@@ -102,6 +102,14 @@ impl Program<Name> {
     pub fn to_named_debruijn(self) -> Result<Program<NamedDeBruijn>, debruijn::Error> {
         self.try_into()
     }
+
+    /// A convenient method to convert named programs to global named debruijn programs.
+    /// This automatically assigns global unique IDs to all variables in the program.
+    pub fn to_global_named_debruijn(self) -> Result<Program<GlobalNamedDeBruijn>, debruijn::Error> {
+        let named_debruijn: Program<NamedDeBruijn> = self.try_into()?;
+        // Global IDs are automatically assigned during conversion
+        Ok(named_debruijn.into())
+    }
 }
 
 impl<'a, T> Display for Program<T>
@@ -605,6 +613,165 @@ impl From<NamedDeBruijn> for FakeNamedDeBruijn {
     }
 }
 
+/// Similar to `NamedDeBruijn` but with a global unique ID within the program.
+/// This is useful for tracking variables across the entire program scope
+/// while maintaining debruijn indexing for local scope.
+///
+/// # Example
+///
+/// ```rust
+/// use uplc::ast::{Program, Term, DeBruijn, Name, GlobalNamedDeBruijn};
+/// 
+/// // When decoding an on-chain program, global IDs are automatically assigned
+/// # /*
+/// let debruijn_program: Program<DeBruijn> = decode_from_chain();
+/// let global_program = debruijn_program.to_global_named_debruijn();
+/// // All variables now have unique global IDs automatically
+/// # */
+/// 
+/// // Convert from a named program with automatic ID assignment
+/// # /*
+/// let named_program: Program<Name> = parse_program();
+/// let global_program: Program<GlobalNamedDeBruijn> = named_program.try_into()?;
+/// // or using the convenience method:
+/// let global_program = named_program.to_global_named_debruijn()?;
+/// # */
+/// 
+/// // Convert individual terms
+/// # /*
+/// let named_term: Term<Name> = parse_term();
+/// let global_term: Term<GlobalNamedDeBruijn> = named_term.try_into()?;
+/// # */
+/// 
+/// // The global IDs allow you to track variables across the entire program
+/// // while maintaining local debruijn indices for scope management
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalNamedDeBruijn {
+    pub text: String,
+    pub index: DeBruijn,
+    pub global_id: usize,
+}
+
+impl GlobalNamedDeBruijn {
+    pub fn new(text: String, index: DeBruijn, global_id: usize) -> Self {
+        GlobalNamedDeBruijn {
+            text,
+            index,
+            global_id,
+        }
+    }
+}
+
+impl From<DeBruijn> for GlobalNamedDeBruijn {
+    fn from(index: DeBruijn) -> Self {
+        GlobalNamedDeBruijn {
+            text: String::from("i"),
+            index,
+            global_id: 0, // Will be set properly during program processing
+        }
+    }
+}
+
+impl From<GlobalNamedDeBruijn> for DeBruijn {
+    fn from(g: GlobalNamedDeBruijn) -> Self {
+        g.index
+    }
+}
+
+impl From<NamedDeBruijn> for GlobalNamedDeBruijn {
+    fn from(n: NamedDeBruijn) -> Self {
+        // Note: This creates a placeholder. Real global IDs are assigned 
+        // during program-level conversions that have access to GlobalIdManager
+        GlobalNamedDeBruijn {
+            text: n.text,
+            index: n.index,
+            global_id: 0, // Will be set properly during program processing
+        }
+    }
+}
+
+impl From<GlobalNamedDeBruijn> for NamedDeBruijn {
+    fn from(g: GlobalNamedDeBruijn) -> Self {
+        NamedDeBruijn {
+            text: g.text,
+            index: g.index,
+        }
+    }
+}
+
+impl Display for GlobalNamedDeBruijn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}#{}", self.text, self.global_id)
+    }
+}
+
+/// Helper struct for managing global unique IDs in a program.
+/// Used during program decoding and processing to assign consistent global IDs.
+///
+/// # Example
+///
+/// ```rust
+/// use uplc::ast::{GlobalIdManager, GlobalNamedDeBruijn, DeBruijn};
+/// 
+/// let mut id_manager = GlobalIdManager::new();
+/// 
+/// // Create variables with unique global IDs
+/// let var1 = GlobalNamedDeBruijn::new(
+///     "x".to_string(), 
+///     DeBruijn::new(0), 
+///     id_manager.next_id()
+/// );
+/// 
+/// let var2 = GlobalNamedDeBruijn::new(
+///     "y".to_string(), 
+///     DeBruijn::new(1), 
+///     id_manager.next_id()
+/// );
+/// 
+/// assert_ne!(var1.global_id, var2.global_id);
+/// ```
+///
+/// For automatic ID assignment during program conversions, use the conversion methods:
+///
+/// ```rust
+/// use uplc::ast::{Program, DeBruijn, GlobalNamedDeBruijn};
+/// 
+/// // Global IDs are automatically assigned during conversion
+/// # /*
+/// let debruijn_program: Program<DeBruijn> = decode_program();
+/// let global_program: Program<GlobalNamedDeBruijn> = debruijn_program.into();
+/// // or
+/// let global_program = Program::<GlobalNamedDeBruijn>::from_hex_with_global_ids(hex, &mut cbor_buf, &mut flat_buf)?;
+/// # */
+/// ```
+#[derive(Debug, Clone)]
+pub struct GlobalIdManager {
+    next_id: usize,
+}
+
+impl GlobalIdManager {
+    pub fn new() -> Self {
+        GlobalIdManager { next_id: 1 }
+    }
+
+    pub fn next_id(&mut self) -> usize {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    pub fn reset(&mut self) {
+        self.next_id = 1;
+    }
+}
+
+impl Default for GlobalIdManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Represents a debruijn index.
 #[derive(Debug, Clone, PartialEq, Eq, Copy)]
 pub struct DeBruijn(usize);
@@ -844,6 +1011,123 @@ impl From<Term<FakeNamedDeBruijn>> for Term<NamedDeBruijn> {
         converter.fake_named_debruijn_to_named_debruijn(&value)
     }
 }
+
+// GlobalNamedDeBruijn conversions with automatic ID assignment
+impl From<Program<NamedDeBruijn>> for Program<GlobalNamedDeBruijn> {
+    fn from(value: Program<NamedDeBruijn>) -> Self {
+        let mut converter = Converter::new();
+        Program::<GlobalNamedDeBruijn> {
+            version: value.version,
+            term: converter.named_debruijn_to_global_named_debruijn(&value.term),
+        }
+    }
+}
+
+impl From<Term<NamedDeBruijn>> for Term<GlobalNamedDeBruijn> {
+    fn from(value: Term<NamedDeBruijn>) -> Self {
+        let mut converter = Converter::new();
+        converter.named_debruijn_to_global_named_debruijn(&value)
+    }
+}
+
+impl From<Program<GlobalNamedDeBruijn>> for Program<NamedDeBruijn> {
+    fn from(value: Program<GlobalNamedDeBruijn>) -> Self {
+        let mut converter = Converter::new();
+        Program::<NamedDeBruijn> {
+            version: value.version,
+            term: converter.global_named_debruijn_to_named_debruijn(&value.term),
+        }
+    }
+}
+
+impl From<Term<GlobalNamedDeBruijn>> for Term<NamedDeBruijn> {
+    fn from(value: Term<GlobalNamedDeBruijn>) -> Self {
+        let mut converter = Converter::new();
+        converter.global_named_debruijn_to_named_debruijn(&value)
+    }
+}
+
+impl From<Program<DeBruijn>> for Program<GlobalNamedDeBruijn> {
+    fn from(value: Program<DeBruijn>) -> Self {
+        let mut converter = Converter::new();
+        Program::<GlobalNamedDeBruijn> {
+            version: value.version,
+            term: converter.debruijn_to_global_named_debruijn(&value.term),
+        }
+    }
+}
+
+impl From<Program<GlobalNamedDeBruijn>> for Program<DeBruijn> {
+    fn from(value: Program<GlobalNamedDeBruijn>) -> Self {
+        let mut converter = Converter::new();
+        Program::<DeBruijn> {
+            version: value.version,
+            term: converter.global_named_debruijn_to_debruijn(&value.term),
+        }
+    }
+}
+
+/// Convert a Parsed `Program` to a `Program` in `GlobalNamedDeBruijn` form.
+/// This checks for any Free Uniques in the `Program` and returns an error if found.
+/// Global IDs are automatically assigned during conversion.
+impl TryFrom<Program<Name>> for Program<GlobalNamedDeBruijn> {
+    type Error = debruijn::Error;
+
+    fn try_from(value: Program<Name>) -> Result<Self, Self::Error> {
+        Ok(Program::<GlobalNamedDeBruijn> {
+            version: value.version,
+            term: value.term.try_into()?,
+        })
+    }
+}
+
+/// Convert a Parsed `Term` to a `Term` in `GlobalNamedDeBruijn` form.
+/// This checks for any Free Uniques in the `Term` and returns an error if found.
+/// Global IDs are automatically assigned during conversion.
+impl TryFrom<Term<Name>> for Term<GlobalNamedDeBruijn> {
+    type Error = debruijn::Error;
+
+    fn try_from(value: Term<Name>) -> Result<Self, debruijn::Error> {
+        let mut converter = Converter::new();
+
+        let term = converter.name_to_global_named_debruijn(&value)?;
+
+        Ok(term)
+    }
+}
+
+impl Program<GlobalNamedDeBruijn> {
+    /// Re-assign global unique IDs to all variables in the program.
+    /// This is useful if you need to reset or change the global ID numbering
+    /// in an existing GlobalNamedDeBruijn program.
+    pub fn reassign_global_ids(mut self) -> Self {
+        let mut converter = Converter::new();
+        self.term = converter.reassign_global_ids_to_term(&self.term);
+        self
+    }
+
+    /// Convert to NamedDeBruijn program (loses global ID information).
+    pub fn to_named_debruijn(self) -> Program<NamedDeBruijn> {
+        self.into()
+    }
+
+    /// Convert to DeBruijn program (loses global ID and name information).
+    pub fn to_debruijn(self) -> Program<DeBruijn> {
+        self.into()
+    }
+
+    /// Create a new program from DeBruijn with automatically assigned global IDs.
+    pub fn from_debruijn(program: Program<DeBruijn>) -> Self {
+        program.into()
+    }
+
+    /// Create a new program from NamedDeBruijn with automatically assigned global IDs.
+    pub fn from_named_debruijn(program: Program<NamedDeBruijn>) -> Self {
+        program.into()
+    }
+}
+
+// Helper functions moved to Converter in debruijn.rs for better organization
 
 impl Program<NamedDeBruijn> {
     pub fn eval(self, initial_budget: ExBudget) -> EvalResult {

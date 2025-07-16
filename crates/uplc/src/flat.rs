@@ -1,6 +1,6 @@
 use crate::{
     ast::{
-        Constant, DeBruijn, FakeNamedDeBruijn, Name, NamedDeBruijn, Program, Term, Type, Unique,
+        Constant, DeBruijn, FakeNamedDeBruijn, GlobalNamedDeBruijn, Name, NamedDeBruijn, Program, Term, Type, Unique,
     },
     builtins::DefaultFunction,
     machine::runtime::Compressable,
@@ -143,6 +143,33 @@ where
         let hex = hex::encode(bytes);
 
         Ok(hex)
+    }
+}
+
+impl Program<GlobalNamedDeBruijn> {
+    /// Decode a DeBruijn program from CBOR and automatically assign global IDs.
+    /// This is useful when decoding on-chain programs that need global variable tracking.
+    pub fn from_cbor_with_global_ids(bytes: &[u8], buffer: &mut Vec<u8>) -> Result<Self, de::Error> {
+        let debruijn_program: Program<DeBruijn> = Program::from_cbor(bytes, buffer)?;
+        Ok(debruijn_program.into())
+    }
+
+    /// Decode a DeBruijn program from hex and automatically assign global IDs.
+    /// This is useful when decoding on-chain programs that need global variable tracking.
+    pub fn from_hex_with_global_ids(
+        hex_str: &str,
+        cbor_buffer: &mut Vec<u8>,
+        flat_buffer: &mut Vec<u8>,
+    ) -> Result<Self, de::Error> {
+        let debruijn_program: Program<DeBruijn> = Program::from_hex(hex_str, cbor_buffer, flat_buffer)?;
+        Ok(debruijn_program.into())
+    }
+
+    /// Decode a DeBruijn program from flat bytes and automatically assign global IDs.
+    /// This is useful when decoding on-chain programs that need global variable tracking.
+    pub fn from_flat_with_global_ids(bytes: &[u8]) -> Result<Self, de::Error> {
+        let debruijn_program: Program<DeBruijn> = Program::from_flat(bytes)?;
+        Ok(debruijn_program.into())
     }
 }
 
@@ -941,6 +968,48 @@ impl Binder<'_> for FakeNamedDeBruijn {
 
     fn text(&self) -> String {
         format!("{}_{}", self.0.text, self.0.index)
+    }
+}
+
+impl Encode for GlobalNamedDeBruijn {
+    fn encode(&self, e: &mut Encoder) -> Result<(), en::Error> {
+        self.text.encode(e)?;
+        self.index.encode(e)?;
+        self.global_id.encode(e)?;
+
+        Ok(())
+    }
+}
+
+impl Decode<'_> for GlobalNamedDeBruijn {
+    fn decode(d: &mut Decoder) -> Result<Self, de::Error> {
+        Ok(GlobalNamedDeBruijn {
+            text: String::decode(d)?,
+            index: DeBruijn::decode(d)?,
+            global_id: usize::decode(d)?,
+        })
+    }
+}
+
+impl Binder<'_> for GlobalNamedDeBruijn {
+    fn binder_encode(&self, e: &mut Encoder) -> Result<(), en::Error> {
+        self.text.encode(e)?;
+        self.index.encode(e)?;
+        self.global_id.encode(e)?;
+
+        Ok(())
+    }
+
+    fn binder_decode(d: &mut Decoder) -> Result<Self, de::Error> {
+        Ok(GlobalNamedDeBruijn {
+            text: String::decode(d)?,
+            index: DeBruijn::decode(d)?,
+            global_id: usize::decode(d)?,
+        })
+    }
+
+    fn text(&self) -> String {
+        format!("{}#{}_{}", self.text, self.global_id, self.index)
     }
 }
 
