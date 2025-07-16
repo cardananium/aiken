@@ -3,7 +3,7 @@ use std::{fmt::Display, rc::Rc};
 use crate::ast::{Constant, NamedDeBruijn, Term, Type};
 
 pub mod cost_model;
-mod discharge;
+pub mod discharge;
 mod error;
 pub mod eval_result;
 pub mod runtime;
@@ -19,14 +19,14 @@ use self::{
     value::{Env, Value},
 };
 
-enum MachineState {
+pub enum MachineState {
     Return(Context, Value),
     Compute(Context, Env, Term<NamedDeBruijn>),
     Done(Term<NamedDeBruijn>),
 }
 
 #[derive(Clone)]
-enum Context {
+pub enum Context {
     FrameAwaitArg(Value, Box<Context>),
     FrameAwaitFunTerm(Env, Term<NamedDeBruijn>, Box<Context>),
     FrameAwaitFunValue(Value, Box<Context>),

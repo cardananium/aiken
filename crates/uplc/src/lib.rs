@@ -4,6 +4,7 @@ pub mod builtins;
 mod debruijn;
 pub mod flat;
 pub mod machine;
+pub mod manual_machine;
 pub mod optimize;
 pub mod parser;
 mod pretty;

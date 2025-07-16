@@ -11,7 +11,7 @@ use num_traits::{Signed, ToPrimitive, Zero};
 use pallas_primitives::conway::{self, PlutusData};
 use std::{collections::VecDeque, mem::size_of, ops::Deref, rc::Rc};
 
-pub(super) type Env = Rc<Vec<Value>>;
+pub type Env = Rc<Vec<Value>>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
