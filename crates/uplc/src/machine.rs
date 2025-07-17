@@ -37,6 +37,7 @@ pub enum Context {
         Vec<Term<NamedDeBruijn>>,
         Vec<Value>,
         Box<Context>,
+        isize,
     ),
     FrameCases(Env, Vec<Term<NamedDeBruijn>>, Box<Context>),
     NoFrame,
@@ -148,21 +149,26 @@ impl Machine {
         term: Term<NamedDeBruijn>,
     ) -> Result<MachineState, Error> {
         match term {
-            Term::Var(name) => {
+            Term::Var { name, uniq_id } => {
                 self.step_and_maybe_spend(StepKind::Var)?;
 
-                let val = self.lookup_var(name.as_ref(), &env)?;
+                let val = self.lookup_var(name.as_ref(), &env, uniq_id)?;
 
                 Ok(MachineState::Return(context, val))
             }
-            Term::Delay(body) => {
+            Term::Delay { body, uniq_id } => {
                 self.step_and_maybe_spend(StepKind::Delay)?;
 
-                Ok(MachineState::Return(context, Value::Delay(body, env)))
+                Ok(MachineState::Return(context, Value::Delay {
+                    body,
+                    env,
+                    term_id: uniq_id,
+                }))
             }
             Term::Lambda {
                 parameter_name,
                 body,
+                uniq_id,
             } => {
                 self.step_and_maybe_spend(StepKind::Lambda)?;
 
@@ -172,10 +178,11 @@ impl Machine {
                         parameter_name,
                         body,
                         env,
+                        term_id: uniq_id,
                     },
                 ))
             }
-            Term::Apply { function, argument } => {
+            Term::Apply { function, argument, .. } => {
                 self.step_and_maybe_spend(StepKind::Apply)?;
 
                 Ok(MachineState::Compute(
@@ -188,12 +195,12 @@ impl Machine {
                     function.as_ref().clone(),
                 ))
             }
-            Term::Constant(x) => {
+            Term::Constant { value, .. } => {
                 self.step_and_maybe_spend(StepKind::Constant)?;
 
-                Ok(MachineState::Return(context, Value::Con(x)))
+                Ok(MachineState::Return(context, Value::Con(value)))
             }
-            Term::Force(body) => {
+            Term::Force { body, .. } => {
                 self.step_and_maybe_spend(StepKind::Force)?;
 
                 Ok(MachineState::Compute(
@@ -202,18 +209,18 @@ impl Machine {
                     body.as_ref().clone(),
                 ))
             }
-            Term::Error => Err(Error::EvaluationFailure),
-            Term::Builtin(fun) => {
+            Term::Error { .. } => Err(Error::EvaluationFailure),
+            Term::Builtin { fun, uniq_id } => {
                 self.step_and_maybe_spend(StepKind::Builtin)?;
 
                 let runtime: BuiltinRuntime = fun.into();
 
                 Ok(MachineState::Return(
                     context,
-                    Value::Builtin { fun, runtime },
+                    Value::Builtin { fun, runtime, term_id: uniq_id },
                 ))
             }
-            Term::Constr { tag, mut fields } => {
+            Term::Constr { tag, mut fields, uniq_id } => {
                 self.step_and_maybe_spend(StepKind::Constr)?;
 
                 fields.reverse();
@@ -222,7 +229,7 @@ impl Machine {
                     let popped_field = fields.pop().unwrap();
 
                     Ok(MachineState::Compute(
-                        Context::FrameConstr(env.clone(), tag, fields, vec![], context.into()),
+                        Context::FrameConstr(env.clone(), tag, fields, vec![], context.into(), uniq_id),
                         env,
                         popped_field,
                     ))
@@ -232,11 +239,12 @@ impl Machine {
                         Value::Constr {
                             tag,
                             fields: vec![],
+                            term_id: uniq_id,
                         },
                     ))
                 }
             }
-            Term::Case { constr, branches } => {
+            Term::Case { constr, branches, .. } => {
                 self.step_and_maybe_spend(StepKind::Case)?;
 
                 Ok(MachineState::Compute(
@@ -267,14 +275,14 @@ impl Machine {
             )),
             Context::FrameAwaitArg(fun, ctx) => self.apply_evaluate(*ctx, fun, value),
             Context::FrameAwaitFunValue(arg, ctx) => self.apply_evaluate(*ctx, value, arg),
-            Context::FrameConstr(env, tag, mut fields, mut resolved_fields, ctx) => {
+            Context::FrameConstr(env, tag, mut fields, mut resolved_fields, ctx, term_id) => {
                 resolved_fields.push(value);
 
                 if !fields.is_empty() {
                     let popped_field = fields.pop().unwrap();
 
                     Ok(MachineState::Compute(
-                        Context::FrameConstr(env.clone(), tag, fields, resolved_fields, ctx),
+                        Context::FrameConstr(env.clone(), tag, fields, resolved_fields, ctx, term_id),
                         env,
                         popped_field,
                     ))
@@ -284,12 +292,13 @@ impl Machine {
                         Value::Constr {
                             tag,
                             fields: resolved_fields,
+                            term_id,
                         },
                     ))
                 }
             }
-            Context::FrameCases(env, branches, ctx) => match value {
-                Value::Constr { tag, fields } => match branches.get(tag) {
+            Context::FrameCases(env, branches, ctx,) => match value {
+                Value::Constr { tag, fields, term_id } => match branches.get(tag) {
                     Some(t) => Ok(MachineState::Compute(
                         transfer_arg_stack(fields, *ctx),
                         env,
@@ -297,7 +306,7 @@ impl Machine {
                     )),
                     None => Err(Error::MissingCaseBranch(
                         branches,
-                        Value::Constr { tag, fields },
+                        Value::Constr { tag, fields, term_id: term_id },
                     )),
                 },
                 v => Err(Error::NonConstrScrutinized(v)),
@@ -307,22 +316,26 @@ impl Machine {
 
     fn force_evaluate(&mut self, context: Context, value: Value) -> Result<MachineState, Error> {
         match value {
-            Value::Delay(body, env) => {
+            Value::Delay { body, env, .. } => {
                 Ok(MachineState::Compute(context, env, body.as_ref().clone()))
             }
-            Value::Builtin { fun, mut runtime } => {
+            Value::Builtin { fun, mut runtime, term_id } => {
                 if runtime.needs_force() {
                     runtime.consume_force();
 
                     let res = if runtime.is_ready() {
                         self.eval_builtin_app(runtime)?
                     } else {
-                        Value::Builtin { fun, runtime }
+                        Value::Builtin { fun, runtime, term_id }
                     };
 
                     Ok(MachineState::Return(context, res))
                 } else {
-                    let term = discharge::value_as_term(Value::Builtin { fun, runtime });
+                    let term = discharge::value_as_term(Value::Builtin {
+                        fun,
+                        runtime,
+                        term_id,
+                    });
 
                     Err(Error::BuiltinTermArgumentExpected(term))
                 }
@@ -349,7 +362,7 @@ impl Machine {
                     body.as_ref().clone(),
                 ))
             }
-            Value::Builtin { fun, runtime } => {
+            Value::Builtin { fun, runtime, term_id } => {
                 if runtime.is_arrow() && !runtime.needs_force() {
                     let mut runtime = runtime;
 
@@ -358,12 +371,16 @@ impl Machine {
                     let res = if runtime.is_ready() {
                         self.eval_builtin_app(runtime)?
                     } else {
-                        Value::Builtin { fun, runtime }
+                        Value::Builtin { fun, runtime, term_id }
                     };
 
                     Ok(MachineState::Return(context, res))
                 } else {
-                    let term = discharge::value_as_term(Value::Builtin { fun, runtime });
+                    let term = discharge::value_as_term(Value::Builtin {
+                        fun,
+                        runtime,
+                        term_id,
+                    });
 
                     Err(Error::UnexpectedBuiltinTermArgument(term))
                 }
@@ -387,10 +404,15 @@ impl Machine {
         runtime.call(&self.version, &mut self.traces)
     }
 
-    fn lookup_var(&mut self, name: &NamedDeBruijn, env: &[Value]) -> Result<Value, Error> {
+    fn lookup_var(&mut self, name: &NamedDeBruijn, env: &[Value], term_id: isize) -> Result<Value, Error> {
         env.get::<usize>(env.len() - usize::from(name.index))
             .cloned()
-            .ok_or_else(|| Error::OpenTermEvaluated(Term::Var(name.clone().into())))
+            .ok_or_else(|| {
+                Error::OpenTermEvaluated(Term::Var {
+                    name: name.clone().into(),
+                    uniq_id: term_id,
+                })
+            })
     }
 
     fn step_and_maybe_spend(&mut self, step: StepKind) -> Result<(), Error> {
@@ -484,12 +506,26 @@ mod tests {
         let program: Program<NamedDeBruijn> = Program {
             version: (0, 0, 0),
             term: Term::Apply {
+                uniq_id: 0,
                 function: Term::Apply {
-                    function: Term::Builtin(DefaultFunction::AddInteger).into(),
-                    argument: Term::Constant(Constant::Integer(i128::MAX.into()).into()).into(),
+                    uniq_id: 1,
+                    function: Term::Builtin {
+                        fun: DefaultFunction::AddInteger,
+                        uniq_id: 2,
+                    }
+                    .into(),
+                    argument: Term::Constant {
+                        value: Constant::Integer(i128::MAX.into()).into(),
+                        uniq_id: 3,
+                    }
+                    .into(),
                 }
                 .into(),
-                argument: Term::Constant(Constant::Integer(i128::MAX.into()).into()).into(),
+                argument: Term::Constant {
+                    value: Constant::Integer(i128::MAX.into()).into(),
+                    uniq_id: 4,
+                }
+                .into(),
             },
         };
 
@@ -499,12 +535,13 @@ mod tests {
 
         assert_eq!(
             term,
-            Term::Constant(
-                Constant::Integer(
+            Term::Constant {
+                value: Constant::Integer(
                     Into::<BigInt>::into(i128::MAX) + Into::<BigInt>::into(i128::MAX)
                 )
-                .into()
-            )
+                .into(),
+                uniq_id: 0,
+            }
         );
     }
 
@@ -513,12 +550,26 @@ mod tests {
         let make_program = |fun: DefaultFunction, n: i32, m: i32| Program::<NamedDeBruijn> {
             version: (0, 0, 0),
             term: Term::Apply {
+                uniq_id: 0,
                 function: Term::Apply {
-                    function: Term::Builtin(fun).into(),
-                    argument: Term::Constant(Constant::Integer(n.into()).into()).into(),
+                    uniq_id: 1,
+                    function: Term::Builtin {
+                        fun,
+                        uniq_id: 2,
+                    }
+                    .into(),
+                    argument: Term::Constant {
+                        value: Constant::Integer(n.into()).into(),
+                        uniq_id: 3,
+                    }
+                    .into(),
                 }
                 .into(),
-                argument: Term::Constant(Constant::Integer(m.into()).into()).into(),
+                argument: Term::Constant {
+                    value: Constant::Integer(m.into()).into(),
+                    uniq_id: 4,
+                }
+                .into(),
             },
         };
 
@@ -546,7 +597,10 @@ mod tests {
 
             assert_eq!(
                 eval_result.result().unwrap(),
-                Term::Constant(Constant::Integer(result.into()).into())
+                Term::Constant {
+                    value: Constant::Integer(result.into()).into(),
+                    uniq_id: 0,
+                }
             );
         }
     }
@@ -560,12 +614,26 @@ mod tests {
                     constr: Term::Constr {
                         tag,
                         fields: vec![
-                            Term::Constant(Constant::Integer(n.into()).into()),
-                            Term::Constant(Constant::Integer(m.into()).into()),
+                            Term::Constant {
+                                value: Constant::Integer(n.into()).into(),
+                                uniq_id: 0,
+                            },
+                            Term::Constant {
+                                value: Constant::Integer(m.into()).into(),
+                                uniq_id: 1,
+                            },
                         ],
+                        uniq_id: 2,
                     }
                     .into(),
-                    branches: vec![Term::Builtin(fun), Term::subtract_integer()],
+                    branches: vec![
+                        Term::Builtin {
+                            fun,
+                            uniq_id: 3,
+                        },
+                        Term::subtract_integer(),
+                    ],
+                    uniq_id: 4,
                 },
             };
 
@@ -579,7 +647,10 @@ mod tests {
 
             assert_eq!(
                 eval_result.result().unwrap(),
-                Term::Constant(Constant::Integer(result.into()).into())
+                Term::Constant {
+                    value: Constant::Integer(result.into()).into(),
+                    uniq_id: 0,
+                }
             );
         }
     }
@@ -592,6 +663,7 @@ mod tests {
                 constr: Term::Constr {
                     tag,
                     fields: vec![],
+                    uniq_id: 0,
                 }
                 .into(),
                 branches: vec![
@@ -599,6 +671,7 @@ mod tests {
                     Term::integer(10.into()),
                     Term::integer(15.into()),
                 ],
+                uniq_id: 1,
             },
         };
 
@@ -609,7 +682,10 @@ mod tests {
 
             assert_eq!(
                 eval_result.result().unwrap(),
-                Term::Constant(Constant::Integer(result.into()).into())
+                Term::Constant {
+                    value: Constant::Integer(result.into()).into(),
+                    uniq_id: 0,
+                }
             );
         }
     }

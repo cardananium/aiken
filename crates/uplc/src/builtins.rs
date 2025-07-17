@@ -1,6 +1,5 @@
-use crate::ast::Term;
 use pallas_codec::flat::de;
-use std::{fmt::Display, rc::Rc, str::FromStr};
+use std::{fmt::Display, str::FromStr};
 use strum::EnumIter;
 
 /// All the possible builtin functions in Untyped Plutus Core.
@@ -630,17 +629,5 @@ impl DefaultFunction {
             // CaseData => "case_data",
         }
         .to_string()
-    }
-}
-
-impl<T> From<DefaultFunction> for Term<T> {
-    fn from(builtin: DefaultFunction) -> Self {
-        Term::Builtin(builtin)
-    }
-}
-
-impl<T> From<DefaultFunction> for Rc<Term<T>> {
-    fn from(builtin: DefaultFunction) -> Self {
-        Term::Builtin(builtin).into()
     }
 }

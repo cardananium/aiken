@@ -79,12 +79,12 @@ where
 
     fn to_doc(&self) -> RcDoc<()> {
         match self {
-            Term::Var(name) => RcDoc::text(name.text()),
-            Term::Delay(term) => RcDoc::text("(")
+            Term::Var { name, .. } => RcDoc::text(name.text()),
+            Term::Delay { body, .. } => RcDoc::text("(")
                 .append(
                     RcDoc::text("delay")
                         .append(RcDoc::line())
-                        .append(term.to_doc())
+                        .append(body.to_doc())
                         .nest(2),
                 )
                 .append(RcDoc::line_())
@@ -92,6 +92,7 @@ where
             Term::Lambda {
                 parameter_name,
                 body,
+                ..
             } => RcDoc::text("(")
                 .append(
                     RcDoc::text("lam")
@@ -103,7 +104,7 @@ where
                 )
                 .append(RcDoc::line_())
                 .append(RcDoc::text(")")),
-            Term::Apply { function, argument } => RcDoc::text("[")
+            Term::Apply { function, argument, .. } => RcDoc::text("[")
                 .append(
                     RcDoc::line()
                         .append(
@@ -117,39 +118,39 @@ where
                 )
                 .append(RcDoc::line())
                 .append(RcDoc::text("]")),
-            Term::Constant(constant) => RcDoc::text("(")
+            Term::Constant { value, .. } => RcDoc::text("(")
                 .append(
                     RcDoc::text("con")
                         .append(RcDoc::line())
-                        .append(constant.to_doc())
+                        .append(value.to_doc())
                         .nest(2),
                 )
                 .append(RcDoc::line_())
                 .append(RcDoc::text(")")),
-            Term::Force(term) => RcDoc::text("(")
+            Term::Force { body, .. } => RcDoc::text("(")
                 .append(
                     RcDoc::text("force")
                         .append(RcDoc::line())
-                        .append(term.to_doc())
+                        .append(body.to_doc())
                         .nest(2),
                 )
                 .append(RcDoc::line_())
                 .append(RcDoc::text(")")),
-            Term::Error => RcDoc::text("(")
+            Term::Error { .. } => RcDoc::text("(")
                 .append(RcDoc::text("error").nest(2))
                 .append(RcDoc::line())
                 .append(RcDoc::line_())
                 .append(RcDoc::text(")")),
-            Term::Builtin(builtin) => RcDoc::text("(")
+            Term::Builtin { fun, .. } => RcDoc::text("(")
                 .append(
                     RcDoc::text("builtin")
                         .append(RcDoc::line())
-                        .append(RcDoc::text(builtin.to_string()))
+                        .append(RcDoc::text(fun.to_string()))
                         .nest(2),
                 )
                 .append(RcDoc::line_())
                 .append(RcDoc::text(")")),
-            Term::Constr { tag, fields } => RcDoc::text("(")
+            Term::Constr { tag, fields, .. } => RcDoc::text("(")
                 .append(
                     RcDoc::text("constr")
                         .append(RcDoc::line())
@@ -162,7 +163,7 @@ where
                     RcDoc::line_(),
                 ))
                 .append(RcDoc::text(")")),
-            Term::Case { constr, branches } => RcDoc::text("(")
+            Term::Case { constr, branches, .. } => RcDoc::text("(")
                 .append(
                     RcDoc::text("case")
                         .append(RcDoc::line())

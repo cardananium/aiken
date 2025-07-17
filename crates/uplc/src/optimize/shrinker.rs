@@ -1,9 +1,6 @@
 use super::interner::CodeGenInterner;
 use crate::{
-    ast::{Constant, Data, Name, NamedDeBruijn, Program, Term, Type},
-    builder::{CONSTR_FIELDS_EXPOSER, CONSTR_INDEX_EXPOSER, INDICES_CONVERTER},
-    builtins::DefaultFunction,
-    machine::{cost_model::ExBudget, runtime::Compressable, value::from_pallas_bigint},
+    ast::{Constant, Data, Name, NamedDeBruijn, Program, Term, Type}, builder::{CONSTR_FIELDS_EXPOSER, CONSTR_INDEX_EXPOSER, INDICES_CONVERTER}, builtins::DefaultFunction, global_uniq::next_uniq_id, machine::{cost_model::ExBudget, runtime::Compressable, value::from_pallas_bigint}
 };
 use blst::{blst_p1, blst_p2};
 use indexmap::IndexMap;
@@ -201,7 +198,7 @@ impl DefaultFunction {
             | DefaultFunction::LessThanInteger
             | DefaultFunction::LessThanEqualsInteger
             | DefaultFunction::IData => arg_stack.iter().all(|arg| {
-                if let Term::Constant(c) = arg {
+                if let Term::Constant { value: c, .. } = arg {
                     matches!(c.as_ref(), Constant::Integer(_))
                 } else {
                     false
@@ -211,7 +208,7 @@ impl DefaultFunction {
             | DefaultFunction::ModInteger
             | DefaultFunction::QuotientInteger
             | DefaultFunction::RemainderInteger => arg_stack.iter().all(|arg| {
-                if let Term::Constant(c) = arg {
+                if let Term::Constant { value: c, .. } = arg {
                     if let Constant::Integer(i) = c.as_ref() {
                         *i != 0.into()
                     } else {
@@ -227,7 +224,7 @@ impl DefaultFunction {
             | DefaultFunction::LessThanEqualsByteString
             | DefaultFunction::LessThanByteString
             | DefaultFunction::BData => arg_stack.iter().all(|arg| {
-                if let Term::Constant(c) = arg {
+                if let Term::Constant { value: c, .. } = arg {
                     matches!(c.as_ref(), Constant::ByteString(_))
                 } else {
                     false
@@ -235,7 +232,9 @@ impl DefaultFunction {
             }),
 
             DefaultFunction::ConsByteString => {
-                if let (Term::Constant(c), Term::Constant(c2)) = (&arg_stack[0], &arg_stack[1]) {
+                if let (Term::Constant { value: c, .. }, Term::Constant { value: c2, .. }) =
+                    (&arg_stack[0], &arg_stack[1])
+                {
                     if let (Constant::Integer(i), Constant::ByteString(_)) =
                         (c.as_ref(), c2.as_ref())
                     {
@@ -249,7 +248,7 @@ impl DefaultFunction {
             }
 
             DefaultFunction::SliceByteString => {
-                if let (Term::Constant(c), Term::Constant(c2), Term::Constant(c3)) =
+                if let (Term::Constant { value: c, .. }, Term::Constant { value: c2, .. }, Term::Constant { value: c3, .. }) =
                     (&arg_stack[0], &arg_stack[1], &arg_stack[2])
                 {
                     matches!(
@@ -266,7 +265,9 @@ impl DefaultFunction {
             }
 
             DefaultFunction::IndexByteString => {
-                if let (Term::Constant(c), Term::Constant(c2)) = (&arg_stack[0], &arg_stack[1]) {
+                if let (Term::Constant { value: c, .. }, Term::Constant { value: c2, .. }) =
+                    (&arg_stack[0], &arg_stack[1])
+                {
                     if let (Constant::ByteString(bs), Constant::Integer(i)) =
                         (c.as_ref(), c2.as_ref())
                     {
@@ -282,7 +283,7 @@ impl DefaultFunction {
             DefaultFunction::EqualsString
             | DefaultFunction::AppendString
             | DefaultFunction::EncodeUtf8 => arg_stack.iter().all(|arg| {
-                if let Term::Constant(c) = arg {
+                if let Term::Constant { value: c, .. } = arg {
                     matches!(c.as_ref(), Constant::String(_))
                 } else {
                     false
@@ -291,7 +292,7 @@ impl DefaultFunction {
 
             DefaultFunction::EqualsData | DefaultFunction::SerialiseData => {
                 arg_stack.iter().all(|arg| {
-                    if let Term::Constant(c) = arg {
+                    if let Term::Constant { value: c, .. } = arg {
                         matches!(c.as_ref(), Constant::Data(_))
                     } else {
                         false
@@ -301,7 +302,7 @@ impl DefaultFunction {
 
             DefaultFunction::Bls12_381_G1_Equal | DefaultFunction::Bls12_381_G1_Add => {
                 arg_stack.iter().all(|arg| {
-                    if let Term::Constant(c) = arg {
+                    if let Term::Constant { value: c, .. } = arg {
                         matches!(c.as_ref(), Constant::Bls12_381G1Element(_))
                     } else {
                         false
@@ -311,7 +312,7 @@ impl DefaultFunction {
 
             DefaultFunction::Bls12_381_G2_Equal | DefaultFunction::Bls12_381_G2_Add => {
                 arg_stack.iter().all(|arg| {
-                    if let Term::Constant(c) = arg {
+                    if let Term::Constant { value: c, .. } = arg {
                         matches!(c.as_ref(), Constant::Bls12_381G2Element(_))
                     } else {
                         false
@@ -320,7 +321,9 @@ impl DefaultFunction {
             }
 
             DefaultFunction::ConstrData => {
-                if let (Term::Constant(c), Term::Constant(c2)) = (&arg_stack[0], &arg_stack[1]) {
+                if let (Term::Constant { value: c, .. }, Term::Constant { value: c2, .. }) =
+                    (&arg_stack[0], &arg_stack[1])
+                {
                     if let (Constant::Integer(i), Constant::ProtoList(Type::Data, _)) =
                         (c.as_ref(), c2.as_ref())
                     {
@@ -372,9 +375,9 @@ impl BuiltinArgs {
         let mut ordered_arg_stack = stack.into_iter().sorted_by(|(_, arg1), (_, arg2)| {
             // sort by constant first if the builtin is order agnostic
             if func.is_order_agnostic_builtin() {
-                if matches!(arg1, Term::Constant(_)) == matches!(arg2, Term::Constant(_)) {
+                if matches!(arg1, Term::Constant { .. }) == matches!(arg2, Term::Constant { .. }) {
                     Ordering::Equal
-                } else if matches!(arg1, Term::Constant(_)) {
+                } else if matches!(arg1, Term::Constant { .. }) {
                     Ordering::Less
                 } else {
                     Ordering::Greater
@@ -587,7 +590,7 @@ impl CurriedArgs {
                         // switched must be false here
                         // I use Term::Error.force() since it's not a
                         // naturally occurring term in code gen.
-                        term: std::mem::replace(&mut fst.1, Term::Error.force()),
+                        term: std::mem::replace(&mut fst.1, Term::Error { uniq_id: next_uniq_id() }.force()),
                     });
 
                     (false, fst_args)
@@ -595,7 +598,7 @@ impl CurriedArgs {
 
                 // If switched then put the first arg in the second arg slot
                 let snd_args = if switched {
-                    assert!(fst.1 != Term::Error.force());
+                    assert!(fst.1 != Term::Error { uniq_id: next_uniq_id() }.force());
 
                     if snd_args.iter_mut().any(|item| item.term == fst.1) {
                         snd_args
@@ -896,7 +899,7 @@ impl Term<Name> {
         inline_lambda: bool,
     ) {
         match self {
-            Term::Apply { function, argument } => {
+            Term::Apply { function, argument, .. } => {
                 let arg = Rc::make_mut(argument);
 
                 arg.traverse_uplc_with_helper(
@@ -925,8 +928,8 @@ impl Term<Name> {
 
                 with(Some(apply_id), self, vec![], scope, context);
             }
-            Term::Force(f) => {
-                let f = Rc::make_mut(f);
+            Term::Force { body, .. } => {
+                let f = Rc::make_mut(body);
                 let force_id = id_gen.next_id();
 
                 arg_stack.push(Args::Force(force_id));
@@ -935,8 +938,8 @@ impl Term<Name> {
 
                 with(Some(force_id), self, vec![], scope, context);
             }
-            Term::Delay(d) => {
-                let d = Rc::make_mut(d);
+            Term::Delay { body, .. } => {
+                let d = Rc::make_mut(body);
                 let delay_arg = arg_stack
                     .pop()
                     .map(|arg| {
@@ -952,6 +955,7 @@ impl Term<Name> {
             Term::Lambda {
                 parameter_name,
                 body,
+                ..
             } => {
                 let p = parameter_name.clone();
 
@@ -979,6 +983,7 @@ impl Term<Name> {
                         Term::Lambda {
                             parameter_name,
                             body,
+                            ..
                         } if *parameter_name == p => {
                             let body = Rc::make_mut(body);
                             body.traverse_uplc_with_helper(
@@ -1015,7 +1020,7 @@ impl Term<Name> {
                 }
             }
 
-            Term::Case { constr, branches } => {
+            Term::Case { constr, branches, .. } => {
                 let constr = Rc::make_mut(constr);
                 constr.traverse_uplc_with_helper(
                     scope,
@@ -1063,10 +1068,10 @@ impl Term<Name> {
                 }
             }
 
-            Term::Builtin(func) => {
+            Term::Builtin { fun, .. } => {
                 let mut args = vec![];
 
-                for _ in 0..(func.arity() + usize::try_from(func.force_count()).unwrap()) {
+                for _ in 0..(fun.arity() + usize::try_from(fun.force_count()).unwrap()) {
                     if let Some(arg) = arg_stack.pop() {
                         args.push(arg);
                     }
@@ -1083,22 +1088,23 @@ impl Term<Name> {
 
     fn substitute_var(&mut self, original: Rc<Name>, replace_with: &Term<Name>) {
         match self {
-            Term::Var(name) if *name == original => {
+            Term::Var { name, .. } if *name == original => {
                 *self = replace_with.clone();
             }
-            Term::Delay(body) => Rc::make_mut(body).substitute_var(original, replace_with),
+            Term::Delay { body, .. } => Rc::make_mut(body).substitute_var(original, replace_with),
             Term::Lambda {
                 parameter_name,
                 body,
+                ..
             } if *parameter_name != original => {
                 Rc::make_mut(body).substitute_var(original, replace_with);
             }
-            Term::Apply { function, argument } => {
+            Term::Apply { function, argument, .. } => {
                 Rc::make_mut(function).substitute_var(original.clone(), replace_with);
                 Rc::make_mut(argument).substitute_var(original, replace_with);
             }
-            Term::Force(f) => {
-                Rc::make_mut(f).substitute_var(original, replace_with);
+            Term::Force { body, .. } => {
+                Rc::make_mut(body).substitute_var(original, replace_with);
             }
             Term::Case { .. } => todo!(),
             Term::Constr { .. } => todo!(),
@@ -1108,34 +1114,35 @@ impl Term<Name> {
 
     fn replace_identity_usage(&mut self, original: Rc<Name>) {
         match self {
-            Term::Delay(body) => {
+            Term::Delay { body, .. } => {
                 Rc::make_mut(body).replace_identity_usage(original.clone());
             }
             Term::Lambda {
                 parameter_name,
                 body,
+                ..
             } => {
                 if *parameter_name != original {
                     Rc::make_mut(body).replace_identity_usage(original.clone());
                 }
             }
-            Term::Apply { function, argument } => {
+            Term::Apply { function, argument, .. } => {
                 let func = Rc::make_mut(function);
                 let arg = Rc::make_mut(argument);
 
                 func.replace_identity_usage(original.clone());
                 arg.replace_identity_usage(original.clone());
 
-                let Term::Var(name) = &func else {
+                let Term::Var { name, .. } = &func else {
                     return;
                 };
 
                 if *name == original {
-                    *self = std::mem::replace(arg, Term::Error.force());
+                    *self = std::mem::replace(arg, Term::Error { uniq_id: next_uniq_id() }.force());
                 }
             }
-            Term::Force(f) => {
-                Rc::make_mut(f).replace_identity_usage(original.clone());
+            Term::Force { body, .. } => {
+                Rc::make_mut(body).replace_identity_usage(original.clone());
             }
             Term::Case { .. } => todo!(),
             Term::Constr { .. } => todo!(),
@@ -1150,14 +1157,14 @@ impl Term<Name> {
         mut force_stack: Vec<()>,
     ) -> VarLookup {
         match self {
-            Term::Var(name) => {
+            Term::Var { name, .. } => {
                 if *name == search_for {
                     VarLookup::new_found()
                 } else {
                     VarLookup::new()
                 }
             }
-            Term::Delay(body) => {
+            Term::Delay { body, .. } => {
                 let not_forced = usize::from(force_stack.pop().is_none());
 
                 body.var_occurrences(search_for, arg_stack, force_stack)
@@ -1166,6 +1173,7 @@ impl Term<Name> {
             Term::Lambda {
                 parameter_name,
                 body,
+                ..
             } => {
                 if parameter_name.text == NO_INLINE {
                     body.var_occurrences(search_for, arg_stack, force_stack)
@@ -1178,7 +1186,7 @@ impl Term<Name> {
                         .delay_if_found(not_applied)
                 }
             }
-            Term::Apply { function, argument } => {
+            Term::Apply { function, argument, .. } => {
                 // unwrap apply and add void to arg stack!
                 arg_stack.push(());
 
@@ -1192,6 +1200,7 @@ impl Term<Name> {
                 if let Term::Apply {
                     function: next_func,
                     argument: next_arg,
+                    ..
                 } = function.as_ref()
                 {
                     // unwrap apply and add void to arg stack!
@@ -1208,9 +1217,9 @@ impl Term<Name> {
                         .combine(apply_var_occurrence_no_stack(argument))
                 }
             }
-            Term::Force(x) => {
+            Term::Force {body, ..} => {
                 force_stack.push(());
-                x.var_occurrences(search_for, arg_stack, force_stack)
+                body.var_occurrences(search_for, arg_stack, force_stack)
             }
             Term::Case { .. } => todo!(),
             Term::Constr { .. } => todo!(),
@@ -1233,6 +1242,7 @@ impl Term<Name> {
         let Term::Apply {
             function: builtin,
             argument: condition,
+            ..
         } = self
         else {
             return var_occurrence_stack(self, arg_stack)
@@ -1243,14 +1253,14 @@ impl Term<Name> {
         // unwrap apply and add void to arg stack!
         arg_stack.push(());
 
-        let Term::Delay(else_arg) = else_arg.as_ref() else {
+        let Term::Delay { body: else_arg, .. } = else_arg.as_ref() else {
             return var_occurrence_stack(builtin, arg_stack)
                 .combine(var_occurrence_no_stack(condition))
                 .combine(var_occurrence_no_stack(then_arg))
                 .combine(var_occurrence_no_stack(else_arg));
         };
 
-        let Term::Delay(then_arg) = then_arg.as_ref() else {
+        let Term::Delay { body: then_arg, .. } = then_arg.as_ref() else {
             return var_occurrence_stack(builtin, arg_stack)
                 .combine(var_occurrence_no_stack(condition))
                 .combine(var_occurrence_no_stack(then_arg))
@@ -1258,11 +1268,11 @@ impl Term<Name> {
         };
 
         match builtin.as_ref() {
-            Term::Var(a)
-                if a.text == DefaultFunction::IfThenElse.wrapped_name()
-                    || a.text == DefaultFunction::ChooseList.wrapped_name() =>
+            Term::Var { name, .. }
+                if name.text == DefaultFunction::IfThenElse.wrapped_name()
+                    || name.text == DefaultFunction::ChooseList.wrapped_name() =>
             {
-                if matches!(else_arg.as_ref(), Term::Error) {
+                if matches!(else_arg.as_ref(), Term::Error { .. }) {
                     // Pop 3 args of arg_stack due to branch execution
                     arg_stack.pop();
                     arg_stack.pop();
@@ -1270,7 +1280,7 @@ impl Term<Name> {
 
                     var_occurrence_no_stack(condition)
                         .combine(var_occurrence_stack(then_arg, arg_stack))
-                } else if matches!(then_arg.as_ref(), Term::Error) {
+                } else if matches!(then_arg.as_ref(), Term::Error { .. }) {
                     // Pop 3 args of arg_stack due to branch execution
                     arg_stack.pop();
                     arg_stack.pop();
@@ -1305,19 +1315,20 @@ impl Term<Name> {
             Term::Lambda {
                 parameter_name,
                 body,
+                ..
             } => {
                 // pops stack here no matter what
                 if let Some(Args::Apply(arg_id, arg_term)) = arg_stack.pop() {
                     let replace = match &arg_term {
                         // Do nothing for String consts
-                        Term::Constant(c) if matches!(c.as_ref(), Constant::String(_)) => false,
+                        Term::Constant { value: c, .. } if matches!(c.as_ref(), Constant::String(_)) => false,
                         // Inline Delay Error terms since total size is only 1 byte
                         // So it costs more size to have them hoisted
-                        Term::Delay(e) if matches!(e.as_ref(), Term::Error) => true,
+                        Term::Delay { body, .. } if matches!(body.as_ref(), Term::Error { .. }) => true,
                         // If it wraps a builtin with consts or arguments passed in then inline
                         Term::Lambda { .. } => arg_term.is_a_builtin_wrapper(),
                         // Inline smaller terms too
-                        Term::Constant(_) | Term::Var(_) | Term::Builtin(_) => true,
+                        Term::Constant { .. } | Term::Var { .. } | Term::Builtin { .. } => true,
 
                         _ => false,
                     };
@@ -1332,7 +1343,7 @@ impl Term<Name> {
                             arg_term.pierce_no_inlines_ref(),
                         );
                         // creates new body that replaces all var occurrences with the arg
-                        *self = std::mem::replace(body, Term::Error.force());
+                        *self = std::mem::replace(body, Term::Error { uniq_id: next_uniq_id() }.force());
                     }
                 }
             }
@@ -1353,16 +1364,16 @@ impl Term<Name> {
         _scope: &Scope,
         context: &mut Context,
     ) {
-        if let Term::Builtin(func) = self {
+        if let Term::Builtin { fun, .. } = self {
             arg_stack.reverse();
-            let has_forces = func.force_count() > 0;
+            let has_forces = fun.force_count() > 0;
             while let Some(Args::Force(id)) = arg_stack.pop() {
                 context.inlined_apply_ids.push(id);
             }
 
             if has_forces {
-                context.builtins_map.insert(*func, ());
-                *self = Term::var(func.wrapped_name());
+                context.builtins_map.insert(*fun, ());
+                *self = Term::var(fun.wrapped_name());
             }
         }
     }
@@ -1375,7 +1386,7 @@ impl Term<Name> {
         _scope: &Scope,
         context: &mut Context,
     ) {
-        if let Term::Constant(con) = self {
+        if let Term::Constant { value: con, .. } = self {
             match con.as_ref() {
                 Constant::Bls12_381G1Element(blst_p1) => {
                     if let Some(index) = context
@@ -1414,7 +1425,7 @@ impl Term<Name> {
     // allowing for some crazy gains from cast_constr_apply_reducer
     fn split_body_lambda(&mut self) {
         let mut arg_stack = vec![];
-        let mut current_term = &mut std::mem::replace(self, Term::Error.force());
+        let mut current_term = &mut std::mem::replace(self, Term::Error { uniq_id: next_uniq_id() }.force());
         let mut unsat_lams = vec![];
 
         let mut function_groups = vec![vec![]];
@@ -1422,18 +1433,19 @@ impl Term<Name> {
 
         loop {
             match current_term {
-                Term::Apply { function, argument } => {
+                Term::Apply { function, argument, .. } => {
                     current_term = Rc::make_mut(function);
 
                     let arg = Rc::make_mut(argument);
 
                     arg.split_body_lambda();
 
-                    arg_stack.push(Args::Apply(0, std::mem::replace(arg, Term::Error.force())));
+                    arg_stack.push(Args::Apply(0, std::mem::replace(arg, Term::Error { uniq_id: next_uniq_id() }.force())));
                 }
                 Term::Lambda {
                     parameter_name,
                     body,
+                    ..
                 } => {
                     current_term = Rc::make_mut(body);
 
@@ -1466,12 +1478,12 @@ impl Term<Name> {
                         unsat_lams.push(parameter_name.clone());
                     }
                 }
-                Term::Force(term) => {
+                Term::Force { body: term, .. } => {
                     current_term = Rc::make_mut(term);
 
                     arg_stack.push(Args::Force(0));
                 }
-                Term::Delay(term) => {
+                Term::Delay { body: term, .. } => {
                     Rc::make_mut(term).split_body_lambda();
                     break;
                 }
@@ -1521,7 +1533,7 @@ impl Term<Name> {
             function_groups[swap_index].push(item);
         }
 
-        let term_to_build_on = std::mem::replace(current_term, Term::Error.force());
+        let term_to_build_on = std::mem::replace(current_term, Term::Error { uniq_id: next_uniq_id() }.force());
 
         // Replace args that weren't consumed
         let term = arg_stack
@@ -1535,6 +1547,7 @@ impl Term<Name> {
             let term = group.iter().rfold(term, |term, (name, _)| Term::Lambda {
                 parameter_name: name.clone(),
                 body: term.into(),
+                uniq_id: next_uniq_id(),
             });
 
             group
@@ -1547,6 +1560,7 @@ impl Term<Name> {
             .rfold(term, |term, name| Term::Lambda {
                 parameter_name: name.clone(),
                 body: term.into(),
+                uniq_id: next_uniq_id(),
             });
 
         *self = term;
@@ -1559,27 +1573,27 @@ impl Term<Name> {
 
         loop {
             match term {
-                Term::Apply { function, argument } => {
+                Term::Apply { function, argument, .. } => {
                     let arg_names = argument.get_var_names();
 
                     names.extend(arg_names);
 
                     term = function;
                 }
-                Term::Var(name) => {
+                Term::Var { name, .. } => {
                     names.push(name.clone());
                     break;
                 }
-                Term::Delay(t) => {
+                Term::Delay { body: t, .. } => {
                     term = t;
                 }
                 Term::Lambda { body, .. } => {
                     term = body;
                 }
-                Term::Constant(_) | Term::Error | Term::Builtin(_) => {
+                Term::Constant { .. } | Term::Error { .. } | Term::Builtin { .. } => {
                     break;
                 }
-                Term::Force(t) => {
+                Term::Force { body: t, .. } => {
                     term = t;
                 }
                 Term::Constr { .. } => todo!(),
@@ -1598,11 +1612,11 @@ impl Term<Name> {
         _scope: &Scope,
         _context: &mut Context,
     ) {
-        let mut term = &mut std::mem::replace(self, Term::Error.force());
+        let mut term = &mut std::mem::replace(self, Term::Error { uniq_id: next_uniq_id() }.force());
 
         let mut arg_vec = vec![];
 
-        while let Term::Apply { function, argument } = term {
+        while let Term::Apply { function, argument, .. } = term {
             arg_vec.push(Rc::make_mut(argument));
 
             term = Rc::make_mut(function);
@@ -1611,7 +1625,7 @@ impl Term<Name> {
         arg_vec.reverse();
 
         match term {
-            Term::Case { constr, branches }
+            Term::Case { constr, branches, .. }
                 if branches.len() == 1 && matches!(constr.as_ref(), Term::Constr { .. }) =>
             {
                 let Term::Constr { fields, .. } = Rc::make_mut(constr) else {
@@ -1619,28 +1633,28 @@ impl Term<Name> {
                 };
 
                 for arg in arg_vec {
-                    fields.push(std::mem::replace(arg, Term::Error.force()));
+                    fields.push(std::mem::replace(arg, Term::Error { uniq_id: next_uniq_id() }.force()));
                 }
 
-                *self = std::mem::replace(term, Term::Error.force());
+                *self = std::mem::replace(term, Term::Error { uniq_id: next_uniq_id() }.force());
             }
             _ => {
                 if arg_vec.len() > 2 {
                     let mut fields = vec![];
 
                     for arg in arg_vec {
-                        fields.push(std::mem::replace(arg, Term::Error.force()));
+                        fields.push(std::mem::replace(arg, Term::Error { uniq_id: next_uniq_id() }.force()));
                     }
 
                     *self = Term::constr(0, fields)
-                        .case(vec![std::mem::replace(term, Term::Error.force())]);
+                        .case(vec![std::mem::replace(term, Term::Error { uniq_id: next_uniq_id() }.force())]);
                 } else {
                     for arg in arg_vec {
-                        *term = (std::mem::replace(term, Term::Error.force()))
-                            .apply(std::mem::replace(arg, Term::Error.force()));
+                        *term = (std::mem::replace(term, Term::Error { uniq_id: next_uniq_id() }.force()))
+                            .apply(std::mem::replace(arg, Term::Error { uniq_id: next_uniq_id() }.force()));
                     }
 
-                    *self = std::mem::replace(term, Term::Error.force());
+                    *self = std::mem::replace(term, Term::Error { uniq_id: next_uniq_id() }.force());
                 }
             }
         }
@@ -1661,7 +1675,7 @@ impl Term<Name> {
 
                 if context.write_bits_indices_arg.contains(&id) {
                     match Rc::make_mut(argument) {
-                        Term::Constant(constant) => {
+                        Term::Constant { value: constant, .. } => {
                             let Constant::ProtoList(tipo, items) = Rc::make_mut(constant) else {
                                 unreachable!();
                             };
@@ -1681,13 +1695,13 @@ impl Term<Name> {
                             context.write_bits_convert = true;
 
                             *arg = Term::var(INDICES_CONVERTER)
-                                .apply(std::mem::replace(arg, Term::Error.force()));
+                                .apply(std::mem::replace(arg, Term::Error { uniq_id: next_uniq_id() }.force()));
                         }
                     }
                 }
             }
 
-            Term::Builtin(DefaultFunction::WriteBits) => {
+            Term::Builtin { fun: DefaultFunction::WriteBits, .. } => {
                 if arg_stack.is_empty() {
                     context.write_bits_convert = true;
 
@@ -1726,6 +1740,7 @@ impl Term<Name> {
             Term::Lambda {
                 parameter_name,
                 body,
+                ..
             } => {
                 let body = Rc::make_mut(body);
                 // pops stack here no matter what
@@ -1737,12 +1752,13 @@ impl Term<Name> {
                 let Term::Lambda {
                     parameter_name: identity_name,
                     body: identity_body,
+                    ..
                 } = identity_func.pierce_no_inlines()
                 else {
                     return false;
                 };
 
-                let Term::Var(identity_var) = identity_body.as_ref() else {
+                let Term::Var { name: identity_var, .. } = identity_body.as_ref() else {
                     return false;
                 };
 
@@ -1757,7 +1773,7 @@ impl Term<Name> {
                     {
                         changed = true;
                         context.inlined_apply_ids.push(arg_id);
-                        *self = std::mem::replace(body, Term::Error.force());
+                        *self = std::mem::replace(body, Term::Error { uniq_id: next_uniq_id() }.force());
                     }
                 }
             }
@@ -1782,6 +1798,7 @@ impl Term<Name> {
             Term::Lambda {
                 parameter_name,
                 body,
+                ..
             } => {
                 // pops stack here no matter what
                 let Some(Args::Apply(arg_id, arg_term)) = arg_stack.pop() else {
@@ -1798,11 +1815,11 @@ impl Term<Name> {
 
                 let cant_throw_condition = matches!(
                     arg_term,
-                    Term::Var(_)
-                        | Term::Constant(_)
-                        | Term::Delay(_)
+                    Term::Var { .. }
+                        | Term::Constant { .. }
+                        | Term::Delay { .. }
                         | Term::Lambda { .. }
-                        | Term::Builtin(_),
+                        | Term::Builtin { .. },
                 );
 
                 let force_wrapped_builtin = context
@@ -1820,13 +1837,13 @@ impl Term<Name> {
                     body.substitute_var(parameter_name.clone(), arg_term);
 
                     context.inlined_apply_ids.push(arg_id);
-                    *self = std::mem::replace(body, Term::Error.force());
+                    *self = std::mem::replace(body, Term::Error { uniq_id: next_uniq_id() }.force());
 
                 // This will strip out unused terms that can't throw an error by themselves
                 } else if !var_lookup.found && (cant_throw_condition || force_wrapped_builtin) {
                     changed = true;
                     context.inlined_apply_ids.push(arg_id);
-                    *self = std::mem::replace(body, Term::Error.force());
+                    *self = std::mem::replace(body, Term::Error { uniq_id: next_uniq_id() }.force());
                 }
             }
 
@@ -1845,13 +1862,13 @@ impl Term<Name> {
         context: &mut Context,
     ) -> bool {
         let mut changed = false;
-        if let Term::Delay(d) = self {
+        if let Term::Delay { body: d, .. } = self {
             if let Some(Args::Force(id)) = arg_stack.pop() {
                 changed = true;
                 context.inlined_apply_ids.push(id);
-                *self = std::mem::replace(Rc::make_mut(d), Term::Error.force())
-            } else if let Term::Force(var) = d.as_ref() {
-                if let Term::Var(_) = var.as_ref() {
+                *self = std::mem::replace(Rc::make_mut(d), Term::Error { uniq_id: next_uniq_id() }.force())
+            } else if let Term::Force { body: var, .. } = d.as_ref() {
+                if let Term::Var { .. } = var.as_ref() {
                     changed = true;
                     *self = var.as_ref().clone();
                 }
@@ -1871,8 +1888,9 @@ impl Term<Name> {
             Term::Lambda {
                 parameter_name,
                 body,
+                ..
             } if parameter_name.text == NO_INLINE => {
-                *self = std::mem::replace(Rc::make_mut(body), Term::Error.force());
+                *self = std::mem::replace(Rc::make_mut(body), Term::Error { uniq_id: next_uniq_id() }.force());
             }
             _ => (),
         }
@@ -1886,28 +1904,29 @@ impl Term<Name> {
         _scope: &Scope,
         _context: &mut Context,
     ) {
-        if let Term::Apply { function, argument } = self {
-            if let Term::Var(name) = function.as_ref() {
+        if let Term::Apply { function, argument, .. } = self {
+            if let Term::Var { name, .. } = function.as_ref() {
                 let arg = Rc::make_mut(argument);
                 if name.text == CONSTR_FIELDS_EXPOSER {
                     *self = Term::snd_pair().apply(
-                        Term::unconstr_data().apply(std::mem::replace(arg, Term::Error.force())),
+                        Term::unconstr_data().apply(std::mem::replace(arg, Term::Error { uniq_id: next_uniq_id() }.force())),
                     )
                 } else if name.text == CONSTR_INDEX_EXPOSER {
                     *self = Term::fst_pair().apply(
-                        Term::unconstr_data().apply(std::mem::replace(arg, Term::Error.force())),
+                        Term::unconstr_data().apply(std::mem::replace(arg, Term::Error { uniq_id: next_uniq_id() }.force())),
                     )
                 }
             } else if let Term::Lambda {
                 parameter_name,
                 body,
+                ..
             } = Rc::make_mut(function)
             {
                 if parameter_name.text == CONSTR_INDEX_EXPOSER
                     || parameter_name.text == CONSTR_FIELDS_EXPOSER
                 {
                     let body = Rc::make_mut(body);
-                    *self = std::mem::replace(body, Term::Error)
+                    *self = std::mem::replace(body, Term::Error { uniq_id: next_uniq_id() }.force())
                 }
             }
         }
@@ -1923,14 +1942,14 @@ impl Term<Name> {
         let mut changed = false;
 
         match self {
-            Term::Builtin(first_function) => {
+            Term::Builtin { fun: first_function, .. } => {
                 let Some(Args::Apply(arg_id, mut arg_term)) = arg_stack.pop() else {
                     return false;
                 };
 
                 match &mut arg_term {
-                    Term::Apply { function, argument } => {
-                        if let Term::Builtin(second_function) = function.as_ref() {
+                    Term::Apply { function, argument, .. } => {
+                        if let Term::Builtin { fun: second_function, .. } = function.as_ref() {
                             match (first_function, second_function) {
                                 (DefaultFunction::UnIData, DefaultFunction::IData)
                                 | (DefaultFunction::IData, DefaultFunction::UnIData)
@@ -1944,14 +1963,14 @@ impl Term<Name> {
                                     context.inlined_apply_ids.push(arg_id);
                                     *self = std::mem::replace(
                                         Rc::make_mut(argument),
-                                        Term::Error.force(),
+                                        Term::Error { uniq_id: next_uniq_id() }.force(),
                                     );
                                 }
                                 _ => {}
                             }
                         }
                     }
-                    Term::Constant(c) => match (first_function, c.as_ref()) {
+                    Term::Constant { value: c, .. } => match (first_function, c.as_ref()) {
                         (
                             DefaultFunction::UnIData,
                             Constant::Data(PlutusData::BigInt(BigInt::Int(i))),
@@ -2053,15 +2072,15 @@ impl Term<Name> {
     ) -> bool {
         let mut changed = false;
         match self {
-            Term::Builtin(d @ DefaultFunction::SubtractInteger) => {
+            Term::Builtin { fun: d @ DefaultFunction::SubtractInteger, .. } => {
                 if arg_stack.len() == d.arity() {
-                    let Some(Args::Apply(apply_id, Term::Constant(_))) = arg_stack.last() else {
+                    let Some(Args::Apply(apply_id, Term::Constant { value: _, .. })) = arg_stack.last() else {
                         return false;
                     };
                     changed = true;
                     context.constants_to_flip.push(*apply_id);
 
-                    *self = Term::Builtin(DefaultFunction::AddInteger);
+                    *self = Term::Builtin { fun: DefaultFunction::AddInteger, uniq_id: next_uniq_id() };
                 }
             }
             Term::Constr { .. } => todo!(),
@@ -2081,7 +2100,7 @@ impl Term<Name> {
         let mut changed = false;
 
         match self {
-            Term::Builtin(func) => {
+            Term::Builtin { fun: func, .. } => {
                 arg_stack = arg_stack
                     .into_iter()
                     .filter(|args| matches!(args, Args::Apply(_, _)))
@@ -2102,7 +2121,7 @@ impl Term<Name> {
                     let applied_term =
                         arg_stack
                             .into_iter()
-                            .fold(Term::Builtin(*func), |acc, item| {
+                            .fold(Term::Builtin { fun: *func, uniq_id: next_uniq_id() }, |acc, item| {
                                 let Args::Apply(arg_id, arg) = item else {
                                     unreachable!()
                                 };
@@ -2142,7 +2161,7 @@ impl Term<Name> {
         context: &mut Context,
     ) {
         match self {
-            Term::Apply { function, .. } | Term::Force(function) => {
+            Term::Apply { function, .. } => {
                 // We inlined the arg so now we remove the application of it
                 let Some(id) = id else {
                     return;
@@ -2150,7 +2169,18 @@ impl Term<Name> {
 
                 if context.inlined_apply_ids.contains(&id) {
                     let func = Rc::make_mut(function);
-                    *self = std::mem::replace(func, Term::Error.force());
+                    *self = std::mem::replace(func, Term::Error { uniq_id: next_uniq_id() }.force());
+                }
+            }
+            Term::Force { body, .. } => {
+                // We inlined the arg so now we remove the application of it
+                let Some(id) = id else {
+                    return;
+                };
+
+                if context.inlined_apply_ids.contains(&id) {
+                    let b = Rc::make_mut(body);
+                    *self = std::mem::replace(b, Term::Error { uniq_id: next_uniq_id() }.force());
                 }
             }
             _ => (),
@@ -2170,7 +2200,7 @@ impl Term<Name> {
             };
 
             if context.constants_to_flip.contains(&id) {
-                let Term::Constant(c) = Rc::make_mut(argument) else {
+                let Term::Constant { value: c, .. } = Rc::make_mut(argument) else {
                     unreachable!();
                 };
 
@@ -2189,6 +2219,7 @@ impl Term<Name> {
         while let Term::Lambda {
             parameter_name,
             body,
+            ..
         } = term
         {
             if parameter_name.as_ref().text == NO_INLINE {
@@ -2207,16 +2238,17 @@ impl Term<Name> {
         while let Term::Lambda {
             parameter_name,
             body,
+            ..
         } = term
         {
             if parameter_name.as_ref().text == NO_INLINE {
-                *term = std::mem::replace(Rc::make_mut(body), Term::Error.force());
+                *term = std::mem::replace(Rc::make_mut(body), Term::Error { uniq_id: next_uniq_id() }.force());
             } else {
                 break;
             }
         }
 
-        std::mem::replace(term, Term::Error.force())
+        std::mem::replace(term, Term::Error { uniq_id: next_uniq_id() }.force())
     }
 
     fn is_a_builtin_wrapper(&self) -> bool {
@@ -2226,11 +2258,11 @@ impl Term<Name> {
 
         let mut term = term;
 
-        while let Term::Apply { function, argument } = term {
+        while let Term::Apply { function, argument, .. } = term {
             match argument.as_ref() {
-                Term::Var(name) => arg_names.push(format!("{}_{}", name.text, name.unique)),
+                Term::Var { name, .. } => arg_names.push(format!("{}_{}", name.text, name.unique)),
 
-                Term::Constant(_) => {}
+                Term::Constant { .. } => {}
                 _ => {
                     //Break loop, it's not a builtin wrapper function
                     return false;
@@ -2240,8 +2272,8 @@ impl Term<Name> {
         }
 
         let func_is_builtin = match term {
-            Term::Var(name) => forceable_wrapped_names().contains(&name.text),
-            Term::Builtin(_) => true,
+            Term::Var { name, .. } => forceable_wrapped_names().contains(&name.text),
+            Term::Builtin { .. } => true,
             _ => false,
         };
 
@@ -2256,6 +2288,7 @@ impl Term<Name> {
         while let Term::Lambda {
             parameter_name,
             body,
+            ..
         } = term
         {
             if parameter_name.text != NO_INLINE {
@@ -2345,9 +2378,9 @@ impl Program<Name> {
 
         for default_func in context.builtins_map.keys().sorted().cloned().rev() {
             term = term.apply(if default_func.force_count() == 1 {
-                Term::Builtin(default_func).force()
+                Term::Builtin { fun: default_func, uniq_id: next_uniq_id() }.force()
             } else {
-                Term::Builtin(default_func).force().force()
+                Term::Builtin { fun: default_func, uniq_id: next_uniq_id() }.force().force()
             });
         }
 
@@ -2471,7 +2504,7 @@ impl Program<Name> {
         let (step_a, _) = self.traverse_uplc_with(
             false,
             &mut |_id, term, arg_stack, scope, _context| match term {
-                Term::Builtin(func) => {
+                Term::Builtin { fun: func, .. } => {
                     if func.can_curry_builtin() && arg_stack.len() == func.arity() {
                         let arg_stack = arg_stack
                             .into_iter()
@@ -2541,7 +2574,7 @@ impl Program<Name> {
                             } else if id_vec.is_empty() {
                                 id_mapped_curry_terms.insert(
                                     curry_name,
-                                    (scope.clone(), Term::Builtin(*func).apply(node.term), 1),
+                                    (scope.clone(), Term::Builtin { fun: *func, uniq_id: next_uniq_id() }.apply(node.term), 1),
                                 );
                             } else {
                                 let var_name = id_vec_function_to_var(
@@ -2588,7 +2621,7 @@ impl Program<Name> {
         let (mut step_b, _) = step_a.traverse_uplc_with(
             false,
             &mut |id, term, arg_stack, scope, _context| match term {
-                Term::Builtin(func) => {
+                Term::Builtin { fun: func, .. } => {
                     if func.can_curry_builtin() && arg_stack.len() == func.arity() {
                         let mut arg_stack = arg_stack
                             .into_iter()
@@ -2710,10 +2743,7 @@ fn id_vec_function_to_var(func_name: &str, id_vec: &[usize]) -> String {
 mod tests {
     use super::NO_INLINE;
     use crate::{
-        ast::{Constant, Data, Name, NamedDeBruijn, Program, Term},
-        builder::{CONSTR_FIELDS_EXPOSER, CONSTR_INDEX_EXPOSER},
-        builtins::DefaultFunction,
-        optimize::interner::CodeGenInterner,
+        ast::{Constant, Data, Name, NamedDeBruijn, Program, Term}, builder::{CONSTR_FIELDS_EXPOSER, CONSTR_INDEX_EXPOSER}, builtins::DefaultFunction, global_uniq::next_uniq_id, optimize::interner::CodeGenInterner
     };
     use pallas_primitives::conway::{BigInt, PlutusData};
     use pretty_assertions::assert_eq;
@@ -2823,7 +2853,7 @@ mod tests {
                 .lambda("bar")
                 .apply(Term::integer(1.into()).delay())
                 .lambda("baz")
-                .apply(Term::Error)
+                .apply(Term::Error { uniq_id: next_uniq_id() })
                 .lambda("bat")
                 .apply(Term::bool(false).lambda("x")),
         };
@@ -2839,7 +2869,7 @@ mod tests {
                 .lambda("bar")
                 .apply(Term::integer(1.into()).delay())
                 .lambda("baz")
-                .apply(Term::Error)
+                .apply(Term::Error { uniq_id: next_uniq_id() })
                 .lambda("bat")
                 .apply(Term::bool(false).lambda("x")),
         };
@@ -2897,7 +2927,7 @@ mod tests {
                 )
                 .delayed_if_then_else(
                     Term::length_of_bytearray().apply(Term::byte_string(vec![])),
-                    Term::Error,
+                    Term::Error { uniq_id: next_uniq_id() },
                 )
                 .lambda("x")
                 .lambda("y"),
@@ -2918,12 +2948,12 @@ mod tests {
                         .apply(Term::byte_string(vec![]))
                         .delay(),
                 )
-                .apply(Term::Error.delay())
+                .apply(Term::Error { uniq_id: next_uniq_id() }.delay())
                 .force()
                 .lambda("x")
                 .lambda("y")
                 .lambda("__if_then_else_wrapped")
-                .apply(Term::Builtin(DefaultFunction::IfThenElse).force()),
+                .apply(Term::Builtin { fun: DefaultFunction::IfThenElse, uniq_id: next_uniq_id() }.force()),
         };
 
         compare_optimization(expected, program, |p| p.run_once_pass());
@@ -3160,12 +3190,12 @@ mod tests {
             term: Term::var("__if_then_else_wrapped")
                 .apply(Term::bool(true))
                 .apply(Term::sha3_256().apply(Term::var("x")).delay())
-                .apply(Term::Error.delay())
+                .apply(Term::Error { uniq_id: next_uniq_id() }.delay())
                 .force()
                 .lambda("x")
                 .apply(Term::sha3_256().apply(Term::byte_string(vec![])))
                 .lambda("__if_then_else_wrapped")
-                .apply(Term::Builtin(DefaultFunction::IfThenElse).force()),
+                .apply(Term::Builtin { fun: DefaultFunction::IfThenElse, uniq_id: next_uniq_id() }.force()),
         };
 
         let expected = Program {
@@ -3177,10 +3207,10 @@ mod tests {
                         .apply(Term::sha3_256().apply(Term::byte_string(vec![])))
                         .delay(),
                 )
-                .apply(Term::Error.delay())
+                .apply(Term::Error { uniq_id: next_uniq_id() }.delay())
                 .force()
                 .lambda("__if_then_else_wrapped")
-                .apply(Term::Builtin(DefaultFunction::IfThenElse).force()),
+                .apply(Term::Builtin { fun: DefaultFunction::IfThenElse, uniq_id: next_uniq_id() }.force()),
         };
 
         compare_optimization(expected, program, |p| {
@@ -3196,20 +3226,20 @@ mod tests {
             version: (1, 0, 0),
             term: Term::var("__if_then_else_wrapped")
                 .apply(Term::bool(true))
-                .apply(Term::Error.delay())
+                .apply(Term::Error { uniq_id: 0 }.delay())
                 .apply(Term::sha3_256().apply(Term::var("x")).delay())
                 .force()
                 .lambda("x")
                 .apply(Term::sha3_256().apply(Term::byte_string(vec![])))
                 .lambda("__if_then_else_wrapped")
-                .apply(Term::Builtin(DefaultFunction::IfThenElse).force()),
+                .apply(Term::Builtin { fun: DefaultFunction::IfThenElse, uniq_id: next_uniq_id() }.force()),
         };
 
         let expected = Program {
             version: (1, 0, 0),
             term: Term::var("__if_then_else_wrapped")
                 .apply(Term::bool(true))
-                .apply(Term::Error.delay())
+                .apply(Term::Error { uniq_id: next_uniq_id() }.delay())
                 .apply(
                     Term::sha3_256()
                         .apply(Term::sha3_256().apply(Term::byte_string(vec![])))
@@ -3217,7 +3247,7 @@ mod tests {
                 )
                 .force()
                 .lambda("__if_then_else_wrapped")
-                .apply(Term::Builtin(DefaultFunction::IfThenElse).force()),
+                .apply(Term::Builtin { fun: DefaultFunction::IfThenElse, uniq_id: next_uniq_id() }.force()),
         };
 
         compare_optimization(expected, program, |p| {
@@ -3253,9 +3283,7 @@ mod tests {
         let program: Program<Name> = Program {
             version: (1, 0, 0),
             term: Term::equals_data()
-                .apply(Term::i_data().apply(Term::un_i_data().apply(Term::Constant(
-                    Constant::Data(PlutusData::BigInt(BigInt::Int(5.into()))).into(),
-                ))))
+                .apply(Term::i_data().apply(Term::un_i_data().apply(Term::Constant { value: Constant::Data(PlutusData::BigInt(BigInt::Int(5.into()))).into(), uniq_id: 0 })))
                 .apply(Term::i_data().apply(Term::integer(1.into())))
                 .lambda("x"),
         };
@@ -3263,9 +3291,7 @@ mod tests {
         let expected = Program {
             version: (1, 0, 0),
             term: Term::equals_data()
-                .apply(Term::Constant(
-                    Constant::Data(PlutusData::BigInt(BigInt::Int(5.into()))).into(),
-                ))
+                .apply(Term::Constant { value: Constant::Data(PlutusData::BigInt(BigInt::Int(5.into()))).into(), uniq_id: 0 })
                 .apply(Term::data(Data::integer(1.into())))
                 .lambda("x"),
         };
@@ -3283,9 +3309,10 @@ mod tests {
             version: (1, 0, 0),
             term: Term::equals_integer()
                 .apply(Term::un_i_data().apply(Term::i_data().apply(Term::integer(1.into()))))
-                .apply(Term::un_i_data().apply(Term::Constant(
-                    Constant::Data(PlutusData::BigInt(BigInt::Int(5.into()))).into(),
-                )))
+                .apply(Term::un_i_data().apply(Term::Constant {
+                    value: Constant::Data(PlutusData::BigInt(BigInt::Int(5.into()))).into(),
+                    uniq_id: 0,
+                }))
                 .lambda("x"),
         };
 

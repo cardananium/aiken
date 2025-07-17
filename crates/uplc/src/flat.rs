@@ -1,9 +1,7 @@
 use crate::{
     ast::{
         Constant, DeBruijn, FakeNamedDeBruijn, Name, NamedDeBruijn, Program, Term, Type, Unique,
-    },
-    builtins::DefaultFunction,
-    machine::runtime::Compressable,
+    }, builtins::DefaultFunction, global_uniq::next_uniq_id, machine::runtime::Compressable
 };
 use num_bigint::BigInt;
 use pallas_codec::flat::{
@@ -188,54 +186,55 @@ where
 {
     fn encode(&self, e: &mut Encoder) -> Result<(), en::Error> {
         match self {
-            Term::Var(name) => {
+            Term::Var { name, .. } => {
                 encode_term_tag(0, e)?;
                 name.encode(e)?;
             }
-            Term::Delay(term) => {
+            Term::Delay { body, .. } => {
                 encode_term_tag(1, e)?;
-                term.encode(e)?;
+                body.encode(e)?;
             }
             Term::Lambda {
                 parameter_name,
                 body,
+                ..
             } => {
                 encode_term_tag(2, e)?;
                 parameter_name.binder_encode(e)?;
                 body.encode(e)?;
             }
-            Term::Apply { function, argument } => {
+            Term::Apply { function, argument, .. } => {
                 encode_term_tag(3, e)?;
                 function.encode(e)?;
                 argument.encode(e)?;
             }
 
-            Term::Constant(constant) => {
+            Term::Constant { value: constant, .. } => {
                 encode_term_tag(4, e)?;
                 constant.encode(e)?;
             }
 
-            Term::Force(term) => {
+            Term::Force { body, .. } => {
                 encode_term_tag(5, e)?;
-                term.encode(e)?;
+                body.encode(e)?;
             }
 
-            Term::Error => {
+            Term::Error { .. } => {
                 encode_term_tag(6, e)?;
             }
-            Term::Builtin(builtin) => {
+            Term::Builtin { fun, .. } => {
                 encode_term_tag(7, e)?;
 
-                builtin.encode(e)?;
+                fun.encode(e)?;
             }
-            Term::Constr { tag, fields } => {
+            Term::Constr { tag, fields, .. } => {
                 encode_term_tag(8, e)?;
 
                 tag.encode(e)?;
 
                 e.encode_list_with(fields, |term, e| (*term).encode(e))?;
             }
-            Term::Case { constr, branches } => {
+            Term::Case { constr, branches, .. } => {
                 encode_term_tag(9, e)?;
 
                 constr.encode(e)?;
@@ -254,33 +253,50 @@ where
 {
     fn decode(d: &mut Decoder) -> Result<Self, de::Error> {
         match decode_term_tag(d)? {
-            0 => Ok(Term::Var(T::decode(d)?.into())),
-            1 => Ok(Term::Delay(Rc::new(Term::decode(d)?))),
+            0 => Ok(Term::Var {
+                name: T::decode(d)?.into(),
+                uniq_id: next_uniq_id(),
+            }),
+            1 => Ok(Term::Delay {
+                body: Rc::new(Term::decode(d)?),
+                uniq_id: next_uniq_id(),
+            }),
             2 => Ok(Term::Lambda {
                 parameter_name: T::binder_decode(d)?.into(),
                 body: Rc::new(Term::decode(d)?),
+                uniq_id: next_uniq_id(),
             }),
             3 => Ok(Term::Apply {
                 function: Rc::new(Term::decode(d)?),
                 argument: Rc::new(Term::decode(d)?),
+                uniq_id: next_uniq_id(),
             }),
             // Need size limit for Constant
-            4 => Ok(Term::Constant(Constant::decode(d)?.into())),
-            5 => Ok(Term::Force(Rc::new(Term::decode(d)?))),
-            6 => Ok(Term::Error),
-            7 => Ok(Term::Builtin(DefaultFunction::decode(d)?)),
+            4 => Ok(Term::Constant {
+                value: Constant::decode(d)?.into(),
+                uniq_id: next_uniq_id(),
+            }),
+            5 => Ok(Term::Force {
+                body: Rc::new(Term::decode(d)?),
+                uniq_id: next_uniq_id(),
+            }),
+            6 => Ok(Term::Error {
+                uniq_id: next_uniq_id(),
+            }),
             8 => {
                 let tag = usize::decode(d)?;
                 let fields = d.decode_list_with(Term::<T>::decode)?;
+                let uniq_id = next_uniq_id();
 
-                Ok(Term::Constr { tag, fields })
+                Ok(Term::Constr { tag, fields, uniq_id })
             }
             9 => {
                 let constr = (Term::<T>::decode(d)?).into();
 
                 let branches = d.decode_list_with(Term::<T>::decode)?;
+                let uniq_id = next_uniq_id();
 
-                Ok(Term::Case { constr, branches })
+                Ok(Term::Case { constr, branches, uniq_id })
             }
             x => {
                 let buffer_slice: Vec<u8> = d
@@ -316,7 +332,10 @@ where
                 match var_option {
                     Ok(var) => {
                         state_log.push(format!("{})", var.text()));
-                        Ok(Term::Var(var.into()))
+                        Ok(Term::Var {
+                            name: var.into(),
+                            uniq_id: next_uniq_id(),
+                        })
                     }
                     Err(error) => {
                         state_log.push("parse error)".to_string());
@@ -331,7 +350,10 @@ where
                 match term_option {
                     Ok(term) => {
                         state_log.push(")".to_string());
-                        Ok(Term::Delay(Rc::new(term)))
+                        Ok(Term::Delay {
+                            body: Rc::new(term),
+                            uniq_id: next_uniq_id(),
+                        })
                     }
                     Err(error) => {
                         state_log.push(")".to_string());
@@ -353,6 +375,7 @@ where
                                 Ok(Term::Lambda {
                                     parameter_name: var.into(),
                                     body: Rc::new(term),
+                                    uniq_id: next_uniq_id(),
                                 })
                             }
                             Err(error) => {
@@ -381,6 +404,7 @@ where
                                 Ok(Term::Apply {
                                     function: Rc::new(function),
                                     argument: Rc::new(argument),
+                                    uniq_id: next_uniq_id(),
                                 })
                             }
                             Err(error) => {
@@ -403,7 +427,10 @@ where
                 match con_option {
                     Ok(constant) => {
                         state_log.push(format!("{})", constant.to_pretty()));
-                        Ok(Term::Constant(constant.into()))
+                        Ok(Term::Constant {
+                            value: constant.into(),
+                            uniq_id: next_uniq_id(),
+                        })
                     }
                     Err(error) => {
                         state_log.push("parse error)".to_string());
@@ -417,7 +444,10 @@ where
                 match term_option {
                     Ok(term) => {
                         state_log.push(")".to_string());
-                        Ok(Term::Force(Rc::new(term)))
+                        Ok(Term::Force {
+                            body: Rc::new(term),
+                            uniq_id: next_uniq_id(),
+                        })
                     }
                     Err(error) => {
                         state_log.push(")".to_string());
@@ -427,7 +457,9 @@ where
             }
             6 => {
                 state_log.push("(error)".to_string());
-                Ok(Term::Error)
+                Ok(Term::Error {
+                    uniq_id: next_uniq_id(),
+                })
             }
             7 => {
                 state_log.push("(builtin ".to_string());
@@ -436,7 +468,10 @@ where
                 match builtin_option {
                     Ok(builtin) => {
                         state_log.push(format!("{builtin})"));
-                        Ok(Term::Builtin(builtin))
+                        Ok(Term::Builtin {
+                            fun: builtin,
+                            uniq_id: next_uniq_id(),
+                        })
                     }
                     Err(error) => {
                         state_log.push("parse error)".to_string());
@@ -454,7 +489,11 @@ where
                     state_log,
                 )?;
 
-                Ok(Term::Constr { tag, fields })
+                Ok(Term::Constr {
+                    tag,
+                    fields,
+                    uniq_id: next_uniq_id(),
+                })
             }
             9 => {
                 state_log.push("(case ".to_string());
@@ -465,7 +504,11 @@ where
                     state_log,
                 )?;
 
-                Ok(Term::Case { constr, branches })
+                Ok(Term::Case {
+                    constr,
+                    branches,
+                    uniq_id: next_uniq_id(),
+                })
             }
             x => {
                 state_log.push("parse error".to_string());
@@ -1000,8 +1043,7 @@ pub fn decode_constant_tag(d: &mut Decoder) -> Result<u8, de::Error> {
 mod tests {
     use super::{Constant, Program, Term};
     use crate::{
-        ast::{DeBruijn, Name, Type},
-        parser,
+        ast::{DeBruijn, Name, Type}, global_uniq::next_uniq_id, parser
     };
     use indoc::indoc;
     use pallas_codec::flat::Flat;
@@ -1010,7 +1052,10 @@ mod tests {
     fn flat_encode_integer() {
         let program = Program::<Name> {
             version: (11, 22, 33),
-            term: Term::Constant(Constant::Integer(11.into()).into()),
+            term: Term::Constant {
+                value: Constant::Integer(11.into()).into(),
+                uniq_id: next_uniq_id(),
+            },
         };
 
         let expected_bytes = vec![
@@ -1026,8 +1071,8 @@ mod tests {
     fn flat_encode_list_list_integer() {
         let program = Program::<Name> {
             version: (1, 0, 0),
-            term: Term::Constant(
-                Constant::ProtoList(
+            term: Term::Constant{
+                value: Constant::ProtoList(
                     Type::List(Type::Integer.into()),
                     vec![
                         Constant::ProtoList(Type::Integer, vec![Constant::Integer(7.into())]),
@@ -1035,7 +1080,8 @@ mod tests {
                     ],
                 )
                 .into(),
-            ),
+                uniq_id: next_uniq_id(),
+            },
         };
 
         let expected_bytes = vec![
@@ -1052,8 +1098,8 @@ mod tests {
     fn flat_encode_pair_pair_integer_bool_integer() {
         let program = Program::<Name> {
             version: (1, 0, 0),
-            term: Term::Constant(
-                Constant::ProtoPair(
+            term: Term::Constant {
+                value: Constant::ProtoPair(
                     Type::Pair(Type::Integer.into(), Type::Bool.into()),
                     Type::Integer,
                     Constant::ProtoPair(
@@ -1066,7 +1112,8 @@ mod tests {
                     Constant::Integer(11.into()).into(),
                 )
                 .into(),
-            ),
+                uniq_id: next_uniq_id(),
+            },
         };
 
         let expected_bytes = vec![
@@ -1088,8 +1135,8 @@ mod tests {
 
         let expected_program = Program::<Name> {
             version: (1, 0, 0),
-            term: Term::Constant(
-                Constant::ProtoList(
+            term: Term::Constant {
+                value: Constant::ProtoList(
                     Type::List(Type::Integer.into()),
                     vec![
                         Constant::ProtoList(Type::Integer, vec![Constant::Integer(7.into())]),
@@ -1097,7 +1144,8 @@ mod tests {
                     ],
                 )
                 .into(),
-            ),
+                uniq_id: next_uniq_id(),
+            },
         };
 
         let actual_program: Program<Name> = Program::unflat(&bytes).unwrap();
@@ -1114,8 +1162,8 @@ mod tests {
 
         let expected_program = Program::<Name> {
             version: (1, 0, 0),
-            term: Term::Constant(
-                Constant::ProtoPair(
+            term: Term::Constant {
+                value: Constant::ProtoPair(
                     Type::Pair(Type::Integer.into(), Type::Bool.into()),
                     Type::Integer,
                     Constant::ProtoPair(
@@ -1128,7 +1176,8 @@ mod tests {
                     Constant::Integer(11.into()).into(),
                 )
                 .into(),
-            ),
+                uniq_id: next_uniq_id(),
+            },
         };
 
         let actual_program: Program<Name> = Program::unflat(&bytes).unwrap();
@@ -1144,7 +1193,10 @@ mod tests {
 
         let expected_program = Program {
             version: (11, 22, 33),
-            term: Term::Constant(Constant::Integer(11.into()).into()),
+            term: Term::Constant {
+                value: Constant::Integer(11.into()).into(),
+                uniq_id: next_uniq_id(),
+            },
         };
 
         let actual_program: Program<Name> = Program::unflat(&bytes).unwrap();

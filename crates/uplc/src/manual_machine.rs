@@ -1,6 +1,7 @@
 use std::rc::Rc;
 
 use crate::ast::{NamedDeBruijn, Term};
+use crate::global_uniq::next_uniq_id;
 use crate::machine::{
     cost_model::{ExBudget, StepKind, CostModel},
     runtime::BuiltinRuntime,
@@ -22,37 +23,6 @@ pub enum ExecutionStatus {
 }
 
 /// Manual machine for step-by-step execution of UPLC code
-/// 
-/// # Usage Example
-/// 
-/// ```rust
-/// use uplc::manual_machine::{ManualMachine, ExecutionStatus};
-/// use uplc::machine::cost_model::{CostModel, ExBudget};
-/// use uplc::ast::{Term, Constant};
-/// use pallas_primitives::conway::Language;
-/// 
-/// let term = Term::Constant(Constant::Integer(42.into()).into());
-/// 
-/// let mut machine = ManualMachine::new(
-///     Language::PlutusV2,
-///     CostModel::default(),
-///     ExBudget::max(),
-///     1000,
-///     term,
-/// ).unwrap();
-/// 
-/// // Step-by-step execution
-/// while machine.is_ready() {
-///     machine.step();
-/// }
-/// 
-/// // Check result
-/// match machine.status() {
-///     ExecutionStatus::Done(result) => println!("Result: {:?}", result),
-///     ExecutionStatus::Error(error) => println!("Error: {:?}", error),
-///     _ => {},
-/// }
-/// ```
 pub struct ManualMachine {
     /// Current machine state
     state: MachineState,
@@ -156,7 +126,7 @@ impl ManualMachine {
             return &self.status;
         }
 
-        match std::mem::replace(&mut self.state, MachineState::Done(Term::Error)) {
+        match std::mem::replace(&mut self.state, MachineState::Done(Term::Error { uniq_id: next_uniq_id() })) {
             MachineState::Compute(context, env, term) => {
                 match self.compute(context, env, term) {
                     Ok(new_state) => {
@@ -260,35 +230,6 @@ impl ManualMachine {
     /// - Last element is the innermost context (usually NoFrame)
     /// - Empty vector if machine is in Done state
     /// 
-    /// # Example
-    /// 
-    /// ```rust
-    /// use uplc::manual_machine::{ManualMachine, ExecutionStatus};
-    /// use uplc::machine::cost_model::{CostModel, ExBudget};
-    /// use uplc::ast::{Term, Constant};
-    /// use pallas_primitives::conway::Language;
-    /// 
-    /// let term = Term::Apply {
-    ///     function: Term::Builtin(uplc::builtins::DefaultFunction::AddInteger).into(),
-    ///     argument: Term::Constant(Constant::Integer(42.into()).into()).into(),
-    /// };
-    /// 
-    /// let mut machine = ManualMachine::new(
-    ///     Language::PlutusV2,
-    ///     CostModel::default(),
-    ///     ExBudget::max(),
-    ///     1000,
-    ///     term,
-    /// ).unwrap();
-    /// 
-    /// // Execute a few steps and examine contexts
-    /// machine.step();
-    /// let contexts = machine.collect_nested_contexts();
-    /// 
-    /// for (i, context) in contexts.iter().enumerate() {
-    ///     println!("Context level {}: {:?}", i, context);
-    /// }
-    /// ```
     pub fn collect_nested_contexts(&self) -> Vec<Context> {
         let mut contexts = Vec::new();
         
@@ -310,7 +251,7 @@ impl ManualMachine {
                 Context::FrameAwaitFunTerm(_, _, nested_ctx) => Some(nested_ctx.as_ref()),
                 Context::FrameAwaitArg(_, nested_ctx) => Some(nested_ctx.as_ref()),
                 Context::FrameAwaitFunValue(_, nested_ctx) => Some(nested_ctx.as_ref()),
-                Context::FrameConstr(_, _, _, _, nested_ctx) => Some(nested_ctx.as_ref()),
+                Context::FrameConstr(_, _, _, _, nested_ctx, _) => Some(nested_ctx.as_ref()),
                 Context::FrameCases(_, _, nested_ctx) => Some(nested_ctx.as_ref()),
             };
         }
@@ -326,21 +267,22 @@ impl ManualMachine {
         term: Term<NamedDeBruijn>,
     ) -> Result<MachineState, Error> {
         match term {
-            Term::Var(name) => {
+            Term::Var { name, uniq_id } => {
                 self.step_and_maybe_spend(StepKind::Var)?;
 
-                let val = self.lookup_var(name.as_ref(), &env)?;
+                let val = self.lookup_var(name.as_ref(), &env, uniq_id)?;
 
                 Ok(MachineState::Return(context, val))
             }
-            Term::Delay(body) => {
+            Term::Delay { body, uniq_id } => {
                 self.step_and_maybe_spend(StepKind::Delay)?;
 
-                Ok(MachineState::Return(context, Value::Delay(body, env)))
+                Ok(MachineState::Return(context, Value::Delay { body, env, term_id: uniq_id }))
             }
             Term::Lambda {
                 parameter_name,
                 body,
+                uniq_id,
             } => {
                 self.step_and_maybe_spend(StepKind::Lambda)?;
 
@@ -350,10 +292,11 @@ impl ManualMachine {
                         parameter_name,
                         body,
                         env,
+                        term_id: uniq_id,
                     },
                 ))
             }
-            Term::Apply { function, argument } => {
+            Term::Apply { function, argument, .. } => {
                 self.step_and_maybe_spend(StepKind::Apply)?;
 
                 Ok(MachineState::Compute(
@@ -366,12 +309,12 @@ impl ManualMachine {
                     function.as_ref().clone(),
                 ))
             }
-            Term::Constant(x) => {
+            Term::Constant { value, .. } => {
                 self.step_and_maybe_spend(StepKind::Constant)?;
 
-                Ok(MachineState::Return(context, Value::Con(x)))
+                Ok(MachineState::Return(context, Value::Con(value)))
             }
-            Term::Force(body) => {
+            Term::Force { body, .. } => {
                 self.step_and_maybe_spend(StepKind::Force)?;
 
                 Ok(MachineState::Compute(
@@ -380,18 +323,18 @@ impl ManualMachine {
                     body.as_ref().clone(),
                 ))
             }
-            Term::Error => Err(Error::EvaluationFailure),
-            Term::Builtin(fun) => {
+            Term::Error { .. } => Err(Error::EvaluationFailure),
+            Term::Builtin { fun, uniq_id } => {
                 self.step_and_maybe_spend(StepKind::Builtin)?;
 
                 let runtime: BuiltinRuntime = fun.into();
 
                 Ok(MachineState::Return(
                     context,
-                    Value::Builtin { fun, runtime },
+                    Value::Builtin { fun, runtime, term_id: uniq_id },
                 ))
             }
-            Term::Constr { tag, mut fields } => {
+            Term::Constr { tag, mut fields, uniq_id } => {
                 self.step_and_maybe_spend(StepKind::Constr)?;
 
                 fields.reverse();
@@ -400,7 +343,7 @@ impl ManualMachine {
                     let popped_field = fields.pop().unwrap();
 
                     Ok(MachineState::Compute(
-                        Context::FrameConstr(env.clone(), tag, fields, vec![], context.into()),
+                        Context::FrameConstr(env.clone(), tag, fields, vec![], context.into(), uniq_id),
                         env,
                         popped_field,
                     ))
@@ -410,11 +353,12 @@ impl ManualMachine {
                         Value::Constr {
                             tag,
                             fields: vec![],
+                            term_id: uniq_id,
                         },
                     ))
                 }
             }
-            Term::Case { constr, branches } => {
+            Term::Case { constr, branches, .. } => {
                 self.step_and_maybe_spend(StepKind::Case)?;
 
                 Ok(MachineState::Compute(
@@ -445,14 +389,14 @@ impl ManualMachine {
             )),
             Context::FrameAwaitArg(fun, ctx) => self.apply_evaluate(*ctx, fun, value),
             Context::FrameAwaitFunValue(arg, ctx) => self.apply_evaluate(*ctx, value, arg),
-            Context::FrameConstr(env, tag, mut fields, mut resolved_fields, ctx) => {
+            Context::FrameConstr(env, tag, mut fields, mut resolved_fields, ctx, uniq_id) => {
                 resolved_fields.push(value);
 
                 if !fields.is_empty() {
                     let popped_field = fields.pop().unwrap();
 
                     Ok(MachineState::Compute(
-                        Context::FrameConstr(env.clone(), tag, fields, resolved_fields, ctx),
+                        Context::FrameConstr(env.clone(), tag, fields, resolved_fields, ctx, uniq_id),
                         env,
                         popped_field,
                     ))
@@ -462,12 +406,13 @@ impl ManualMachine {
                         Value::Constr {
                             tag,
                             fields: resolved_fields,
+                            term_id: uniq_id,
                         },
                     ))
                 }
             }
             Context::FrameCases(env, branches, ctx) => match value {
-                Value::Constr { tag, fields } => match branches.get(tag) {
+                Value::Constr { tag, fields, term_id } => match branches.get(tag) {
                     Some(t) => Ok(MachineState::Compute(
                         transfer_arg_stack(fields, *ctx),
                         env,
@@ -475,7 +420,7 @@ impl ManualMachine {
                     )),
                     None => Err(Error::MissingCaseBranch(
                         branches,
-                        Value::Constr { tag, fields },
+                        Value::Constr { tag, fields, term_id },
                     )),
                 },
                 v => Err(Error::NonConstrScrutinized(v)),
@@ -485,22 +430,22 @@ impl ManualMachine {
 
     fn force_evaluate(&mut self, context: Context, value: Value) -> Result<MachineState, Error> {
         match value {
-            Value::Delay(body, env) => {
+            Value::Delay { body, env, .. } => {
                 Ok(MachineState::Compute(context, env, body.as_ref().clone()))
             }
-            Value::Builtin { fun, mut runtime } => {
+            Value::Builtin { fun, mut runtime, term_id } => {
                 if runtime.needs_force() {
                     runtime.consume_force();
 
                     let res = if runtime.is_ready() {
                         self.eval_builtin_app(runtime)?
                     } else {
-                        Value::Builtin { fun, runtime }
+                        Value::Builtin { fun, runtime, term_id: term_id }
                     };
 
                     Ok(MachineState::Return(context, res))
                 } else {
-                    let term = value_as_term(Value::Builtin { fun, runtime });
+                    let term = value_as_term(Value::Builtin { fun, runtime, term_id: term_id });
 
                     Err(Error::BuiltinTermArgumentExpected(term))
                 }
@@ -527,7 +472,7 @@ impl ManualMachine {
                     body.as_ref().clone(),
                 ))
             }
-            Value::Builtin { fun, runtime } => {
+            Value::Builtin { fun, runtime, term_id } => {
                 if runtime.is_arrow() && !runtime.needs_force() {
                     let mut runtime = runtime;
 
@@ -536,12 +481,12 @@ impl ManualMachine {
                     let res = if runtime.is_ready() {
                         self.eval_builtin_app(runtime)?
                     } else {
-                        Value::Builtin { fun, runtime }
+                        Value::Builtin { fun, runtime, term_id }
                     };
 
                     Ok(MachineState::Return(context, res))
                 } else {
-                    let term = value_as_term(Value::Builtin { fun, runtime });
+                    let term = value_as_term(Value::Builtin { fun, runtime, term_id });
 
                     Err(Error::UnexpectedBuiltinTermArgument(term))
                 }
@@ -565,10 +510,10 @@ impl ManualMachine {
         runtime.call(&self.version, &mut self.traces)
     }
 
-    fn lookup_var(&mut self, name: &NamedDeBruijn, env: &[Value]) -> Result<Value, Error> {
+    fn lookup_var(&mut self, name: &NamedDeBruijn, env: &[Value], term_id: isize) -> Result<Value, Error> {
         env.get::<usize>(env.len() - usize::from(name.index))
             .cloned()
-            .ok_or_else(|| Error::OpenTermEvaluated(Term::Var(name.clone().into())))
+            .ok_or_else(|| Error::OpenTermEvaluated(Term::Var { name: name.clone().into(), uniq_id: term_id }))
     }
 
     fn step_and_maybe_spend(&mut self, step: StepKind) -> Result<(), Error> {
@@ -637,7 +582,10 @@ mod tests {
 
     #[test]
     fn test_manual_machine_simple() {
-        let term = Term::Constant(Constant::Integer(42.into()).into());
+        let term = Term::Constant {
+            value: Constant::Integer(42.into()).into(),
+            uniq_id: 0,
+        };
         
         let mut machine = ManualMachine::new(
             Language::PlutusV2,
@@ -661,7 +609,10 @@ mod tests {
         
         // Check result
         if let ExecutionStatus::Done(result) = final_status {
-            assert_eq!(result, &Term::Constant(Constant::Integer(42.into()).into()));
+            assert_eq!(result, &Term::Constant {
+                value: Constant::Integer(42.into()).into(),
+                uniq_id: 0,
+            });
         } else {
             panic!("Expected Done status, got: {:?}", final_status);
         }
@@ -672,12 +623,23 @@ mod tests {
         let program: Program<NamedDeBruijn> = Program {
             version: (0, 0, 0),
             term: Term::Apply {
+                uniq_id: 0,
                 function: Term::Apply {
-                    function: Term::Builtin(DefaultFunction::AddInteger).into(),
-                    argument: Term::Constant(Constant::Integer(2.into()).into()).into(),
+                    uniq_id: 1,
+                    function: Term::Builtin {
+                        fun: DefaultFunction::AddInteger,
+                        uniq_id: 2,
+                    }.into(),
+                    argument: Term::Constant {
+                        value: Constant::Integer(2.into()).into(),
+                        uniq_id: 3,
+                    }.into(),
                 }
                 .into(),
-                argument: Term::Constant(Constant::Integer(3.into()).into()).into(),
+                argument: Term::Constant {
+                    value: Constant::Integer(3.into()).into(),
+                    uniq_id: 4,
+                }.into(),
             },
         };
 
@@ -704,7 +666,10 @@ mod tests {
 
         // Check result
         if let ExecutionStatus::Done(result) = machine.status() {
-            assert_eq!(result, &Term::Constant(Constant::Integer(5.into()).into()));
+            assert_eq!(result, &Term::Constant {
+                value: Constant::Integer(5.into()).into(),
+                uniq_id: 0,
+            });
         } else {
             panic!("Expected Done status, got: {:?}", machine.status());
         }
@@ -714,8 +679,14 @@ mod tests {
 
     #[test]
     fn test_manual_machine_reset() {
-        let term1 = Term::Constant(Constant::Integer(42.into()).into());
-        let term2 = Term::Constant(Constant::Integer(24.into()).into());
+        let term1 = Term::Constant {
+            value: Constant::Integer(42.into()).into(),
+            uniq_id: 0,
+        };
+        let term2 = Term::Constant {
+            value: Constant::Integer(24.into()).into(),
+            uniq_id: 1,
+        };
         
         let mut machine = ManualMachine::new(
             Language::PlutusV2,
@@ -737,7 +708,10 @@ mod tests {
         machine.run_to_completion();
         
         if let ExecutionStatus::Done(result) = machine.status() {
-            assert_eq!(result, &Term::Constant(Constant::Integer(24.into()).into()));
+            assert_eq!(result, &Term::Constant {
+                value: Constant::Integer(24.into()).into(),
+                uniq_id: 1,
+            });
         } else {
             panic!("Expected Done status after reset");
         }
@@ -750,12 +724,23 @@ mod tests {
         let program: Program<NamedDeBruijn> = Program {
             version: (0, 0, 0),
             term: Term::Apply {
+                uniq_id: 0,
                 function: Term::Apply {
-                    function: Term::Builtin(DefaultFunction::AddInteger).into(),
-                    argument: Term::Constant(Constant::Integer(i128::MAX.into()).into()).into(),
+                    uniq_id: 1,
+                    function: Term::Builtin {
+                        fun: DefaultFunction::AddInteger,
+                        uniq_id: 2,
+                    }.into(),
+                    argument: Term::Constant {
+                        value: Constant::Integer(i128::MAX.into()).into(),
+                        uniq_id: 3,
+                    }.into(),
                 }
                 .into(),
-                argument: Term::Constant(Constant::Integer(i128::MAX.into()).into()).into(),
+                argument: Term::Constant {
+                    value: Constant::Integer(i128::MAX.into()).into(),
+                    uniq_id: 4,
+                }.into(),
             },
         };
 
@@ -772,12 +757,13 @@ mod tests {
 
         // Check result
         if let ExecutionStatus::Done(result) = machine.status() {
-            let expected = Term::Constant(
-                Constant::Integer(
+            let expected = Term::Constant {
+                value: Constant::Integer(
                     Into::<BigInt>::into(i128::MAX) + Into::<BigInt>::into(i128::MAX)
                 )
-                .into()
-            );
+                .into(),
+                uniq_id: 0,
+            };
             assert_eq!(result, &expected);
         } else {
             panic!("Expected Done status, got: {:?}", machine.status());
@@ -789,12 +775,23 @@ mod tests {
         let make_program = |fun: DefaultFunction, n: i32, m: i32| Program::<NamedDeBruijn> {
             version: (0, 0, 0),
             term: Term::Apply {
+                uniq_id: 0,
                 function: Term::Apply {
-                    function: Term::Builtin(fun).into(),
-                    argument: Term::Constant(Constant::Integer(n.into()).into()).into(),
+                    uniq_id: 1,
+                    function: Term::Builtin {
+                        fun,
+                        uniq_id: 2,
+                    }.into(),
+                    argument: Term::Constant {
+                        value: Constant::Integer(n.into()).into(),
+                        uniq_id: 3,
+                    }.into(),
                 }
                 .into(),
-                argument: Term::Constant(Constant::Integer(m.into()).into()).into(),
+                argument: Term::Constant {
+                    value: Constant::Integer(m.into()).into(),
+                    uniq_id: 4,
+                }.into(),
             },
         };
 
@@ -840,7 +837,10 @@ mod tests {
 
             // Check result
             if let ExecutionStatus::Done(result) = machine.status() {
-                let expected = Term::Constant(Constant::Integer(expected_result.into()).into());
+                let expected = Term::Constant {
+                    value: Constant::Integer(expected_result.into()).into(),
+                    uniq_id: 0,
+                };
                 assert_eq!(result, &expected, "Failed for {:?}({}, {})", fun, n, m);
             } else {
                 panic!("Expected Done status for {:?}({}, {}), got: {:?}", fun, n, m, machine.status());
@@ -854,15 +854,32 @@ mod tests {
             |fun: DefaultFunction, tag: usize, n: i32, m: i32| Program::<NamedDeBruijn> {
                 version: (0, 0, 0),
                 term: Term::Case {
+                    uniq_id: 0,
                     constr: Term::Constr {
                         tag,
                         fields: vec![
-                            Term::Constant(Constant::Integer(n.into()).into()),
-                            Term::Constant(Constant::Integer(m.into()).into()),
+                            Term::Constant {
+                                value: Constant::Integer(n.into()).into(),
+                                uniq_id: 1,
+                            },
+                            Term::Constant {
+                                value: Constant::Integer(m.into()).into(),
+                                uniq_id: 2,
+                            },
                         ],
+                        uniq_id: 3,
                     }
                     .into(),
-                    branches: vec![Term::Builtin(fun), Term::subtract_integer()],
+                    branches: vec![
+                        Term::Builtin {
+                            fun,
+                            uniq_id: 4,
+                        },
+                        Term::Builtin {
+                            fun: DefaultFunction::SubtractInteger,
+                            uniq_id: 5,
+                        },
+                    ],
                 },
             };
 
@@ -895,7 +912,10 @@ mod tests {
 
             // Check result
             if let ExecutionStatus::Done(result) = machine.status() {
-                let expected = Term::Constant(Constant::Integer(expected_result.into()).into());
+                let expected = Term::Constant {
+                    value: Constant::Integer(expected_result.into()).into(),
+                    uniq_id: 0,
+                };
                 assert_eq!(result, &expected, "Failed for tag {} with {:?}", tag, fun);
             } else {
                 panic!("Expected Done status for case test, got: {:?}", machine.status());
@@ -908,15 +928,26 @@ mod tests {
         let make_program = |tag: usize| Program::<NamedDeBruijn> {
             version: (0, 0, 0),
             term: Term::Case {
+                uniq_id: 0,
                 constr: Term::Constr {
                     tag,
                     fields: vec![],
+                    uniq_id: 1,
                 }
                 .into(),
                 branches: vec![
-                    Term::integer(5.into()),
-                    Term::integer(10.into()),
-                    Term::integer(15.into()),
+                    Term::Constant {
+                        value: Constant::Integer(5.into()).into(),
+                        uniq_id: 2,
+                    },
+                    Term::Constant {
+                        value: Constant::Integer(10.into()).into(),
+                        uniq_id: 3,
+                    },
+                    Term::Constant {
+                        value: Constant::Integer(15.into()).into(),
+                        uniq_id: 4,
+                    },
                 ],
             },
         };
@@ -948,7 +979,10 @@ mod tests {
 
             // Check result
             if let ExecutionStatus::Done(result) = machine.status() {
-                let expected = Term::Constant(Constant::Integer(expected_result.into()).into());
+                let expected = Term::Constant {
+                    value: Constant::Integer(expected_result.into()).into(),
+                    uniq_id: 0,
+                };
                 assert_eq!(result, &expected, "Failed for tag {}", tag);
             } else {
                 panic!("Expected Done status for tag {}, got: {:?}", tag, machine.status());
@@ -959,13 +993,24 @@ mod tests {
     #[test]
     fn test_manual_machine_step_by_step_comparison() {
         // Compare the result of ManualMachine with the regular Machine through Program::eval
-        let term = Term::Apply {
+        let term = Term::   Apply {
+            uniq_id: 0,
             function: Term::Apply {
-                function: Term::Builtin(DefaultFunction::MultiplyInteger).into(),
-                argument: Term::Constant(Constant::Integer(6.into()).into()).into(),
+                uniq_id: 1,
+                function: Term::Builtin {
+                    fun: DefaultFunction::MultiplyInteger,
+                    uniq_id: 2,
+                }.into(),
+                argument: Term::Constant {
+                    value: Constant::Integer(6.into()).into(),
+                    uniq_id: 3,
+                }.into(),
             }
             .into(),
-            argument: Term::Constant(Constant::Integer(7.into()).into()).into(),
+            argument: Term::Constant {
+                value: Constant::Integer(7.into()).into(),
+                uniq_id: 4,
+            }.into(),
         };
 
         let program: Program<NamedDeBruijn> = Program {
@@ -999,7 +1044,10 @@ mod tests {
         // Compare results
         if let ExecutionStatus::Done(manual_result) = machine.status() {
             assert_eq!(manual_result, &expected_result, "ManualMachine result differs from Machine result");
-            assert_eq!(manual_result, &Term::Constant(Constant::Integer(42.into()).into()));
+            assert_eq!(manual_result, &Term::Constant {
+                value: Constant::Integer(42.into()).into(),
+                uniq_id: 0,
+            });
             println!("✓ Both machines produced the same result in {} steps", step_count);
         } else {
             panic!("ManualMachine failed: {:?}", machine.status());
@@ -1010,15 +1058,29 @@ mod tests {
     fn test_collect_nested_contexts() {
         // Create a complex nested term that will produce nested contexts
         let term = Term::Apply {
+            uniq_id: 0,
             function: Term::Apply {
-                function: Term::Force(
-                    Term::Delay(
-                        Term::Builtin(DefaultFunction::AddInteger).into()
-                    ).into()
-                ).into(),
-                argument: Term::Constant(Constant::Integer(10.into()).into()).into(),
+                uniq_id: 1,
+                function: Term::Force {
+                    uniq_id: 2,
+                    body: Term::Delay {
+                        uniq_id: 3,
+                        body: Term::Builtin {
+                            fun: DefaultFunction::AddInteger,
+                            uniq_id: 4,
+                        }.into(),
+                    }.into(),
+                }.into(),
+                argument: Term::Constant {
+                    value: Constant::Integer(10.into()).into(),
+                    uniq_id: 5,
+                }.into(),
+            }
+            .into(),
+            argument: Term::Constant {
+                value: Constant::Integer(20.into()).into(),
+                uniq_id: 6,
             }.into(),
-            argument: Term::Constant(Constant::Integer(20.into()).into()).into(),
         };
 
         let mut machine = ManualMachine::new(
@@ -1055,7 +1117,7 @@ mod tests {
                     Context::FrameAwaitFunTerm(_, _, _) => "FrameAwaitFunTerm",
                     Context::FrameAwaitArg(_, _) => "FrameAwaitArg",
                     Context::FrameAwaitFunValue(_, _) => "FrameAwaitFunValue",
-                    Context::FrameConstr(_, _, _, _, _) => "FrameConstr",
+                    Context::FrameConstr(_, _, _, _, _, _) => "FrameConstr",
                     Context::FrameCases(_, _, _) => "FrameCases",
                 };
                 println!("  Context[{}]: {}", i, context_type);

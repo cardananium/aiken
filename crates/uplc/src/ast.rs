@@ -30,6 +30,8 @@ use std::{
     rc::Rc,
 };
 
+use crate::global_uniq::next_uniq_id;
+
 /// This represents a program in Untyped Plutus Core.
 /// A program contains a version tuple and a term.
 /// It is generic because Term requires a generic type.
@@ -50,6 +52,7 @@ where
         let applied_term = Term::Apply {
             function: Rc::new(self.term.clone()),
             argument: Rc::new(program.term.clone()),
+            uniq_id: next_uniq_id(),
         };
 
         Program {
@@ -63,7 +66,11 @@ where
     pub fn apply_data(&self, plutus_data: PlutusData) -> Self {
         let applied_term = Term::Apply {
             function: Rc::new(self.term.clone()),
-            argument: Rc::new(Term::Constant(Constant::Data(plutus_data).into())),
+            argument: Rc::new(Term::Constant {
+                value: Constant::Data(plutus_data).into(),
+                uniq_id: next_uniq_id(),
+            }),
+            uniq_id: next_uniq_id(),
         };
 
         Program {
@@ -81,6 +88,7 @@ impl Program<Name> {
         let applied_term = Term::Apply {
             function: Rc::new(self.term.clone()),
             argument: Rc::new(term.clone()),
+            uniq_id: next_uniq_id(),
         };
 
         let mut program = Program {
@@ -293,49 +301,99 @@ impl Program<DeBruijn> {
 /// Specifically, `Var` and `parameter_name` in `Lambda` can be a `Name`,
 /// `NamedDebruijn`, or `DeBruijn`. When encoded to flat for on chain usage
 /// we must encode using the `DeBruijn` form.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Term<T> {
     // tag: 0
-    Var(Rc<T>),
+    Var {
+        name: Rc<T>,
+        uniq_id: isize,
+    },
     // tag: 1
-    Delay(Rc<Term<T>>),
+    Delay {
+        body: Rc<Term<T>>,
+        uniq_id: isize,
+    },
     // tag: 2
     Lambda {
         parameter_name: Rc<T>,
         body: Rc<Term<T>>,
+        uniq_id: isize,
     },
     // tag: 3
     Apply {
         function: Rc<Term<T>>,
         argument: Rc<Term<T>>,
+        uniq_id: isize,
     },
     // tag: 4
-    Constant(Rc<Constant>),
+    Constant {
+        value: Rc<Constant>,
+        uniq_id: isize,
+    },
     // tag: 5
-    Force(Rc<Term<T>>),
+    Force {
+        body: Rc<Term<T>>,
+        uniq_id: isize,
+    },
     // tag: 6
-    Error,
+    Error {
+        uniq_id: isize,
+    },
     // tag: 7
-    Builtin(DefaultFunction),
+    Builtin {
+        fun: DefaultFunction,
+        uniq_id: isize,
+    },
     // tag: 8
     Constr {
         tag: usize,
         fields: Vec<Term<T>>,
+        uniq_id: isize,
     },
     // tag: 9
     Case {
         constr: Rc<Term<T>>,
         branches: Vec<Term<T>>,
+        uniq_id: isize,
     },
 }
 
 impl<T> Term<T> {
     pub fn is_unit(&self) -> bool {
-        matches!(self, Term::Constant(c) if c.as_ref() == &Constant::Unit)
+        matches!(self, Term::Constant { value: c, .. } if c.as_ref() == &Constant::Unit)
     }
 
     pub fn is_int(&self) -> bool {
-        matches!(self, Term::Constant(c) if matches!(c.as_ref(), &Constant::Integer(_)))
+        matches!(self, Term::Constant { value: c, .. } if matches!(c.as_ref(), &Constant::Integer(_)))
+    }
+}
+
+impl<T> PartialEq for Term<T> 
+where
+    T: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Term::Var { name: n1, .. }, Term::Var { name: n2, .. }) => n1 == n2,
+            (Term::Delay { body: b1, .. }, Term::Delay { body: b2, .. }) => b1 == b2,
+            (Term::Lambda { parameter_name: p1, body: b1, .. }, Term::Lambda { parameter_name: p2, body: b2, .. }) => {
+                p1 == p2 && b1 == b2
+            }
+            (Term::Apply { function: f1, argument: a1, .. }, Term::Apply { function: f2, argument: a2, .. }) => {
+                f1 == f2 && a1 == a2
+            }
+            (Term::Constant { value: v1, .. }, Term::Constant { value: v2, .. }) => v1 == v2,
+            (Term::Force { body: b1, .. }, Term::Force { body: b2, .. }) => b1 == b2,
+            (Term::Error { .. }, Term::Error { .. }) => true,
+            (Term::Builtin { fun: f1, .. }, Term::Builtin { fun: f2, .. }) => f1 == f2,
+            (Term::Constr { tag: t1, fields: f1, .. }, Term::Constr { tag: t2, fields: f2, .. }) => {
+                t1 == t2 && f1 == f2
+            }
+            (Term::Case { constr: c1, branches: b1, .. }, Term::Case { constr: c2, branches: b2, .. }) => {
+                c1 == c2 && b1 == b2
+            }
+            _ => false,
+        }
     }
 }
 
@@ -344,7 +402,7 @@ impl<T> TryInto<PlutusData> for Term<T> {
 
     fn try_into(self) -> Result<PlutusData, String> {
         match self {
-            Term::Constant(rc) => match &*rc {
+            Term::Constant { value: rc, .. } => match &*rc {
                 Constant::Data(data) => Ok(data.to_owned()),
                 _ => Err("not a data".to_string()),
             },
@@ -940,6 +998,6 @@ impl Program<DeBruijn> {
 
 impl Term<NamedDeBruijn> {
     pub fn is_valid_script_result(&self) -> bool {
-        !matches!(self, Term::Error)
+        !matches!(self, Term::Error { .. })
     }
 }

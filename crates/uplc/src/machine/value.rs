@@ -16,19 +16,26 @@ pub type Env = Rc<Vec<Value>>;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     Con(Rc<Constant>),
-    Delay(Rc<Term<NamedDeBruijn>>, Env),
+    Delay {
+        body: Rc<Term<NamedDeBruijn>>,
+        env: Env,
+        term_id: isize,
+    },
     Lambda {
         parameter_name: Rc<NamedDeBruijn>,
         body: Rc<Term<NamedDeBruijn>>,
         env: Env,
+        term_id: isize,
     },
     Builtin {
         fun: DefaultFunction,
         runtime: BuiltinRuntime,
+        term_id: isize,
     },
     Constr {
         tag: usize,
         fields: Vec<Value>,
+        term_id: isize,
     },
 }
 
@@ -292,7 +299,7 @@ impl Value {
                 Constant::Bls12_381G2Element(_) => size_of::<blst::blst_p2>() as i64 / 8,
                 Constant::Bls12_381MlResult(_) => size_of::<blst::blst_fp12>() as i64 / 8,
             },
-            Value::Delay(_, _) => 1,
+            Value::Delay { .. } => 1,
             Value::Lambda { .. } => 1,
             Value::Builtin { .. } => 1,
             Value::Constr { .. } => 1,

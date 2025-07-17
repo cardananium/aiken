@@ -37,17 +37,22 @@ impl Converter {
         term: &Term<Name>,
     ) -> Result<Term<NamedDeBruijn>, Error> {
         let converted_term = match term {
-            Term::Var(name) => Term::Var(
-                NamedDeBruijn {
+            Term::Var { name, uniq_id } => Term::Var {
+                name: NamedDeBruijn {
                     text: name.text.to_string(),
                     index: self.get_index(name)?,
                 }
-                .into(),
-            ),
-            Term::Delay(term) => Term::Delay(Rc::new(self.name_to_named_debruijn(term)?)),
+                .into(), 
+                uniq_id: *uniq_id,
+            },
+            Term::Delay { body, uniq_id } => Term::Delay {
+                body: Rc::new(self.name_to_named_debruijn(body)?),
+                uniq_id: *uniq_id,
+            },
             Term::Lambda {
                 parameter_name,
                 body,
+                uniq_id,
             } => {
                 self.declare_unique(parameter_name.unique);
 
@@ -69,29 +74,42 @@ impl Converter {
                 Term::Lambda {
                     parameter_name: name.into(),
                     body: Rc::new(body),
+                    uniq_id: *uniq_id,
                 }
             }
-            Term::Apply { function, argument } => Term::Apply {
+            Term::Apply { function, argument, uniq_id } => Term::Apply {
                 function: Rc::new(self.name_to_named_debruijn(function)?),
                 argument: Rc::new(self.name_to_named_debruijn(argument)?),
+                uniq_id: *uniq_id,
             },
-            Term::Constant(constant) => Term::Constant(constant.clone()),
-            Term::Force(term) => Term::Force(Rc::new(self.name_to_named_debruijn(term)?)),
-            Term::Error => Term::Error,
-            Term::Builtin(builtin) => Term::Builtin(*builtin),
-            Term::Constr { tag, fields } => Term::Constr {
+            Term::Constant { value, uniq_id } => Term::Constant {
+                value: value.clone(),
+                uniq_id: *uniq_id,
+            },
+            Term::Force { body, uniq_id } => Term::Force {
+                body: Rc::new(self.name_to_named_debruijn(body)?),
+                uniq_id: *uniq_id,
+            },
+            Term::Error { uniq_id } => Term::Error { uniq_id: *uniq_id },
+            Term::Builtin { fun, uniq_id } => Term::Builtin {
+                fun: *fun,
+                uniq_id: *uniq_id,
+            },
+            Term::Constr { tag, fields, uniq_id } => Term::Constr {
                 tag: *tag,
                 fields: fields
                     .iter()
                     .map(|field| self.name_to_named_debruijn(field))
                     .collect::<Result<_, _>>()?,
+                uniq_id: *uniq_id,
             },
-            Term::Case { constr, branches } => Term::Case {
+            Term::Case { constr, branches, uniq_id } => Term::Case {
                 constr: Rc::new(self.name_to_named_debruijn(constr)?),
                 branches: branches
                     .iter()
                     .map(|branch| self.name_to_named_debruijn(branch))
                     .collect::<Result<_, _>>()?,
+                uniq_id: *uniq_id,
             },
         };
 
@@ -100,11 +118,18 @@ impl Converter {
 
     pub fn name_to_debruijn(&mut self, term: &Term<Name>) -> Result<Term<DeBruijn>, Error> {
         let converted_term = match term {
-            Term::Var(name) => Term::Var(self.get_index(name)?.into()),
-            Term::Delay(term) => Term::Delay(Rc::new(self.name_to_debruijn(term)?)),
+            Term::Var { name, uniq_id } => Term::Var {
+                name: self.get_index(name)?.into(),
+                uniq_id: *uniq_id,
+            },
+            Term::Delay { body, uniq_id } => Term::Delay {
+                body: Rc::new(self.name_to_debruijn(body)?),
+                uniq_id: *uniq_id,
+            },
             Term::Lambda {
                 parameter_name,
                 body,
+                uniq_id,
             } => {
                 self.declare_unique(parameter_name.unique);
 
@@ -121,29 +146,42 @@ impl Converter {
                 Term::Lambda {
                     parameter_name: name.into(),
                     body: Rc::new(body),
+                    uniq_id: *uniq_id,
                 }
             }
-            Term::Apply { function, argument } => Term::Apply {
+            Term::Apply { function, argument, uniq_id } => Term::Apply {
                 function: Rc::new(self.name_to_debruijn(function)?),
                 argument: Rc::new(self.name_to_debruijn(argument)?),
+                uniq_id: *uniq_id,
             },
-            Term::Constant(constant) => Term::Constant(constant.clone()),
-            Term::Force(term) => Term::Force(Rc::new(self.name_to_debruijn(term)?)),
-            Term::Error => Term::Error,
-            Term::Builtin(builtin) => Term::Builtin(*builtin),
-            Term::Constr { tag, fields } => Term::Constr {
+            Term::Constant { value, uniq_id } => Term::Constant {
+                value: value.clone(),
+                uniq_id: *uniq_id,
+            },
+            Term::Force { body, uniq_id } => Term::Force {
+                body: Rc::new(self.name_to_debruijn(body)?),
+                uniq_id: *uniq_id,
+            },
+            Term::Error { uniq_id } => Term::Error { uniq_id: *uniq_id },
+            Term::Builtin { fun, uniq_id } => Term::Builtin {
+                fun: *fun,
+                uniq_id: *uniq_id,
+            },
+            Term::Constr { tag, fields, uniq_id } => Term::Constr {
                 tag: *tag,
                 fields: fields
                     .iter()
                     .map(|field| self.name_to_debruijn(field))
                     .collect::<Result<_, _>>()?,
+                uniq_id: *uniq_id,
             },
-            Term::Case { constr, branches } => Term::Case {
+            Term::Case { constr, branches, uniq_id } => Term::Case {
                 constr: Rc::new(self.name_to_debruijn(constr)?),
                 branches: branches
                     .iter()
                     .map(|branch| self.name_to_debruijn(branch))
                     .collect::<Result<_, _>>()?,
+                uniq_id: *uniq_id,
             },
         };
 
@@ -155,17 +193,22 @@ impl Converter {
         term: &Term<NamedDeBruijn>,
     ) -> Result<Term<Name>, Error> {
         let converted_term = match term {
-            Term::Var(var_name) => Term::Var(
-                Name {
-                    text: var_name.text.to_string(),
-                    unique: self.get_unique(&var_name.index)?,
+            Term::Var { name, uniq_id } => Term::Var {
+                name: Name {
+                    text: name.text.to_string(),
+                    unique: self.get_unique(&name.index)?,
                 }
                 .into(),
-            ),
-            Term::Delay(term) => Term::Delay(Rc::new(self.named_debruijn_to_name(term)?)),
+                uniq_id: *uniq_id,
+            },
+            Term::Delay { body, uniq_id } => Term::Delay {
+                body: Rc::new(self.named_debruijn_to_name(body)?),
+                uniq_id: *uniq_id,
+            },
             Term::Lambda {
                 parameter_name,
                 body,
+                uniq_id,
             } => {
                 self.declare_binder();
 
@@ -185,29 +228,42 @@ impl Converter {
                 Term::Lambda {
                     parameter_name: name.into(),
                     body: Rc::new(body),
+                    uniq_id: *uniq_id,
                 }
             }
-            Term::Apply { function, argument } => Term::Apply {
+            Term::Apply { function, argument, uniq_id } => Term::Apply {
                 function: Rc::new(self.named_debruijn_to_name(function)?),
                 argument: Rc::new(self.named_debruijn_to_name(argument)?),
+                uniq_id: *uniq_id,
             },
-            Term::Constant(constant) => Term::Constant(constant.clone()),
-            Term::Force(term) => Term::Force(Rc::new(self.named_debruijn_to_name(term)?)),
-            Term::Error => Term::Error,
-            Term::Builtin(builtin) => Term::Builtin(*builtin),
-            Term::Constr { tag, fields } => Term::Constr {
+            Term::Constant { value, uniq_id } => Term::Constant {
+                value: value.clone(),
+                uniq_id: *uniq_id,
+            },
+            Term::Force { body, uniq_id } => Term::Force {
+                body: Rc::new(self.named_debruijn_to_name(body)?),
+                uniq_id: *uniq_id,
+            },
+            Term::Error { uniq_id } => Term::Error { uniq_id: *uniq_id },
+            Term::Builtin { fun, uniq_id } => Term::Builtin {
+                fun: *fun,
+                uniq_id: *uniq_id,
+            },
+            Term::Constr { tag, fields, uniq_id } => Term::Constr {
                 tag: *tag,
                 fields: fields
                     .iter()
                     .map(|field| self.named_debruijn_to_name(field))
                     .collect::<Result<_, _>>()?,
+                uniq_id: *uniq_id,
             },
-            Term::Case { constr, branches } => Term::Case {
+            Term::Case { constr, branches, uniq_id } => Term::Case {
                 constr: Rc::new(self.named_debruijn_to_name(constr)?),
                 branches: branches
                     .iter()
                     .map(|branch| self.named_debruijn_to_name(branch))
                     .collect::<Result<_, _>>()?,
+                uniq_id: *uniq_id,
             },
         };
 
@@ -216,21 +272,26 @@ impl Converter {
 
     pub fn debruijn_to_name(&mut self, term: &Term<DeBruijn>) -> Result<Term<Name>, Error> {
         let converted_term = match term {
-            Term::Var(index) => {
-                let unique = self.get_unique(index)?;
+            Term::Var { name, uniq_id } => {
+                let unique = self.get_unique(&name)?;
 
-                Term::Var(
-                    Name {
+                Term::Var {
+                    name: Name {
                         text: format!("i_{unique}"),
                         unique,
                     }
                     .into(),
-                )
+                    uniq_id: *uniq_id,
+                }
             }
-            Term::Delay(term) => Term::Delay(Rc::new(self.debruijn_to_name(term)?)),
+            Term::Delay { body, uniq_id } => Term::Delay {
+                body: Rc::new(self.debruijn_to_name(body)?),
+                uniq_id: *uniq_id,
+            },
             Term::Lambda {
                 parameter_name,
                 body,
+                uniq_id,
             } => {
                 self.declare_binder();
 
@@ -250,29 +311,42 @@ impl Converter {
                 Term::Lambda {
                     parameter_name: name.into(),
                     body: Rc::new(body),
+                    uniq_id: *uniq_id,
                 }
             }
-            Term::Apply { function, argument } => Term::Apply {
+            Term::Apply { function, argument, uniq_id } => Term::Apply {
                 function: Rc::new(self.debruijn_to_name(function)?),
                 argument: Rc::new(self.debruijn_to_name(argument)?),
+                uniq_id: *uniq_id,
             },
-            Term::Constant(constant) => Term::Constant(constant.clone()),
-            Term::Force(term) => Term::Force(Rc::new(self.debruijn_to_name(term)?)),
-            Term::Error => Term::Error,
-            Term::Builtin(builtin) => Term::Builtin(*builtin),
-            Term::Constr { tag, fields } => Term::Constr {
+            Term::Constant { value, uniq_id } => Term::Constant {
+                value: value.clone(),
+                uniq_id: *uniq_id,
+            },
+            Term::Force { body, uniq_id } => Term::Force {
+                body: Rc::new(self.debruijn_to_name(body)?),
+                uniq_id: *uniq_id,
+            },
+            Term::Error { uniq_id } => Term::Error { uniq_id: *uniq_id },
+            Term::Builtin { fun, uniq_id } => Term::Builtin {
+                fun: *fun,
+                uniq_id: *uniq_id,
+            },
+            Term::Constr { tag, fields, uniq_id } => Term::Constr {
                 tag: *tag,
                 fields: fields
                     .iter()
                     .map(|field| self.debruijn_to_name(field))
                     .collect::<Result<_, _>>()?,
+                uniq_id: *uniq_id,
             },
-            Term::Case { constr, branches } => Term::Case {
+            Term::Case { constr, branches, uniq_id } => Term::Case {
                 constr: Rc::new(self.debruijn_to_name(constr)?),
                 branches: branches
                     .iter()
                     .map(|branch| self.debruijn_to_name(branch))
                     .collect::<Result<_, _>>()?,
+                uniq_id: *uniq_id,
             },
         };
 
@@ -282,36 +356,56 @@ impl Converter {
     #[allow(clippy::only_used_in_recursion)]
     pub fn named_debruijn_to_debruijn(&mut self, term: &Term<NamedDeBruijn>) -> Term<DeBruijn> {
         match term {
-            Term::Var(name) => Term::Var(name.index.into()),
-            Term::Delay(term) => Term::Delay(Rc::new(self.named_debruijn_to_debruijn(term))),
+            Term::Var { name, uniq_id } => Term::Var {
+                name: name.index.into(),
+                uniq_id: *uniq_id,
+            },
+            Term::Delay { body, uniq_id } => Term::Delay {
+                body: Rc::new(self.named_debruijn_to_debruijn(body)),
+                uniq_id: *uniq_id,
+            },
             Term::Lambda {
                 parameter_name,
                 body,
+                uniq_id,
             } => Term::Lambda {
                 parameter_name: parameter_name.index.into(),
                 body: Rc::new(self.named_debruijn_to_debruijn(body)),
+                uniq_id: *uniq_id,
             },
-            Term::Apply { function, argument } => Term::Apply {
+            Term::Apply { function, argument, uniq_id } => Term::Apply {
                 function: Rc::new(self.named_debruijn_to_debruijn(function)),
                 argument: Rc::new(self.named_debruijn_to_debruijn(argument)),
+                uniq_id: *uniq_id,
             },
-            Term::Constant(constant) => Term::Constant(constant.clone()),
-            Term::Force(term) => Term::Force(Rc::new(self.named_debruijn_to_debruijn(term))),
-            Term::Error => Term::Error,
-            Term::Builtin(builtin) => Term::Builtin(*builtin),
-            Term::Constr { tag, fields } => Term::Constr {
+            Term::Constant { value, uniq_id } => Term::Constant {
+                value: value.clone(),
+                uniq_id: *uniq_id,
+            },
+            Term::Force { body, uniq_id } => Term::Force {
+                body: Rc::new(self.named_debruijn_to_debruijn(body)),
+                uniq_id: *uniq_id,
+            },
+            Term::Error { uniq_id } => Term::Error { uniq_id: *uniq_id },
+            Term::Builtin { fun, uniq_id } => Term::Builtin {
+                fun: *fun,
+                uniq_id: *uniq_id,
+            },
+            Term::Constr { tag, fields, uniq_id } => Term::Constr {
                 tag: *tag,
                 fields: fields
                     .iter()
                     .map(|field| self.named_debruijn_to_debruijn(field))
                     .collect(),
+                uniq_id: *uniq_id,
             },
-            Term::Case { constr, branches } => Term::Case {
+            Term::Case { constr, branches, uniq_id } => Term::Case {
                 constr: Rc::new(self.named_debruijn_to_debruijn(constr)),
                 branches: branches
                     .iter()
                     .map(|branch| self.named_debruijn_to_debruijn(branch))
                     .collect(),
+                uniq_id: *uniq_id,
             },
         }
     }
@@ -319,42 +413,60 @@ impl Converter {
     #[allow(clippy::only_used_in_recursion)]
     pub fn debruijn_to_named_debruijn(&mut self, term: &Term<DeBruijn>) -> Term<NamedDeBruijn> {
         match term {
-            Term::Var(name) => Term::Var(
-                NamedDeBruijn {
+            Term::Var { name, uniq_id } => Term::Var {
+                name: NamedDeBruijn {
                     text: "i".to_string(),
                     index: *name.as_ref(),
                 }
                 .into(),
-            ),
-            Term::Delay(term) => Term::Delay(Rc::new(self.debruijn_to_named_debruijn(term))),
+                uniq_id: *uniq_id,
+            },
+            Term::Delay { body, uniq_id } => Term::Delay {
+                body: Rc::new(self.debruijn_to_named_debruijn(body)),
+                uniq_id: *uniq_id,
+            },
             Term::Lambda {
                 parameter_name,
                 body,
+                uniq_id,
             } => Term::Lambda {
                 parameter_name: NamedDeBruijn::from(*parameter_name.as_ref()).into(),
                 body: Rc::new(self.debruijn_to_named_debruijn(body)),
+                uniq_id: *uniq_id,
             },
-            Term::Apply { function, argument } => Term::Apply {
+            Term::Apply { function, argument, uniq_id } => Term::Apply {
                 function: Rc::new(self.debruijn_to_named_debruijn(function)),
                 argument: Rc::new(self.debruijn_to_named_debruijn(argument)),
+                uniq_id: *uniq_id,
             },
-            Term::Constant(constant) => Term::Constant(constant.clone()),
-            Term::Force(term) => Term::Force(Rc::new(self.debruijn_to_named_debruijn(term))),
-            Term::Error => Term::Error,
-            Term::Builtin(builtin) => Term::Builtin(*builtin),
-            Term::Constr { tag, fields } => Term::Constr {
+            Term::Constant { value, uniq_id } => Term::Constant {
+                value: value.clone(),
+                uniq_id: *uniq_id,
+            },
+            Term::Force { body, uniq_id } => Term::Force {
+                body: Rc::new(self.debruijn_to_named_debruijn(body)),
+                uniq_id: *uniq_id,
+            },
+            Term::Error { uniq_id } => Term::Error { uniq_id: *uniq_id },
+            Term::Builtin { fun, uniq_id } => Term::Builtin {
+                fun: *fun,
+                uniq_id: *uniq_id,
+            },
+            Term::Constr { tag, fields, uniq_id } => Term::Constr {
                 tag: *tag,
                 fields: fields
                     .iter()
                     .map(|field| self.debruijn_to_named_debruijn(field))
                     .collect(),
+                uniq_id: *uniq_id,
             },
-            Term::Case { constr, branches } => Term::Case {
+            Term::Case { constr, branches, uniq_id } => Term::Case {
                 constr: Rc::new(self.debruijn_to_named_debruijn(constr)),
                 branches: branches
                     .iter()
                     .map(|branch| self.debruijn_to_named_debruijn(branch))
                     .collect(),
+                uniq_id: *uniq_id,
             },
         }
     }
@@ -365,40 +477,56 @@ impl Converter {
         term: &Term<FakeNamedDeBruijn>,
     ) -> Term<NamedDeBruijn> {
         match term {
-            Term::Var(name) => Term::Var(NamedDeBruijn::from(name.as_ref().clone()).into()),
-            Term::Delay(term) => {
-                Term::Delay(Rc::new(self.fake_named_debruijn_to_named_debruijn(term)))
-            }
+            Term::Var { name, uniq_id } => Term::Var {
+                name: NamedDeBruijn::from(name.as_ref().clone()).into(),
+                uniq_id: *uniq_id,
+            },
+            Term::Delay { body, uniq_id } => Term::Delay {
+                body: Rc::new(self.fake_named_debruijn_to_named_debruijn(body)),
+                uniq_id: *uniq_id,
+            },
             Term::Lambda {
                 parameter_name,
                 body,
+                uniq_id,
             } => Term::Lambda {
                 parameter_name: NamedDeBruijn::from(parameter_name.as_ref().clone()).into(),
                 body: Rc::new(self.fake_named_debruijn_to_named_debruijn(body)),
+                uniq_id: *uniq_id,
             },
-            Term::Apply { function, argument } => Term::Apply {
+            Term::Apply { function, argument, uniq_id } => Term::Apply {
                 function: Rc::new(self.fake_named_debruijn_to_named_debruijn(function)),
                 argument: Rc::new(self.fake_named_debruijn_to_named_debruijn(argument)),
+                uniq_id: *uniq_id,
             },
-            Term::Constant(constant) => Term::Constant(constant.clone()),
-            Term::Force(term) => {
-                Term::Force(Rc::new(self.fake_named_debruijn_to_named_debruijn(term)))
-            }
-            Term::Error => Term::Error,
-            Term::Builtin(builtin) => Term::Builtin(*builtin),
-            Term::Constr { tag, fields } => Term::Constr {
+            Term::Constant { value, uniq_id } => Term::Constant {
+                value: value.clone(),
+                uniq_id: *uniq_id,
+            },
+            Term::Force { body, uniq_id } => Term::Force {
+                body: Rc::new(self.fake_named_debruijn_to_named_debruijn(body)),
+                uniq_id: *uniq_id,
+            },
+            Term::Error { uniq_id } => Term::Error { uniq_id: *uniq_id },
+            Term::Builtin { fun, uniq_id } => Term::Builtin {
+                fun: *fun,
+                uniq_id: *uniq_id,
+            },
+            Term::Constr { tag, fields, uniq_id } => Term::Constr {
                 tag: *tag,
                 fields: fields
                     .iter()
                     .map(|field| self.fake_named_debruijn_to_named_debruijn(field))
                     .collect(),
+                uniq_id: *uniq_id,
             },
-            Term::Case { constr, branches } => Term::Case {
+            Term::Case { constr, branches, uniq_id } => Term::Case {
                 constr: Rc::new(self.fake_named_debruijn_to_named_debruijn(constr)),
                 branches: branches
                     .iter()
                     .map(|branch| self.fake_named_debruijn_to_named_debruijn(branch))
                     .collect(),
+                uniq_id: *uniq_id,
             },
         }
     }
@@ -409,40 +537,56 @@ impl Converter {
         term: &Term<NamedDeBruijn>,
     ) -> Term<FakeNamedDeBruijn> {
         match term {
-            Term::Var(name) => Term::Var(FakeNamedDeBruijn::from(name.as_ref().clone()).into()),
-            Term::Delay(term) => {
-                Term::Delay(Rc::new(self.named_debruijn_to_fake_named_debruijn(term)))
-            }
+            Term::Var { name, uniq_id } => Term::Var {
+                name: FakeNamedDeBruijn::from(name.as_ref().clone()).into(),
+                uniq_id: *uniq_id,
+            },
+            Term::Delay { body, uniq_id } => Term::Delay {
+                body: Rc::new(self.named_debruijn_to_fake_named_debruijn(body)),
+                uniq_id: *uniq_id,
+            },
             Term::Lambda {
                 parameter_name,
                 body,
+                uniq_id,
             } => Term::Lambda {
                 parameter_name: FakeNamedDeBruijn::from(parameter_name.as_ref().clone()).into(),
                 body: Rc::new(self.named_debruijn_to_fake_named_debruijn(body)),
+                uniq_id: *uniq_id,
             },
-            Term::Apply { function, argument } => Term::Apply {
+            Term::Apply { function, argument, uniq_id } => Term::Apply {
                 function: Rc::new(self.named_debruijn_to_fake_named_debruijn(function)),
                 argument: Rc::new(self.named_debruijn_to_fake_named_debruijn(argument)),
+                uniq_id: *uniq_id,
             },
-            Term::Constant(constant) => Term::Constant(constant.clone()),
-            Term::Force(term) => {
-                Term::Force(Rc::new(self.named_debruijn_to_fake_named_debruijn(term)))
-            }
-            Term::Error => Term::Error,
-            Term::Builtin(builtin) => Term::Builtin(*builtin),
-            Term::Constr { tag, fields } => Term::Constr {
+            Term::Constant { value, uniq_id } => Term::Constant {
+                value: value.clone(),
+                uniq_id: *uniq_id,
+            },
+            Term::Force { body, uniq_id } => Term::Force {
+                body: Rc::new(self.named_debruijn_to_fake_named_debruijn(body)),
+                uniq_id: *uniq_id,
+            },
+            Term::Error { uniq_id } => Term::Error { uniq_id: *uniq_id },
+            Term::Builtin { fun, uniq_id } => Term::Builtin {
+                fun: *fun,
+                uniq_id: *uniq_id,
+            },
+            Term::Constr { tag, fields, uniq_id } => Term::Constr {
                 tag: *tag,
                 fields: fields
                     .iter()
                     .map(|field| self.named_debruijn_to_fake_named_debruijn(field))
                     .collect(),
+                uniq_id: *uniq_id,
             },
-            Term::Case { constr, branches } => Term::Case {
+            Term::Case { constr, branches, uniq_id } => Term::Case {
                 constr: Rc::new(self.named_debruijn_to_fake_named_debruijn(constr)),
                 branches: branches
                     .iter()
                     .map(|branch| self.named_debruijn_to_fake_named_debruijn(branch))
                     .collect(),
+                uniq_id: *uniq_id,
             },
         }
     }

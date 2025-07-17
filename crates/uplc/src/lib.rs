@@ -10,6 +10,8 @@ pub mod parser;
 mod pretty;
 pub mod tx;
 
+pub(crate) mod global_uniq;
+
 pub use pallas_codec::utils::KeyValuePairs;
 pub use pallas_crypto::hash::Hash;
 pub use pallas_primitives::{
