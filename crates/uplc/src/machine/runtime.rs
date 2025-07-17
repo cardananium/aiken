@@ -52,9 +52,9 @@ impl From<&Language> for BuiltinSemantics {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BuiltinRuntime {
-    pub(super) args: Vec<Value>,
+    pub args: Vec<Value>,
     pub fun: DefaultFunction,
-    pub(super) forces: u32,
+    pub forces: u32,
 }
 
 impl BuiltinRuntime {
