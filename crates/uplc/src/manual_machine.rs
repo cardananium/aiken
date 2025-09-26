@@ -22,7 +22,7 @@ pub enum ExecutionStatus {
     Error(Error),
 }
 
-/// Manual machine for step-by-step execution of UPLC code
+#[derive(Clone, Debug)]
 pub struct ManualMachine {
     /// Current machine state
     state: MachineState,
