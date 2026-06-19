@@ -162,10 +162,10 @@ impl PartialEq for Type {
 
 impl Type {
     pub fn collapse_links(t: Rc<Self>) -> Rc<Self> {
-        if let Type::Var { tipo, alias } = t.deref() {
-            if let TypeVar::Link { tipo } = tipo.borrow().deref() {
-                return Type::with_alias(tipo.clone(), alias.clone());
-            }
+        if let Type::Var { tipo, alias } = t.deref()
+            && let TypeVar::Link { tipo } = tipo.borrow().deref()
+        {
+            return Type::with_alias(tipo.clone(), alias.clone());
         }
         t
     }
@@ -480,7 +480,7 @@ impl Type {
         }
     }
 
-    pub fn get_generic(&self) -> Option<u64> {
+    pub fn get_generic_id(&self) -> Option<u64> {
         match self {
             Self::Var { tipo, .. } => tipo.borrow().get_generic(),
             _ => None,
@@ -698,7 +698,7 @@ pub fn lookup_data_type_by_tipo(
 pub fn get_generic_id_and_type(tipo: &Type, param: &Type) -> Vec<(u64, Rc<Type>)> {
     let mut generics_ids = vec![];
 
-    if let Some(id) = tipo.get_generic() {
+    if let Some(id) = tipo.get_generic_id() {
         generics_ids.push((id, param.clone().into()));
         return generics_ids;
     }
@@ -844,10 +844,14 @@ pub fn check_replaceable_opaque_type(
 ) -> bool {
     let data_type = lookup_data_type_by_tipo(data_types, t);
 
-    if let Some(data_type) = data_type {
-        if let [constructor] = &data_type.constructors[..] {
-            return constructor.arguments.len() == 1 && data_type.opaque;
-        }
+    if let Some(data_type) = data_type
+        && let [constructor] = &data_type.constructors[..]
+    {
+        return constructor.arguments.len() == 1
+            && data_type.opaque
+            // BIG WARNING: Adding any kind decorator
+            // will make the opaque type not replaceable
+            && data_type.decorators.is_empty();
     }
 
     false
@@ -857,13 +861,8 @@ pub fn find_and_replace_generics(
     tipo: &Rc<Type>,
     mono_types: &IndexMap<u64, Rc<Type>>,
 ) -> Rc<Type> {
-    if let Some(id) = tipo.get_generic() {
-        mono_types
-            .get(&id)
-            .unwrap_or_else(|| {
-                panic!("Unknown generic id {id:?} for type {tipo:?} in mono_types {mono_types:#?}");
-            })
-            .clone()
+    if let Some(id) = tipo.get_generic_id() {
+        mono_types.get(&id).unwrap_or(tipo).clone()
     } else if tipo.is_generic() {
         match &**tipo {
             Type::App {
@@ -1099,7 +1098,7 @@ impl TypeVar {
     pub fn get_generic(&self) -> Option<u64> {
         match self {
             TypeVar::Generic { id } => Some(*id),
-            TypeVar::Link { tipo } => tipo.get_generic(),
+            TypeVar::Link { tipo } => tipo.get_generic_id(),
             _ => None,
         }
     }
@@ -1141,6 +1140,26 @@ impl ValueConstructor {
             public: true,
             variant,
             tipo,
+        }
+    }
+
+    pub fn is_pair(&self) -> bool {
+        match self.tipo.as_ref() {
+            Type::Fn { args, ret, .. } => {
+                let mut args = args.iter();
+
+                let left = args.next().map(|t| Type::collapse_links(t.clone()));
+
+                let right = args.next().map(|t| Type::collapse_links(t.clone()));
+
+                match Type::collapse_links(ret.clone()).as_ref() {
+                    Type::Pair { fst, snd, .. } => {
+                        Some(fst) == left.as_ref() && Some(snd) == right.as_ref()
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
         }
     }
 

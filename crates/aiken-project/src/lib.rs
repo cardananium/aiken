@@ -26,7 +26,8 @@ use crate::{
     },
     config::ProjectConfig,
     error::{Error, Warning},
-    module::{CheckedModule, CheckedModules, ParsedModule, ParsedModules},
+    module::{CheckedModule, CheckedModules, Glossary, ParsedModule, ParsedModules},
+    options::BlueprintExport,
     telemetry::{CoverageMode, Event},
 };
 use aiken_lang::{
@@ -101,6 +102,7 @@ where
     constants: IndexMap<FunctionAccessKey, TypedExpr>,
     data_types: IndexMap<DataTypeKey, TypedDataType>,
     module_sources: HashMap<String, (String, LineNumbers)>,
+    glossary: Glossary,
 }
 
 impl<T> Project<T>
@@ -132,8 +134,8 @@ where
 
         let mut module_types = HashMap::new();
 
-        module_types.insert("aiken".to_string(), builtins::prelude(&id_gen));
-        module_types.insert("aiken/builtin".to_string(), builtins::plutus(&id_gen));
+        module_types.insert(builtins::PRELUDE.to_string(), builtins::prelude(&id_gen));
+        module_types.insert(builtins::BUILTIN.to_string(), builtins::plutus(&id_gen));
 
         let functions = builtins::prelude_functions(&id_gen, &module_types);
 
@@ -154,6 +156,7 @@ where
             constants: IndexMap::new(),
             data_types,
             module_sources: HashMap::new(),
+            glossary: Glossary::default(),
         }
     }
 
@@ -167,6 +170,10 @@ where
             utils::indexmap::as_str_ref_values(&self.module_sources),
             tracing,
         )
+    }
+
+    pub fn glossary(&self) -> &Glossary {
+        &self.glossary
     }
 
     pub fn warnings(&mut self) -> Vec<Warning> {
@@ -205,6 +212,7 @@ where
         uplc: bool,
         tracing: Tracing,
         blueprint_path: PathBuf,
+        blueprint_export: BlueprintExport,
         env: Option<String>,
     ) -> Result<(), Vec<Error>> {
         let options = Options {
@@ -212,6 +220,7 @@ where
             tracing,
             env,
             blueprint_path,
+            blueprint_export,
         };
 
         self.compile(options)
@@ -277,8 +286,8 @@ where
         property_max_success: usize,
         coverage_mode: CoverageMode,
         tracing: Tracing,
-        env: Option<String>,
         plain_numbers: bool,
+        env: Option<String>,
     ) -> Result<(), Vec<Error>> {
         let options = Options {
             tracing,
@@ -297,11 +306,13 @@ where
                 }
             },
             blueprint_path: self.blueprint_path(None),
+            ..Options::default()
         };
 
         self.compile(options)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn benchmark(
         &mut self,
         match_benchmarks: Option<Vec<String>>,
@@ -309,6 +320,7 @@ where
         seed: u32,
         max_size: usize,
         tracing: Tracing,
+        plain_numbers: bool,
         env: Option<String>,
     ) -> Result<(), Vec<Error>> {
         let options = Options {
@@ -319,8 +331,10 @@ where
                 exact_match,
                 seed,
                 max_size,
+                plain_numbers,
             },
             blueprint_path: self.blueprint_path(None),
+            ..Options::default()
         };
 
         self.compile(options)
@@ -341,7 +355,10 @@ where
             let program = &validator.program;
             let program: Program<Name> = program.inner().try_into().unwrap();
 
-            fs::write(&path, program.to_pretty()).map_err(|error| Error::FileIo { error, path })?;
+            fs::write(&path, program.to_pretty()).map_err(|error| Error::FileIo {
+                error,
+                path: Box::new(path),
+            })?;
         }
 
         Ok(())
@@ -404,10 +421,20 @@ where
 
                 let mut generator = self.new_generator(options.tracing);
 
-                let blueprint = Blueprint::new(&self.config, &self.checked_modules, &mut generator)
-                    .map_err(|err| Error::Blueprint(err.into()))?;
+                let blueprint = Blueprint::new(
+                    &self.config,
+                    &self.checked_modules,
+                    &mut generator,
+                    options.blueprint_export == BlueprintExport::AllTypes,
+                )
+                .map_err(|err| Error::Blueprint(err.into()))?;
 
-                if blueprint.validators.is_empty() {
+                if blueprint.validators.is_empty()
+                    && matches!(
+                        options.blueprint_export,
+                        BlueprintExport::OnlyBinaryInterface,
+                    )
+                {
                     self.warnings.push(Warning::NoValidators);
                 }
 
@@ -420,7 +447,7 @@ where
                 fs::write(options.blueprint_path.as_path(), json).map_err(|error| {
                     Error::FileIo {
                         error,
-                        path: options.blueprint_path,
+                        path: Box::new(options.blueprint_path),
                     }
                     .into()
                 })
@@ -441,7 +468,7 @@ where
                     self.event_listener.handle_event(Event::RunningTests);
                 }
 
-                let tests = self.run_runnables(tests, seed, property_max_success);
+                let tests = self.run_runnables(tests, seed, property_max_success, options.tracing);
 
                 self.checks_count = if tests.is_empty() {
                     None
@@ -483,6 +510,7 @@ where
                 exact_match,
                 seed,
                 max_size,
+                plain_numbers,
             } => {
                 let verbose = false;
 
@@ -497,7 +525,7 @@ where
                     self.event_listener.handle_event(Event::RunningBenchmarks);
                 }
 
-                let benchmarks = self.run_runnables(benchmarks, seed, max_size);
+                let benchmarks = self.run_runnables(benchmarks, seed, max_size, options.tracing);
 
                 let errors: Vec<Error> = benchmarks
                     .iter()
@@ -510,8 +538,11 @@ where
                     })
                     .collect();
 
-                self.event_listener
-                    .handle_event(Event::FinishedBenchmarks { seed, benchmarks });
+                self.event_listener.handle_event(Event::FinishedBenchmarks {
+                    seed,
+                    benchmarks,
+                    plain_numbers,
+                });
 
                 if !errors.is_empty() {
                     Err(errors)
@@ -537,10 +568,14 @@ where
             .map(|s| {
                 Address::from_hex(s)
                     .or_else(|_| Address::from_bech32(s))
-                    .map_err(|error| Error::MalformedStakeAddress { error: Some(error) })
+                    .map_err(|error| Error::MalformedStakeAddress {
+                        error: Box::new(Some(error)),
+                    })
                     .and_then(|addr| match addr {
                         Address::Stake(addr) => Ok(addr),
-                        _ => Err(Error::MalformedStakeAddress { error: None }),
+                        _ => Err(Error::MalformedStakeAddress {
+                            error: Box::new(None),
+                        }),
                     })
             })
             .transpose()?;
@@ -550,7 +585,7 @@ where
             Some(StakePayload::Script(script)) => ShelleyDelegationPart::Script(script),
         };
 
-        let blueprint = self.blueprint(blueprint_path)?;
+        let blueprint = Self::blueprint(blueprint_path)?;
 
         // Calculate the address
         let when_too_many = |known_validators| {
@@ -600,7 +635,7 @@ where
         validator_name: Option<&str>,
         blueprint_path: &Path,
     ) -> Result<PolicyId, Error> {
-        let blueprint = self.blueprint(blueprint_path)?;
+        let blueprint = Self::blueprint(blueprint_path)?;
 
         // Error handlers for ambiguous / missing validators
         let when_too_many = |known_validators| {
@@ -669,7 +704,7 @@ where
     }
 
     #[allow(clippy::result_large_err)]
-    pub fn blueprint(&self, path: &Path) -> Result<Blueprint, Error> {
+    pub fn blueprint(path: &Path) -> Result<Blueprint, Error> {
         let blueprint = File::open(path)
             .map_err(|_| Error::Blueprint(blueprint::error::Error::InvalidOrMissingFile.into()))?;
         Ok(serde_json::from_reader(BufReader::new(blueprint))?)
@@ -697,10 +732,14 @@ where
             parsed_modules
                 .par_iter_mut()
                 .for_each(|(_module, parsed_module)| {
-                    parsed_module
-                        .ast
-                        .definitions
-                        .retain(|def| !matches!(def, Definition::Test { .. }))
+                    parsed_module.ast.definitions.retain(|def| {
+                        !matches!(
+                            def,
+                            Definition::Test(..)
+                                | Definition::Benchmark(..)
+                                | Definition::Validator(..)
+                        )
+                    })
                 });
 
             parsed_packages.extend(Into::<HashMap<_, _>>::into(parsed_modules));
@@ -831,9 +870,9 @@ where
             duplicates
                 .into_iter()
                 .map(|(module, first, second)| Error::DuplicateModule {
-                    module,
-                    first,
-                    second,
+                    module: Box::new(module),
+                    first: Box::new(first),
+                    second: Box::new(second),
                 })
                 .collect::<Vec<_>>(),
         );
@@ -842,8 +881,8 @@ where
             parse_errors
                 .into_iter()
                 .map(|(path, src, named, error)| Error::Parse {
-                    path,
-                    src,
+                    path: Box::new(path),
+                    src: Box::new(src),
                     named: named.into(),
                     error,
                 })
@@ -856,9 +895,9 @@ where
                 .insert(parsed_module.name.clone(), parsed_module.path.clone())
             {
                 errors.push(Error::DuplicateModule {
-                    module: parsed_module.name.clone(),
-                    first,
-                    second: parsed_module.path.clone(),
+                    module: Box::new(parsed_module.name.clone()),
+                    first: Box::new(first),
+                    second: Box::new(parsed_module.path.clone()),
                 });
             }
         }
@@ -880,6 +919,8 @@ where
         let our_modules: BTreeSet<String> = modules.keys().cloned().collect();
 
         self.with_dependencies(modules)?;
+
+        modules.extends_glossary(&mut self.glossary);
 
         for name in modules.sequence(&our_modules)? {
             if let Some(module) = modules.remove(&name) {
@@ -1109,6 +1150,7 @@ where
         tests: Vec<Test>,
         seed: u32,
         max_success: usize,
+        tracing: Tracing,
     ) -> Vec<TestResult<UntypedExpr, UntypedExpr>> {
         use rayon::prelude::*;
 
@@ -1118,7 +1160,7 @@ where
 
         tests
             .into_par_iter()
-            .map(|test| test.run(seed, max_success, plutus_version))
+            .map(|test| test.run(seed, max_success, plutus_version, tracing))
             .collect::<Vec<TestResult<(Constant, Rc<Type>), PlutusData>>>()
             .into_iter()
             .map(|test| test.reify(&data_types))
@@ -1176,7 +1218,7 @@ where
             AddModuleBy::Path(path) => {
                 let name = self.module_name(dir, &path);
                 let code = fs::read_to_string(&path).map_err(|error| Error::FileIo {
-                    path: path.clone(),
+                    path: Box::new(path.clone()),
                     error,
                 })?;
                 (name, code, path)

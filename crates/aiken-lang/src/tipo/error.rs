@@ -1,3 +1,7 @@
+// NOTE: Required because clippy is unable to see through miette's Diagnostic macro expansion to
+// correctly assert that fields are used in the diagnostic precisely.
+#![allow(unused_assignments)]
+
 use super::Type;
 use crate::{
     ast::{
@@ -75,7 +79,7 @@ pub enum Error {
     CastDataNoAnn {
         #[label("missing annotation")]
         location: Span,
-        value: UntypedExpr,
+        value: Box<UntypedExpr>,
     },
 
     #[error("I struggled to unify the types of two expressions.\n")]
@@ -100,6 +104,38 @@ pub enum Error {
     CyclicTypeDefinitions {
         #[label(collection, "part of a cycle")]
         cycle: Vec<Span>,
+    },
+
+    #[error("I found an incorrect usage of decorators.\n")]
+    #[diagnostic(code("decorators::validation"))]
+    #[diagnostic(help("{message}"))]
+    DecoratorValidation {
+        #[label("found here")]
+        location: Span,
+        message: String,
+    },
+
+    #[error("I found an incorrect usage of decorators.\n")]
+    #[diagnostic(code("decorators::validation"))]
+    #[diagnostic(help(
+        "All tags for a type must be unique. Pay attention to the order of the constructors.\nBy default a constructor's tag is it's order of appearance at the definition site, starting at 0."
+    ))]
+    DecoratorTagOverlap {
+        tag: usize,
+        #[label("found \"{tag}\" here")]
+        first: Span,
+        #[label("conflicts here")]
+        second: Span,
+    },
+
+    #[error("I found an incorrect usage of decorators.\n")]
+    #[diagnostic(code("decorators::conflict"))]
+    #[diagnostic(help("You cannot use these two decorators together"))]
+    ConflictingDecorators {
+        #[label("here")]
+        location: Span,
+        #[label("conflicts with")]
+        conflicting_location: Span,
     },
 
     #[error(
@@ -341,7 +377,6 @@ You can use '{discard}' and numbers to distinguish between similar names.
         location: Span,
         expected: usize,
         given: usize,
-        labels: Vec<String>,
     },
 
     #[error(
@@ -397,8 +432,8 @@ From there, you can define 'increment', a function that takes a single argument 
         location: Span,
         expected: usize,
         given: Vec<CallArg<UntypedPattern>>,
-        name: String,
-        module: Option<Namespace>,
+        name: Box<String>,
+        module: Box<Option<Namespace>>,
         is_record: bool,
     },
 
@@ -482,7 +517,7 @@ If you really meant to return that last expression, try to replace it with the f
     LastExpressionIsAssignment {
         #[label("let-binding as last expression")]
         location: Span,
-        expr: expr::UntypedExpr,
+        expr: Box<expr::UntypedExpr>,
         patterns: Vec1<AssignmentPattern>,
         kind: UntypedAssignmentKind,
     },
@@ -600,7 +635,7 @@ Maybe you meant to turn it public using the '{keyword_pub}' keyword?"#
     PrivateTypeLeak {
         #[label("private type leak")]
         location: Span,
-        leaked: Type,
+        leaked: Box<Type>,
         #[label("defined here")]
         leaked_location: Option<Span>,
     },
@@ -728,10 +763,10 @@ Perhaps, try the following:
     UnexpectedLabeledArgInPattern {
         #[label("unexpected labeled arg")]
         location: Span,
-        label: String,
-        name: String,
+        label: Box<String>,
+        name: Box<String>,
         args: Vec<CallArg<UntypedPattern>>,
-        module: Option<Namespace>,
+        module: Box<Option<Namespace>>,
         spread_location: Option<Span>,
     },
 
@@ -888,7 +923,6 @@ Perhaps, try the following:
         typ: Rc<Type>,
         label: String,
         fields: Vec<String>,
-        situation: Option<UnknownRecordFieldSituation>,
     },
 
     #[error("I found a reference to an unknown type.\n")]
@@ -1069,10 +1103,7 @@ The best thing to do from here is to remove it."#))]
     },
 
     #[error("Cannot infer caller without inferring callee first")]
-    MustInferFirst {
-        function: UntypedFunction,
-        location: Span,
-    },
+    MustInferFirst { function: Box<UntypedFunction> },
 
     #[error("I found a validator handler referring to an unknown purpose.\n")]
     #[diagnostic(code("unknown::purpose"))]
@@ -1122,6 +1153,14 @@ The best thing to do from here is to remove it."#))]
     ))]
     InvalidFieldAccess {
         #[label("invalid field access")]
+        location: Span,
+    },
+
+    #[error("I couldn't get passed an illegal tracing argument.\n")]
+    #[diagnostic(code("illegal::trace_arg"))]
+    #[diagnostic(help("It isn't possible to inspect certain values like Miller-Loop results."))]
+    IllegalTraceArgument {
+        #[label("cannot be inspected")]
         location: Span,
     },
 }
@@ -1186,7 +1225,11 @@ impl ExtraData for Error {
             | Error::UnexpectedValidatorFallback { .. }
             | Error::IncorrectBenchmarkArity { .. }
             | Error::MustInferFirst { .. }
-            | Error::InvalidFieldAccess { .. } => None,
+            | Error::DecoratorValidation { .. }
+            | Error::ConflictingDecorators { .. }
+            | Error::DecoratorTagOverlap { .. }
+            | Error::InvalidFieldAccess { .. }
+            | Error::IllegalTraceArgument { .. } => None,
 
             Error::PrivateTypeLeak {
                 leaked,
@@ -1209,13 +1252,7 @@ impl ExtraData for Error {
 }
 
 impl Error {
-    pub fn call_situation(mut self) -> Self {
-        if let Error::UnknownRecordField {
-            ref mut situation, ..
-        } = self
-        {
-            *situation = Some(UnknownRecordFieldSituation::FunctionCall);
-        }
+    pub fn call_situation(self) -> Self {
         self
     }
 
@@ -1253,10 +1290,10 @@ impl Error {
     pub fn with_unify_error_rigid_names(mut self, new_names: &HashMap<u64, String>) -> Self {
         match self {
             Error::CouldNotUnify {
-                rigid_type_names: ref mut annotated_names,
+                ref mut rigid_type_names,
                 ..
             } => {
-                annotated_names.clone_from(new_names);
+                rigid_type_names.clone_from(new_names);
                 self
             }
             _ => self,
@@ -1624,7 +1661,7 @@ pub enum Warning {
     SingleWhenClause {
         #[label("use let")]
         location: Span,
-        sample: UntypedExpr,
+        sample: Box<UntypedExpr>,
     },
 
     #[error(
@@ -1651,7 +1688,7 @@ pub enum Warning {
         pattern_location: Span,
         #[label("is not Data")]
         value_location: Span,
-        sample: UntypedExpr,
+        sample: Box<UntypedExpr>,
     },
 
     #[error("I found a todo left in the code.")]

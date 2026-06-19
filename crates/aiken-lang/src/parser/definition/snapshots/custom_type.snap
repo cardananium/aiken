@@ -4,8 +4,10 @@ description: "Code:\n\ntype Option<a> {\n  Some(a, Int)\n  None\n  Wow { name: I
 ---
 DataType(
     DataType {
+        decorators: [],
         constructors: [
             RecordConstructor {
+                decorators: [],
                 location: 19..31,
                 name: "Some",
                 arguments: [
@@ -36,6 +38,7 @@ DataType(
                 sugar: false,
             },
             RecordConstructor {
+                decorators: [],
                 location: 34..38,
                 name: "None",
                 arguments: [],
@@ -43,6 +46,7 @@ DataType(
                 sugar: false,
             },
             RecordConstructor {
+                decorators: [],
                 location: 41..68,
                 name: "Wow",
                 arguments: [

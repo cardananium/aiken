@@ -1,6 +1,9 @@
 use crate::{
-    ast::{BinOp, DataTypeKey, IfBranch, OnTestFailure, Span, TypedArg, TypedDataType, TypedTest},
-    expr::{TypedExpr, UntypedExpr},
+    ast::{
+        BinOp, DataTypeKey, IfBranch, OnTestFailure, Span, TraceLevel, Tracing, TypedArg,
+        TypedDataType, TypedTest,
+    },
+    expr::{CallArg, TypedExpr, UntypedExpr},
     format::Formatter,
     gen_uplc::CodeGenerator,
     plutus_version::PlutusVersion,
@@ -79,7 +82,7 @@ impl Test {
                         &[],
                         &module_name,
                     ))
-                    .expect("failed to convert assertion operaand to NamedDeBruijn")
+                    .expect("failed to convert assertion operand to NamedDeBruijn")
                     .eval(ExBudget::max())
                     .unwrap_constant()
                     .map(|cst| (cst, side.tipo()))
@@ -194,9 +197,12 @@ impl Test {
         seed: u32,
         max_success: usize,
         plutus_version: &PlutusVersion,
+        tracing: Tracing,
     ) -> TestResult<(Constant, Rc<Type>), PlutusData> {
         match self {
-            Test::UnitTest(unit_test) => TestResult::UnitTestResult(unit_test.run(plutus_version)),
+            Test::UnitTest(unit_test) => {
+                TestResult::UnitTestResult(unit_test.run(plutus_version, tracing))
+            }
             Test::PropertyTest(property_test) => {
                 TestResult::PropertyTestResult(property_test.run(seed, max_success, plutus_version))
             }
@@ -222,18 +228,28 @@ pub struct UnitTest {
 unsafe impl Send for UnitTest {}
 
 impl UnitTest {
-    pub fn run(self, plutus_version: &PlutusVersion) -> UnitTestResult<(Constant, Rc<Type>)> {
+    pub fn run(
+        self,
+        plutus_version: &PlutusVersion,
+        tracing: Tracing,
+    ) -> UnitTestResult<(Constant, Rc<Type>)> {
         let eval_result = Program::<NamedDeBruijn>::try_from(self.program.clone())
             .unwrap()
             .eval_version(ExBudget::max(), &plutus_version.into());
 
-        let success = !eval_result.failed(match self.on_test_failure {
-            OnTestFailure::SucceedEventually | OnTestFailure::SucceedImmediately => true,
-            OnTestFailure::FailImmediately => false,
-        });
+        let is_evaluation_failure = eval_result.failed(true, &plutus_version.into());
+
+        let success = match self.on_test_failure {
+            OnTestFailure::SucceedEventually | OnTestFailure::SucceedImmediately => {
+                is_evaluation_failure
+            }
+            OnTestFailure::FailImmediately => !is_evaluation_failure,
+        };
 
         let mut logs = Vec::new();
-        if let Err(err) = eval_result.result() {
+        if let Err(err) = eval_result.result()
+            && tracing.trace_level(false) == TraceLevel::Verbose
+        {
             logs.push(format!("{err}"))
         }
         logs.extend(eval_result.logs());
@@ -415,7 +431,7 @@ impl PropertyTest {
                 .or_insert(1);
         }
 
-        let is_failure = result.failed(false);
+        let is_failure = result.failed(true, &plutus_version.into());
 
         let is_success = !is_failure;
 
@@ -433,9 +449,9 @@ impl PropertyTest {
                         Err(..) => Status::Invalid,
                         Ok(None) => Status::Invalid,
                         Ok(Some((_, value))) => {
-                            let result = self.eval(&value, plutus_version);
-
-                            let is_failure = result.failed(false);
+                            let is_failure = self
+                                .eval(&value, plutus_version)
+                                .failed(true, &plutus_version.into());
 
                             match self.on_test_failure {
                                 FailImmediately | SucceedImmediately => {
@@ -709,58 +725,55 @@ impl Prng {
         /// Interpret the given 'PlutusData' as one of two Prng constructors.
         fn as_prng(cst: &PlutusData) -> Prng {
             if let PlutusData::Constr(Constr { tag, fields, .. }) = cst {
-                if *tag == 121 + Prng::SEEDED {
-                    if let [
+                if *tag == 121 + Prng::SEEDED
+                    && let [
                         PlutusData::BoundedBytes(bytes),
                         PlutusData::BoundedBytes(choices),
                     ] = &fields[..]
-                    {
-                        return Prng::Seeded {
-                            choices: choices.to_vec(),
-                            uplc: Data::constr(
-                                Prng::SEEDED,
-                                vec![
-                                    PlutusData::BoundedBytes(bytes.to_owned()),
-                                    // Clear choices between seeded runs, to not
-                                    // accumulate ALL choices ever made.
-                                    PlutusData::BoundedBytes(vec![].into()),
-                                ],
-                            ),
-                        };
-                    }
+                {
+                    return Prng::Seeded {
+                        choices: choices.to_vec(),
+                        uplc: Data::constr(
+                            Prng::SEEDED,
+                            vec![
+                                PlutusData::BoundedBytes(bytes.to_owned()),
+                                // Clear choices between seeded runs, to not
+                                // accumulate ALL choices ever made.
+                                PlutusData::BoundedBytes(vec![].into()),
+                            ],
+                        ),
+                    };
                 }
 
-                if *tag == 121 + Prng::REPLAYED {
-                    if let [PlutusData::BigInt(..), PlutusData::BoundedBytes(choices)] = &fields[..]
-                    {
-                        return Prng::Replayed {
-                            choices: choices.to_vec(),
-                            uplc: cst.clone(),
-                        };
-                    }
+                if *tag == 121 + Prng::REPLAYED
+                    && let [PlutusData::BigInt(..), PlutusData::BoundedBytes(choices)] = &fields[..]
+                {
+                    return Prng::Replayed {
+                        choices: choices.to_vec(),
+                        uplc: cst.clone(),
+                    };
                 }
             }
 
             unreachable!("malformed Prng: {cst:#?}")
         }
 
-        if let Term::Constant(rc) = &result {
-            if let Constant::Data(PlutusData::Constr(Constr { tag, fields, .. })) = &rc.borrow() {
-                if *tag == 121 + Prng::SOME {
-                    if let [PlutusData::Array(elems)] = &fields[..] {
-                        if let [new_seed, value] = &elems[..] {
-                            return Some((as_prng(new_seed), value.clone()));
-                        }
-                    }
-                }
+        if let Term::Constant(rc) = &result
+            && let Constant::Data(PlutusData::Constr(Constr { tag, fields, .. })) = &rc.borrow()
+        {
+            if *tag == 121 + Prng::SOME
+                && let [PlutusData::Array(elems)] = &fields[..]
+                && let [new_seed, value] = &elems[..]
+            {
+                return Some((as_prng(new_seed), value.clone()));
+            }
 
-                // May occurs when replaying a fuzzer from a shrinked sequence of
-                // choices. If we run out of choices, or a choice end up being
-                // invalid as per the expectation, the fuzzer can't go further and
-                // fail.
-                if *tag == 121 + Prng::NONE {
-                    return None;
-                }
+            // May occurs when replaying a fuzzer from a shrinked sequence of
+            // choices. If we run out of choices, or a choice end up being
+            // invalid as per the expectation, the fuzzer can't go further and
+            // fail.
+            if *tag == 121 + Prng::NONE {
+                return None;
             }
         }
 
@@ -1366,6 +1379,128 @@ impl TryFrom<TypedExpr> for Assertion<TypedExpr> {
                     Err(())
                 }
             }
+
+            TypedExpr::Call {
+                args,
+                location,
+                fun,
+                ..
+            } => {
+                // Unwind backpassing if any, or calls to function that contain binary ops.
+                if let Some((last_arg, first_args)) = args.split_last()
+                    && let TypedExpr::Fn {
+                        body: last_arg_body,
+                        location: last_arg_location,
+                        tipo: last_arg_tipo,
+                        is_capture: last_arg_is_capture,
+                        return_annotation: last_arg_return_annotation,
+                        args: last_arg_args,
+                    } = &last_arg.value
+                {
+                    let Assertion { bin_op, head, tail } = Self::try_from(*last_arg_body.clone())?;
+
+                    let new_callback_tipo = |body: &TypedExpr| -> Rc<Type> {
+                        match last_arg_tipo.as_ref() {
+                            Type::Fn {
+                                args,
+                                ret: _ret,
+                                alias,
+                            } => Rc::new(Type::Fn {
+                                args: args.clone(),
+                                ret: body.tipo(), // Replace the return type to match head.
+                                alias: alias.clone(),
+                            }),
+                            Type::App { .. }
+                            | Type::Var { .. }
+                            | Type::Pair { .. }
+                            | Type::Tuple { .. } => {
+                                unreachable!(
+                                    "guard above on 'last_arg.value' guarantees that type is necessarily a function (Fn)"
+                                )
+                            }
+                        }
+                    };
+
+                    let new_fun = |body: &TypedExpr, callback_tipo: Rc<Type>| -> Box<TypedExpr> {
+                        let fun_tipo = match fun.as_ref().tipo().as_ref() {
+                            Type::Fn {
+                                args,
+                                alias,
+                                ret: _,
+                            } => {
+                                let mut args = args
+                                    .split_last()
+                                    .expect("function has at least one arg")
+                                    .1
+                                    .to_vec();
+                                args.push(callback_tipo); // Replace last callback argument
+                                Rc::new(Type::Fn {
+                                    args,
+                                    ret: body.tipo(), // Replace overall return type
+                                    alias: alias.clone(),
+                                })
+                            }
+                            Type::App { .. }
+                            | Type::Var { .. }
+                            | Type::Pair { .. }
+                            | Type::Tuple { .. } => {
+                                unreachable!(
+                                    "guard above on 'last_arg.value' guarantees that type is necessarily a function (Fn)"
+                                )
+                            }
+                        };
+
+                        let mut fun = fun.clone();
+                        fun.replace_type(fun_tipo);
+
+                        fun
+                    };
+
+                    let new_args =
+                        |body: TypedExpr, callback_tipo: Rc<Type>| -> Vec<CallArg<TypedExpr>> {
+                            let mut args = first_args.to_vec();
+                            args.push(CallArg {
+                                label: last_arg.label.clone(),
+                                location: last_arg.location,
+                                value: TypedExpr::Fn {
+                                    location: *last_arg_location,
+                                    tipo: callback_tipo.clone(),
+                                    is_capture: *last_arg_is_capture,
+                                    return_annotation: last_arg_return_annotation.clone(),
+                                    args: last_arg_args.clone(),
+                                    body: Box::new(body),
+                                },
+                            });
+                            args
+                        };
+
+                    return Ok(Assertion {
+                        bin_op,
+                        head: head.map(|body| {
+                            let callback_tipo = new_callback_tipo(&body);
+                            TypedExpr::Call {
+                                location,
+                                tipo: body.tipo(),
+                                fun: new_fun(&body, callback_tipo.clone()),
+                                args: new_args(body, callback_tipo.clone()),
+                            }
+                        }),
+                        tail: tail.map(|tail| {
+                            tail.mapped(|body| {
+                                let callback_tipo = new_callback_tipo(&body);
+                                TypedExpr::Call {
+                                    location,
+                                    tipo: body.tipo(),
+                                    fun: new_fun(&body, callback_tipo.clone()),
+                                    args: new_args(body, callback_tipo.clone()),
+                                }
+                            })
+                        }),
+                    });
+                }
+                Err(())
+            }
+
             _ => Err(()),
         }
     }

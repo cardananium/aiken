@@ -11,7 +11,7 @@ use aiken_lang::{
 use numfmt::{Precision, Scales};
 use owo_colors::{OwoColorize, Stream::Stderr};
 use rgb::RGB8;
-use std::sync::LazyLock;
+use std::{cell::RefCell, sync::LazyLock};
 use uplc::machine::cost_model::ExBudget;
 
 static BENCH_PLOT_COLOR: LazyLock<RGB8> = LazyLock::new(|| RGB8 {
@@ -182,7 +182,7 @@ impl EventListener for Terminal {
             } => {
                 let (max_mem, max_cpu, max_iter) = find_max_execution_units(&tests);
 
-                let (mut formatter, max_mem, max_cpu) =
+                let (formatter, max_mem, max_cpu) =
                     derive_execution_units_format(plain_numbers, max_mem, max_cpu);
 
                 for (module, results) in &group_by_module(&tests) {
@@ -201,7 +201,7 @@ impl EventListener for Terminal {
                                 max_iter,
                                 true,
                                 coverage_mode,
-                                &mut formatter,
+                                &formatter,
                             )
                         })
                         .collect::<Vec<String>>()
@@ -300,16 +300,21 @@ impl EventListener for Terminal {
                     "...".if_supports_color(Stderr, |s| s.bold())
                 );
             }
-            Event::FinishedBenchmarks { seed, benchmarks } => {
+            Event::FinishedBenchmarks {
+                seed,
+                benchmarks,
+                plain_numbers,
+            } => {
                 let (max_mem, max_cpu, max_iter) = find_max_execution_units(&benchmarks);
+
+                let (formatter, max_mem, max_cpu) =
+                    derive_execution_units_format(plain_numbers, max_mem, max_cpu);
 
                 for (module, results) in &group_by_module(&benchmarks) {
                     let title = module
                         .if_supports_color(Stderr, |s| s.bold())
                         .if_supports_color(Stderr, |s| s.blue())
                         .to_string();
-
-                    let mut formatter = numfmt::Formatter::new();
 
                     let benchmarks = results
                         .iter()
@@ -321,7 +326,7 @@ impl EventListener for Terminal {
                                 max_iter,
                                 true,
                                 CoverageMode::default(),
-                                &mut formatter,
+                                &formatter,
                             )
                         })
                         .collect::<Vec<String>>()
@@ -366,12 +371,12 @@ fn fmt_test(
     max_iter: usize,
     styled: bool,
     coverage_mode: CoverageMode,
-    formatter: &mut numfmt::Formatter,
+    formatter: &RefCell<numfmt::Formatter>,
 ) -> String {
     // Status
     let mut test = if matches!(result, TestResult::BenchmarkResult { .. }) {
         format!(
-            "\n{label}{title}\n",
+            "\n{label}{title}",
             label = if result.is_success() {
                 String::new()
             } else {
@@ -404,8 +409,10 @@ fn fmt_test(
         TestResult::UnitTestResult(UnitTestResult { spent_budget, .. }) => {
             let ExBudget { mem, cpu } = spent_budget;
 
-            let mem_pad = pretty::pad_left(formatter.fmt2(*mem).to_owned(), max_mem, " ");
-            let cpu_pad = pretty::pad_left(formatter.fmt2(*cpu).to_owned(), max_cpu, " ");
+            let mem_pad =
+                pretty::pad_left(formatter.borrow_mut().fmt2(*mem).to_owned(), max_mem, " ");
+            let cpu_pad =
+                pretty::pad_left(formatter.borrow_mut().fmt2(*cpu).to_owned(), max_cpu, " ");
 
             test = format!(
                 "{test} [mem: {mem_unit}, cpu: {cpu_unit}]",
@@ -460,7 +467,8 @@ fn fmt_test(
                         .iter()
                         .map(|(size, budget)| (*size as f32, budget.mem as f32))
                         .collect::<Vec<_>>(),
-                    max_size
+                    max_size,
+                    formatter.clone(),
                 )
             );
 
@@ -475,9 +483,27 @@ fn fmt_test(
                         .iter()
                         .map(|(size, budget)| (*size as f32, budget.cpu as f32))
                         .collect::<Vec<_>>(),
-                    max_size
+                    max_size,
+                    formatter.clone(),
                 )
             );
+
+            let max_mem_size = linear_regression(
+                measures
+                    .iter()
+                    .map(|(size, budget)| ((*size) as u64, budget.mem)),
+            )
+            .and_then(|regression| max_below_limit(regression, ExBudget::default().mem as f64));
+
+            let max_cpu_size = linear_regression(
+                measures
+                    .iter()
+                    .map(|(size, budget)| ((*size) as u64, budget.cpu)),
+            )
+            .and_then(|regression| max_below_limit(regression, ExBudget::default().cpu as f64));
+
+            let projected_max_size =
+                max_mem_size.and_then(|mem| max_cpu_size.map(|cpu| mem.min(cpu)));
 
             let charts = mem_chart
                 .lines()
@@ -486,7 +512,14 @@ fn fmt_test(
                 .collect::<Vec<_>>()
                 .join("\n");
 
-            test = format!("{test}{charts}",);
+            test = format!(
+                "{test}{}{charts}",
+                if let Some(sz) = projected_max_size {
+                    format!(" (projected max size = {sz})\n")
+                } else {
+                    "\n".to_string()
+                }
+            );
         }
     }
 
@@ -591,40 +624,39 @@ fn fmt_test(
     if let TestResult::PropertyTestResult(PropertyTestResult {
         labels, iterations, ..
     }) = result
+        && !labels.is_empty()
+        && result.is_success()
     {
-        if !labels.is_empty() && result.is_success() {
+        test = format!(
+            "{test}\n{title}",
+            title = "· with coverage".if_supports_color(Stderr, |s| s.bold())
+        );
+
+        let mut total = 0;
+        let mut pad = 0;
+        for (k, v) in labels {
+            total += v;
+            if k.len() > pad {
+                pad = k.len();
+            }
+        }
+
+        match coverage_mode {
+            CoverageMode::RelativeToLabels => {}
+            CoverageMode::RelativeToTests => {
+                total = *iterations;
+            }
+        }
+
+        let mut labels = labels.iter().collect::<Vec<_>>();
+        labels.sort_by(|a, b| b.1.cmp(a.1));
+
+        for (k, v) in labels {
             test = format!(
-                "{test}\n{title}",
-                title = "· with coverage".if_supports_color(Stderr, |s| s.bold())
+                "{test}\n| {} {:>5.1}%",
+                pretty::pad_right(k.to_owned(), pad, " ").if_supports_color(Stderr, |s| s.bold()),
+                100.0 * (*v as f64) / (total as f64),
             );
-
-            let mut total = 0;
-            let mut pad = 0;
-            for (k, v) in labels {
-                total += v;
-                if k.len() > pad {
-                    pad = k.len();
-                }
-            }
-
-            match coverage_mode {
-                CoverageMode::RelativeToLabels => {}
-                CoverageMode::RelativeToTests => {
-                    total = *iterations;
-                }
-            }
-
-            let mut labels = labels.iter().collect::<Vec<_>>();
-            labels.sort_by(|a, b| b.1.cmp(a.1));
-
-            for (k, v) in labels {
-                test = format!(
-                    "{test}\n| {} {:>5.1}%",
-                    pretty::pad_right(k.to_owned(), pad, " ")
-                        .if_supports_color(Stderr, |s| s.bold()),
-                    100.0 * (*v as f64) / (total as f64),
-                );
-            }
         }
     }
 
@@ -636,7 +668,26 @@ fn fmt_test(
             traces = result
                 .logs()
                 .iter()
-                .map(|line| { format!("| {line}",) })
+                .map(|line| {
+                    match line
+                        .strip_prefix("expect ")
+                        .or_else(|| line.strip_prefix("<expected> "))
+                    {
+                        None => format!("| {line}"),
+                        Some(rest) => format!(
+                            "{} {rest}",
+                            if result.is_success() {
+                                "✓ <expected>"
+                                    .if_supports_color(Stderr, |s| s.green().bold().to_string())
+                                    .to_string()
+                            } else {
+                                "× <expected>"
+                                    .if_supports_color(Stderr, |s| s.red().bold().to_string())
+                                    .to_string()
+                            },
+                        ),
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("\n")
         );
@@ -669,26 +720,39 @@ fn fmt_test_summary<T>(tests: &[&TestResult<T, T>], styled: bool) -> String {
     )
 }
 
-fn plot(color: &RGB8, points: Vec<(f32, f32)>, max_size: usize) -> String {
-    use textplots::{Chart, ColorPlot, Shape};
+fn plot(
+    color: &RGB8,
+    points: Vec<(f32, f32)>,
+    max_size: usize,
+    formatter: RefCell<numfmt::Formatter>,
+) -> String {
+    use textplots::{Chart, ColorPlot, LabelBuilder, LabelFormat, Shape};
     let mut chart = Chart::new(80, 50, 1.0, max_size as f32);
     let plot = Shape::Lines(&points);
     let chart = chart.linecolorplot(&plot, *color);
     chart.borders();
     chart.axis();
     chart.figures();
-    chart.to_string()
+    chart
+        .y_label_format(LabelFormat::Custom(Box::new(move |y| {
+            formatter.borrow_mut().fmt2(y).to_owned()
+        })))
+        .to_string()
 }
 
 fn derive_execution_units_format(
     plain_numbers: bool,
     max_mem: usize,
     max_cpu: usize,
-) -> (numfmt::Formatter, usize, usize) {
+) -> (RefCell<numfmt::Formatter>, usize, usize) {
     // Update max size of the execution units to account for underscores
     // after three decimal place e.g. 1_000_000
     let update_max_size = |x: usize| {
-        if x % 3 == 0 { x + x / 3 - 1 } else { x + x / 3 }
+        if x.is_multiple_of(3) {
+            x + x / 3 - 1
+        } else {
+            x + x / 3
+        }
     };
 
     if plain_numbers {
@@ -697,7 +761,7 @@ fn derive_execution_units_format(
             .unwrap()
             .precision(Precision::Decimals(0));
         (
-            formatter,
+            RefCell::new(formatter),
             update_max_size(max_mem),
             update_max_size(max_cpu),
         )
@@ -707,6 +771,68 @@ fn derive_execution_units_format(
             .precision(Precision::Decimals(2));
         // For units denoted in scales, max unit value
         // does not give max unit size (e.g. 123.4 K vs 12.3 M )
-        (formatter, 8, 8)
+        (RefCell::new(formatter), 8, 8)
+    }
+}
+
+struct LinearModel {
+    slope: f64,
+    intercept: f64,
+}
+
+fn linear_regression(points: impl Iterator<Item = (u64, i64)>) -> Option<LinearModel> {
+    let mut sum_x = 0.0;
+    let mut sum_y = 0.0;
+    let mut sum_xx = 0.0;
+    let mut sum_xy = 0.0;
+    let mut n = 0;
+
+    for (x, y) in points {
+        n += 1;
+
+        let x: f64 = x as f64;
+        let y: f64 = y as f64;
+
+        if !(x.is_finite() && y.is_finite()) {
+            return None;
+        }
+
+        sum_x += x;
+        sum_y += y;
+        sum_xx += x * x;
+        sum_xy += x * y;
+    }
+
+    let denominator = (n as f64) * sum_xx - sum_x * sum_x;
+
+    if n < 2 || denominator == 0.0 {
+        return None;
+    }
+
+    let slope = ((n as f64) * sum_xy - sum_x * sum_y) / denominator;
+    let intercept = (sum_y - slope * sum_x) / (n as f64);
+
+    Some(LinearModel { slope, intercept })
+}
+
+fn max_below_limit(model: LinearModel, limit: f64) -> Option<u64> {
+    if model.slope == 0.0 {
+        return if model.intercept < limit {
+            Some(u64::MAX)
+        } else {
+            None
+        };
+    }
+
+    if model.slope < 0.0 {
+        return Some(u64::MAX);
+    }
+
+    let candidate = ((limit - model.intercept) / model.slope).ceil() - 1.0;
+
+    if candidate < 0.0 {
+        Some(0)
+    } else {
+        Some(candidate as u64)
     }
 }

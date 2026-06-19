@@ -136,7 +136,7 @@ pub fn exec(
             Some(ref path) => {
                 fs::write(path, json).map_err(|error| Error::FileIo {
                     error,
-                    path: path.clone(),
+                    path: Box::new(path.clone()),
                 })?;
             }
         };
@@ -207,7 +207,7 @@ fn ask_schema(
                     ix + 1,
                     Ordinal::<usize>(ix + 1).suffix()
                 );
-                let inner_schema = lookup_declaration(&decl.clone().into(), definitions);
+                let inner_schema = lookup_declaration(&decl.clone(), definitions);
                 elems.push(ask_schema(&inner_schema, definitions)?);
             }
 

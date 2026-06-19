@@ -6,8 +6,9 @@ use indexmap::IndexMap;
 use itertools::{Either, Itertools, Position};
 
 use crate::{
-    ast::{DataTypeKey, Pattern, TypedClause, TypedDataType, TypedPattern},
+    ast::{DataTypeKey, DecoratorKind, Pattern, TypedClause, TypedDataType, TypedPattern},
     expr::{Type, TypeVar, TypedExpr, lookup_data_type_by_tipo},
+    gen_uplc::builder::get_constr_index_variant,
     tipo::PatternConstructor,
 };
 
@@ -23,7 +24,7 @@ struct Occurrence {
 pub enum Path {
     Pair(usize),
     Tuple(usize),
-    Constr(Rc<Type>, usize),
+    Constr(Rc<Type>, usize, bool),
     OpaqueConstr(Rc<Type>),
     List(usize),
     ListTail(usize),
@@ -38,8 +39,8 @@ impl Display for Path {
             Path::Tuple(i) => {
                 write!(f, "tuple_{i}")
             }
-            Path::Constr(_, i) => {
-                write!(f, "constr_{i}")
+            Path::Constr(_, i, b) => {
+                write!(f, "constr_{i}_{b}")
             }
             Path::OpaqueConstr(_) => write!(f, "opaqueconstr"),
             Path::List(i) => {
@@ -57,7 +58,7 @@ impl PartialEq for Path {
         match (self, other) {
             (Path::Pair(a), Path::Pair(b))
             | (Path::Tuple(a), Path::Tuple(b))
-            | (Path::Constr(_, a), Path::Constr(_, b))
+            | (Path::Constr(_, a, _), Path::Constr(_, b, _))
             | (Path::List(a), Path::List(b))
             | (Path::ListTail(a), Path::ListTail(b)) => a == b,
             (Path::OpaqueConstr(_), Path::OpaqueConstr(_)) => true,
@@ -81,7 +82,7 @@ impl Ord for Path {
             | (Path::Tuple(a), Path::Tuple(b))
             | (Path::List(a), Path::List(b))
             | (Path::ListTail(a), Path::ListTail(b))
-            | (Path::Constr(_, a), Path::Constr(_, b)) => a.cmp(b),
+            | (Path::Constr(_, a, _), Path::Constr(_, b, _)) => a.cmp(b),
             (Path::OpaqueConstr(_), Path::OpaqueConstr(_)) => Ordering::Equal,
             _ => Ordering::Equal,
         }
@@ -276,7 +277,7 @@ impl<'a> DecisionTree<'a> {
 
     // Please help me with this the way nesting works
     // has me baffled
-    fn to_doc(&self) -> RcDoc<()> {
+    fn to_doc(&self) -> RcDoc<'_, ()> {
         match self {
             DecisionTree::Switch {
                 path,
@@ -824,6 +825,7 @@ impl<'a, 'b> TreeGen<'a, 'b> {
             |(mut default_matrix, mut case_matrices): (Vec<Row>, Vec<(CaseTest, Vec<Row>)>),
              mut row| {
                 // For example in the case of matching on []
+                // and then the expansion of [] is empty
                 if row.columns.is_empty() {
                     default_matrix.push(row);
                     return (default_matrix, case_matrices);
@@ -886,12 +888,7 @@ impl<'a, 'b> TreeGen<'a, 'b> {
                         let data_type =
                             lookup_data_type_by_tipo(self.data_types, &specialized_tipo).unwrap();
 
-                        let (constr_index, _) = data_type
-                            .constructors
-                            .iter()
-                            .enumerate()
-                            .find(|(_, dt)| &dt.name == name)
-                            .unwrap();
+                        let (constr_index, _) = get_constr_index_variant(&data_type, name).unwrap();
 
                         (
                             CaseTest::Constr(constr_index),
@@ -901,7 +898,7 @@ impl<'a, 'b> TreeGen<'a, 'b> {
                                 .map(|(index, arg)| {
                                     let mut item_path = col.path.clone();
 
-                                    item_path.push(Path::Constr(tipo.clone(), index));
+                                    item_path.push(Path::Constr(tipo.clone(), index, false));
 
                                     self.map_pattern_to_row(&arg.value, subject_tipo, item_path)
                                 })
@@ -1219,8 +1216,14 @@ impl<'a, 'b> TreeGen<'a, 'b> {
             } => {
                 let data_type = lookup_data_type_by_tipo(self.data_types, &current_tipo).unwrap();
 
-                let is_transparent =
-                    data_type.opaque && data_type.constructors[0].arguments.len() == 1;
+                let list_decorator = data_type
+                    .decorators
+                    .iter()
+                    .any(|dec| matches!(&dec.kind, DecoratorKind::List));
+
+                let is_transparent = data_type.opaque
+                    && data_type.constructors[0].arguments.len() == 1
+                    && !list_decorator;
 
                 if data_type.constructors.len() == 1 || data_type.is_never() {
                     arguments
@@ -1233,8 +1236,10 @@ impl<'a, 'b> TreeGen<'a, 'b> {
 
                             if is_transparent {
                                 item_path.push(Path::OpaqueConstr(tipo.clone()));
+                            } else if list_decorator {
+                                item_path.push(Path::Constr(tipo.clone(), index, true));
                             } else {
-                                item_path.push(Path::Constr(tipo.clone(), index));
+                                item_path.push(Path::Constr(tipo.clone(), index, false));
                             }
 
                             let (assigns, patts) =
@@ -1303,7 +1308,7 @@ pub fn get_tipo_by_path(mut subject_tipo: Rc<Type>, mut path: &[Path]) -> Rc<Typ
             }
             Path::List(_) => subject_tipo.get_inner_types().swap_remove(0),
             Path::ListTail(_) => subject_tipo,
-            Path::Constr(tipo, index) => tipo.arg_types().unwrap().swap_remove(*index),
+            Path::Constr(tipo, index, _) => tipo.arg_types().unwrap().swap_remove(*index),
             Path::OpaqueConstr(tipo) => tipo.arg_types().unwrap().swap_remove(0),
         };
 
@@ -1410,8 +1415,8 @@ mod tester {
         let mut warnings = vec![];
 
         let mut module_types = HashMap::new();
-        module_types.insert("aiken".to_string(), builtins::prelude(&id_gen));
-        module_types.insert("aiken/builtin".to_string(), builtins::plutus(&id_gen));
+        module_types.insert(builtins::PRELUDE.to_string(), builtins::prelude(&id_gen));
+        module_types.insert(builtins::BUILTIN.to_string(), builtins::plutus(&id_gen));
 
         for (package, module) in extra {
             let mut warnings = vec![];

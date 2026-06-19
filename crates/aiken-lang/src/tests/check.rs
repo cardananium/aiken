@@ -37,8 +37,8 @@ fn check_module(
     let mut warnings = vec![];
 
     let mut module_types = HashMap::new();
-    module_types.insert("aiken".to_string(), builtins::prelude(&id_gen));
-    module_types.insert("aiken/builtin".to_string(), builtins::plutus(&id_gen));
+    module_types.insert(builtins::PRELUDE.to_string(), builtins::prelude(&id_gen));
+    module_types.insert(builtins::BUILTIN.to_string(), builtins::plutus(&id_gen));
 
     for module in extra {
         let mut warnings = vec![];
@@ -4404,4 +4404,243 @@ fn unused_constructors() {
         ),
         "{warnings:#?}"
     );
+}
+
+#[test]
+fn decorator_validation_encoding_on_enum() {
+    let source_code = r#"
+        @list
+        pub type Redeemer {
+          Buy
+          Cancel
+        }
+    "#;
+
+    assert!(matches!(
+        check(parse(source_code)),
+        Err((_, Error::DecoratorValidation { .. }))
+    ))
+}
+
+#[test]
+fn decorator_validation_encoding_on_enum_member() {
+    let source_code = r#"
+        pub type Redeemer {
+          @list
+          Buy
+          Cancel
+        }
+    "#;
+
+    assert!(matches!(
+        check(parse(source_code)),
+        Err((_, Error::DecoratorValidation { .. }))
+    ))
+}
+
+#[test]
+fn decorator_validation_tag_on_enum() {
+    let source_code = r#"
+        @tag(12)
+        pub type Redeemer {
+          Buy
+          Cancel
+        }
+    "#;
+
+    assert!(matches!(
+        check(parse(source_code)),
+        Err((_, Error::DecoratorValidation { .. }))
+    ))
+}
+
+#[test]
+fn decorator_validation_conflict() {
+    let source_code = r#"
+        @list
+        @tag(100)
+        pub type Datum {
+          thing: Int,
+        }
+    "#;
+
+    assert!(matches!(
+        check(parse(source_code)),
+        Err((_, Error::ConflictingDecorators { .. }))
+    ))
+}
+
+#[test]
+fn decorator_validation_legit_record_tag() {
+    let source_code = r#"
+        @tag(100)
+        pub type Datum {
+          thing: Int,
+        }
+    "#;
+
+    assert!(dbg!(check(parse(source_code))).is_ok())
+}
+
+#[test]
+fn decorator_validation_legit_record_list() {
+    let source_code = r#"
+        @list
+        pub type Datum {
+          thing: Int,
+        }
+    "#;
+
+    assert!(dbg!(check(parse(source_code))).is_ok())
+}
+
+#[test]
+fn decorator_validation_legit_enum() {
+    let source_code = r#"
+        pub type Redeemer {
+          @tag(4)
+          Buy
+          @tag(10)
+          Cancel
+        }
+    "#;
+
+    assert!(dbg!(check(parse(source_code))).is_ok())
+}
+
+#[test]
+fn decorator_validation_overlaping_tags_explicit() {
+    let source_code = r#"
+        pub type Redeemer {
+          @tag(4)
+          Buy
+          @tag(4)
+          Cancel
+        }
+    "#;
+
+    assert!(matches!(
+        check(parse(source_code)),
+        Err((_, Error::DecoratorTagOverlap { .. }))
+    ))
+}
+
+#[test]
+fn decorator_validation_overlaping_tags() {
+    let source_code = r#"
+        pub type Redeemer {
+          @tag(1)
+          Buy
+          Cancel
+        }
+    "#;
+
+    assert!(matches!(
+        check(parse(source_code)),
+        Err((_, Error::DecoratorTagOverlap { .. }))
+    ))
+}
+
+#[test]
+fn validator_parameter_scope_escape() {
+    let source_code = r#"
+        validator placeholder(foo: Option<Int>) {
+          withdraw(_redeemer: Data, _credential: Data, self: Data) {
+            bar(self)
+          }
+        }
+
+        fn bar(_self: Data) {
+          // foo shouldn't be in scope here!
+          when foo is {
+            None -> True
+            Some(_) -> False
+          }
+        }
+    "#;
+
+    assert!(matches!(
+        dbg!(check_validator(parse(source_code))),
+        Err((_, Error::UnknownVariable { name, .. })) if name == "foo"
+    ))
+}
+
+#[test]
+fn backpassing_with_labels() {
+    let source_code = r#"
+        fn foo(n: Int, return: fn(Int) -> a) -> a {
+          return(n)
+        }
+
+        test using_foo() {
+          let n <- foo(n: 42)
+          n == 42
+        }
+    "#;
+
+    assert!(dbg!(check_validator(parse(source_code))).is_ok())
+}
+
+#[test]
+fn dangling_assignment_in_trace_arg() {
+    let source_code = r#"
+        test foo() {
+          trace @"what's going on?": expect 1 + 1 == 2
+        }
+    "#;
+
+    assert!(dbg!(check(parse(source_code))).is_ok())
+}
+
+#[test]
+fn illegal_tracing_argument() {
+    let source_code = r#"
+        use aiken/builtin
+
+        const q: G1Element =
+          #<Bls12_381, G1>"97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb"
+
+        const p: G2Element =
+          #<Bls12_381, G2>"93e02b6052719f607dacd3a088274f65596bd0d09920b61ab5da61bbdc7f5049334cf11213945d57e5ac7d055d042b7e024aa2b2f08f0a91260805272dc51051c6e47ad4fa403b02b4510b647ae3d1770bac0326a805bbefd48056c8c121bdb8"
+
+        test foo() {
+          let some_miller_loop_result = builtin.bls12_381_miller_loop(q, p)
+          trace @"illegal trace": some_miller_loop_result
+          Void
+        }
+    "#;
+
+    assert!(matches!(
+        dbg!(check_validator(parse(source_code))),
+        Err((_, Error::IllegalTraceArgument { .. }))
+    ))
+}
+
+#[test]
+fn pointfree_pair() {
+    let source_code = r#"
+        fn mk_pair(constructor: fn(a, b) -> Pair<a, b>, a: a, b: b) -> Pair<a, b> {
+          constructor(a, b)
+        }
+
+        test foo() {
+          mk_pair(Pair, 14, "42") == Pair(14, "42")
+        }
+    "#;
+
+    assert!(dbg!(check_validator(parse(source_code))).is_ok())
+}
+
+#[test]
+fn incomplete_pair() {
+    let source_code = r#"
+        test foo() {
+          Pair(14, "42") == Pair(14)
+        }
+    "#;
+
+    assert!(matches!(
+        dbg!(check_validator(parse(source_code))),
+        Err((_, Error::IncorrectFunctionCallArity { expected, .. })) if expected == 2
+    ))
 }

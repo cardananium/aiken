@@ -18,13 +18,13 @@ use std::{
     collections::{BTreeSet, HashMap},
     fmt::Debug,
 };
-use uplc::{PlutusData, tx::script_context::PlutusScript};
+use uplc::{PlutusData, ast::SerializableProgram, tx::script_context::PlutusScript};
 use validator::Validator;
 
 #[derive(Debug, PartialEq, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Blueprint {
     pub preamble: Preamble,
-    pub validators: Vec<Validator>,
+    pub validators: Vec<Validator<SerializableProgram>>,
     #[serde(skip_serializing_if = "Definitions::is_empty", default)]
     pub definitions: Definitions<Annotated<Schema>>,
 }
@@ -66,6 +66,7 @@ impl Blueprint {
         config: &ProjectConfig,
         modules: &CheckedModules,
         generator: &mut CodeGenerator,
+        export_all_types: bool,
     ) -> Result<Self, Error> {
         let preamble = config.into();
 
@@ -73,23 +74,55 @@ impl Blueprint {
 
         let validators: Result<Vec<_>, Error> = modules
             .validators()
-            .flat_map(|(validator, def)| {
-                Validator::from_checked_module(modules, generator, validator, def, &config.plutus)
-                    .into_iter()
-                    .map(|result| {
-                        result.map(|mut schema| {
-                            definitions.merge(&mut schema.definitions);
-                            schema.definitions = Definitions::new();
-                            schema
-                        })
-                    })
-                    .collect::<Vec<_>>()
+            .map(|(validator, def)| {
+                Ok(Validator::from_checked_module(
+                    modules,
+                    generator,
+                    validator,
+                    def,
+                    &config.plutus,
+                )?
+                .into_iter()
+                .map(|mut schema| {
+                    definitions.merge(&mut schema.definitions);
+                    schema.definitions = Definitions::new();
+                    schema
+                })
+                .collect::<Vec<_>>())
             })
             .collect();
 
+        let validators: Vec<_> = validators?.into_iter().flatten().collect();
+
+        if export_all_types {
+            let project_package = config.name.to_string();
+            let modules_map: &HashMap<String, _> = modules.into();
+
+            for module in modules.values() {
+                if module.package != project_package {
+                    continue;
+                }
+
+                for type_construtor in module.ast.type_info.types.values() {
+                    if !type_construtor.public {
+                        continue;
+                    }
+
+                    Annotated::from_type(modules_map, &type_construtor.tipo, &mut definitions)
+                        .map(|_| ())
+                        .unwrap_or_else(|e| match e.context() {
+                            schema::ErrorContext::UnsupportedType
+                            | schema::ErrorContext::UnexpectedFunction
+                            | schema::ErrorContext::IllegalOpaqueType => (),
+                            _ => unreachable!("failed to export type={type_construtor:?}: {e}"),
+                        });
+                }
+            }
+        }
+
         Ok(Blueprint {
             preamble,
-            validators: validators?,
+            validators,
             definitions,
         })
     }
@@ -100,7 +133,7 @@ impl Blueprint {
         &self,
         want_module_name: Option<&str>,
         want_validator_name: Option<&str>,
-    ) -> Option<LookupResult<Validator>> {
+    ) -> Option<LookupResult<'_, Validator<SerializableProgram>>> {
         let mut validator = None;
 
         for v in self.validators.iter() {
@@ -198,7 +231,7 @@ impl Blueprint {
         action: F,
     ) -> Result<A, E>
     where
-        F: Fn(&Validator) -> Result<A, E>,
+        F: Fn(&Validator<SerializableProgram>) -> Result<A, E>,
     {
         match self.lookup(module_name, validator_name) {
             Some(LookupResult::One(_, validator)) => action(validator),
@@ -208,16 +241,16 @@ impl Blueprint {
                     .filter_map(|v| {
                         let (l, r) = v.get_module_and_name();
 
-                        if let Some(module_name) = module_name {
-                            if l != module_name {
-                                return None;
-                            }
+                        if let Some(module_name) = module_name
+                            && l != module_name
+                        {
+                            return None;
                         }
 
-                        if let Some(validator_name) = validator_name {
-                            if r != validator_name {
-                                return None;
-                            }
+                        if let Some(validator_name) = validator_name
+                            && r != validator_name
+                        {
+                            return None;
                         }
 
                         Some((l.to_string(), r.to_string(), !v.parameters.is_empty()))
@@ -391,7 +424,7 @@ mod tests {
                     "Int": {
                         "dataType": "integer"
                     },
-                    "List$ByteArray": {
+                    "List<ByteArray>": {
                         "dataType": "list",
                         "items": {
                             "$ref": "#/definitions/ByteArray"

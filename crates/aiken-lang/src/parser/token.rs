@@ -52,6 +52,7 @@ pub enum Token {
     Hash,     // '#'
     Bang,     // '!'
     Question, // '?'
+    At,       // '@'
     Equal,
     EqualEqual,  // '=='
     NotEqual,    // '!='
@@ -71,6 +72,7 @@ pub enum Token {
     Comment,
     DocComment,
     ModuleComment,
+    ExpectComment(String),
     EmptyLine,
     NewLine,
     // Keywords (alphabetically):
@@ -104,6 +106,9 @@ impl fmt::Display for Token {
             Token::Error(c) => {
                 write!(f, "\"{c}\"")?;
                 return Ok(());
+            }
+            Token::ExpectComment(comment) => {
+                return write!(f, "/// {comment}");
             }
             Token::Name { name } => name,
             Token::Ordinal { index } => {
@@ -146,6 +151,7 @@ impl fmt::Display for Token {
             Token::Bang => "!",
             Token::Equal => "=",
             Token::Question => "?",
+            Token::At => "@",
             Token::EqualEqual => "==",
             Token::NotEqual => "!=",
             Token::Vbar => "|",

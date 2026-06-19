@@ -1,11 +1,67 @@
 # Changelog
 
-## v1.1.18 - UNRELEASED
+## v1.1.22 - 2026-05-15
+
+### Added
+
+- **aiken-lang**: Allow test assertions to _"see through"_ backpassing, to provide better insights on failing tests using a continuation passing style. @KtorZ
+- **aiken**: New flag `-I / --include-all-types` to the `aiken build` command to include all serialisable types in the blueprint, regardless of whether they are part of the contract interface or not. @emiflake, @KtorZ
+- **aiken**: `aiken test` is now an alias for `aiken check`. @KtorZ
+- **aiken**: `aiken bench` now also display units using human-readable units by default and falls back to plain number when passed `--plain-numbers`. @KtorZ
+- **aiken**: `aiken bench` indicates a projected maximum size for benches by performing a linear regression on the results, using the minimum/bottleneck between cpu and mem. @KtorZ
+- **aiken-project**: Swap constants with variable arguments in symmetric operators to allow currying and hoisting optimisations to kick-in more often. @KtorZ
+- **aiken-project**: Automatically optimise subtraction of constant values into sum of negative constants. @KtorZ
+- **aiken-project**: Better code-generation for boolean comparisons with constant terms. @KtorZ
+
+### Fixed
+
+- **uplc**: Fixed conversion/discrepancy from large negative bigint when using `Data::integer`; mostly impacting value reification and tracing of large negative integers. Fixes [#1241](https://github.com/aiken-lang/aiken/issues/1241). @KtorZ
+- **uplc**: Make evaluation failures language-dependent; thus allowing V1 & V2 evaluations to return non-unit results. @michaeljfazio, @KtorZ
+- **uplc**: Fixed case and constr UPLC text-formatter in cases where they are formatted on a single-line. @KtorZ
+- **aiken-lang**: Improve/fix formatter on assignments, in particular multiline ones. @KtorZ
+- **aiken-lang**: Do not display UPLC machine logs in test reports when `-t silent` is given. @KtorZ
+- **aiken-lang**: Allow test assertions to "see through" backpassing and provide feedback on test failure even when using continuation passing style. @KtorZ
+- **aiken-lang**: Fix code generation interner to avoid FreeUnique caused by optimisations. @KtorZ
+- **aiken-lang**: Fix compiler removing empty list checks with `-t silent` for list patterns containing only discards. @KtorZ
+- **aiken-lang**: Reject malformed list spread patterns with a leading comma (e.g. `[, ..rest]`) at parse time instead of crashing during code generation. Fixes [#1313](https://github.com/aiken-lang/aiken/issues/1313). @SAY-5
+- **aiken-lsp**: Fix import suggestions not being able to see through modules that aren't within the dependency path. @KtorZ
+
+## v1.1.21 - 2025-12-11
+
+### Added
+
+- **aiken-project**: Format and display simple unary-op expressions constants in generated docs. @KtorZ
+- **aiken-lang**: Custom error traces for expect keyword. See [documentation](https://aiken-lang.org/language-tour/troubleshooting#expect-traces). @KtorZ
+
+### Fixed
+
+- **aiken-project**: Properly support field names in lists when encoding into blueprint. @emiflake
+- **aiken-project**: Use less ambiguous separators for generic params in blueprint's JSON references. @KtorZ
+- **aiken-project**: Do not require a full project when simulating passing an explicit `--blueprint` file. @KtorZ
+- **aiken-lsp**: More flexible and robust lsp diagnostic hints. @KtorZ
+    - return a generic error message when no help is available on the error (still showing the location of the problem)
+    - use related errors to find labels on where to report errors for those with no immediate location (e.g. UnknownLabels).
+- **aiken-lang**: Recover from assignment as last expression in trace args. @KtorZ
+- **aiken-lang**: Reify generics in-place and avoid crashing when trying to reify values with conflicting generic instantiations. @KtorZ
+- **aiken-lang**: Do not fail when only one positional argument is after labeled ones (in particular, allows for labelled arguments with backpassing). @KtorZ
+- **aiken-lang**: Only generate handler programs after evaluating all handler signatures (prevent crashes in UPLC generation due to a type-check violation). @KtorZ
+- **aiken-lang**: Forbid inspection of MillerLoopResults via tracing. @KtorZ
+- **aiken-lang**: Handle pointfree pairs constructor calls & improve error reporting on arity mismatch when using Pairs. @KtorZ
+- **aiken-lang**: Do not (immediately) panic when unresolved generics are found during monomorphisation. @KtorZ
+- **aiken-lang**: Using "as" with list decorator no longer generates code with an list data error. @Microproofs
+- **uplc**: Correctly handle credentials in certificates for Plutus V1 & Plutus V2 script executions. @yHSJ
+
+## v1.1.20
+
+Aborted.
+
+## v1.1.19 - 2025-07-28
 
 ### Added
 
 - **aiken-project**: Pretty print execution units. Added `--plain-numbers`
   flag to `check` command, to switch between the two formats. @nikhils9
+- **aiken-lang**: New type decorators that allow control over the encoding of types. @rvcas @MicroProofs
 
 ### Changed
 
@@ -15,6 +71,10 @@
 
 - **aiken-lang**: Fix formatting issue with grouped pipeline followed by tuple index. @rvcas
 - **aiken-lang**: Fix formatting issue with record updates and punning syntax. @rvcas
+- **aiken-lang**: Prevent validator params being in the top level scope for functions. @microproofs
+- **aiken-lang**: Formatting for long import lines @rvcas
+- **aiken-lang**: `aiken add` wrongly rejects valid org/project pairs. @rvcas
+- **uplc**: PlutusData comparison in the UPLC VM shouldn't rely on CBOR encoding. @rvcas @KtorZ
 
 ## v1.1.17 - 2025-05-08
 

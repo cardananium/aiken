@@ -156,9 +156,33 @@ impl DefaultFunction {
                 | DefaultFunction::Bls12_381_G2_Add
         )
     }
+
+    pub fn try_curry_builtin(&self, arg_stack: Vec<Args>) -> Option<Vec<(usize, Term<Name>)>> {
+        if !self.can_curry_builtin() {
+            return None;
+        }
+
+        if self.arity() != arg_stack.len() {
+            return None;
+        }
+
+        Some(
+            arg_stack
+                .into_iter()
+                .map(|item| {
+                    let Args::Apply(arg_id, arg) = item else {
+                        unreachable!()
+                    };
+
+                    (arg_id, arg)
+                })
+                .collect_vec(),
+        )
+    }
+
     /// For now all of the curry builtins are not forceable
     /// Curryable builtins must take in 2 or more arguments
-    pub fn can_curry_builtin(self) -> bool {
+    pub fn can_curry_builtin(&self) -> bool {
         matches!(
             self,
             DefaultFunction::AddInteger
@@ -169,23 +193,35 @@ impl DefaultFunction {
                 | DefaultFunction::QuotientInteger
                 | DefaultFunction::RemainderInteger
                 | DefaultFunction::EqualsInteger
-                | DefaultFunction::EqualsByteString
-                | DefaultFunction::EqualsString
-                | DefaultFunction::EqualsData
-                | DefaultFunction::Bls12_381_G1_Equal
-                | DefaultFunction::Bls12_381_G2_Equal
                 | DefaultFunction::LessThanInteger
                 | DefaultFunction::LessThanEqualsInteger
                 | DefaultFunction::AppendByteString
                 | DefaultFunction::ConsByteString
                 | DefaultFunction::SliceByteString
                 | DefaultFunction::IndexByteString
-                | DefaultFunction::LessThanEqualsByteString
+                | DefaultFunction::EqualsByteString
                 | DefaultFunction::LessThanByteString
+                | DefaultFunction::LessThanEqualsByteString
+                | DefaultFunction::EqualsString
                 | DefaultFunction::AppendString
-                | DefaultFunction::Bls12_381_G1_Add
-                | DefaultFunction::Bls12_381_G2_Add
                 | DefaultFunction::ConstrData
+                | DefaultFunction::EqualsData
+                | DefaultFunction::Bls12_381_G1_Add
+                | DefaultFunction::Bls12_381_G1_ScalarMul
+                | DefaultFunction::Bls12_381_G1_Equal
+                | DefaultFunction::Bls12_381_G1_HashToGroup
+                | DefaultFunction::Bls12_381_G2_Add
+                | DefaultFunction::Bls12_381_G2_ScalarMul
+                | DefaultFunction::Bls12_381_G2_Equal
+                | DefaultFunction::Bls12_381_G2_HashToGroup
+                | DefaultFunction::IntegerToByteString
+                | DefaultFunction::ByteStringToInteger
+                | DefaultFunction::AndByteString
+                | DefaultFunction::OrByteString
+                | DefaultFunction::XorByteString
+                | DefaultFunction::ReplicateByte
+                | DefaultFunction::RotateByteString
+                | DefaultFunction::ShiftByteString
         )
     }
 
@@ -331,6 +367,91 @@ impl DefaultFunction {
                     } else {
                         false
                     }
+                } else {
+                    false
+                }
+            }
+
+            DefaultFunction::Bls12_381_G1_HashToGroup
+            | DefaultFunction::Bls12_381_G2_HashToGroup => arg_stack.iter().all(|arg| {
+                if let Term::Constant { value: c, .. } = arg {
+                    matches!(c.as_ref(), Constant::ByteString(..))
+                } else {
+                    false
+                }
+            }),
+
+            DefaultFunction::Bls12_381_G1_ScalarMul | DefaultFunction::Bls12_381_G2_ScalarMul => {
+                if let (Term::Constant { value: c1, .. }, Term::Constant { value: c2, .. }) =
+                    (&arg_stack[0], &arg_stack[1])
+                {
+                    matches!(c1.as_ref(), Constant::Integer(..))
+                        && matches!(c2.as_ref(), Constant::Bls12_381G1Element(..))
+                } else {
+                    false
+                }
+            }
+
+            DefaultFunction::IntegerToByteString => {
+                if let (
+                    Term::Constant { value: c1, .. },
+                    Term::Constant { value: c2, .. },
+                    Term::Constant { value: c3, .. },
+                ) = (&arg_stack[0], &arg_stack[1], &arg_stack[2])
+                {
+                    matches!(c1.as_ref(), Constant::Bool(..))
+                        && matches!(c2.as_ref(), Constant::Integer(i) if i == &0.into())
+                        && matches!(c3.as_ref(), Constant::Integer(i) if i >= &0.into())
+                } else {
+                    false
+                }
+            }
+
+            DefaultFunction::ByteStringToInteger => {
+                if let (Term::Constant { value: c1, .. }, Term::Constant { value: c2, .. }) =
+                    (&arg_stack[0], &arg_stack[1])
+                {
+                    matches!(c1.as_ref(), Constant::Bool(..))
+                        && matches!(c2.as_ref(), Constant::ByteString(..))
+                } else {
+                    false
+                }
+            }
+
+            DefaultFunction::AndByteString
+            | DefaultFunction::OrByteString
+            | DefaultFunction::XorByteString => {
+                if let (
+                    Term::Constant { value: c1, .. },
+                    Term::Constant { value: c2, .. },
+                    Term::Constant { value: c3, .. },
+                ) = (&arg_stack[0], &arg_stack[1], &arg_stack[2])
+                {
+                    matches!(c1.as_ref(), Constant::Bool(..))
+                        && matches!(c2.as_ref(), Constant::ByteString(..))
+                        && matches!(c3.as_ref(), Constant::ByteString(..))
+                } else {
+                    false
+                }
+            }
+
+            DefaultFunction::RotateByteString | DefaultFunction::ShiftByteString => {
+                if let (Term::Constant { value: c1, .. }, Term::Constant { value: c2, .. }) =
+                    (&arg_stack[0], &arg_stack[1])
+                {
+                    matches!(c1.as_ref(), Constant::ByteString(..))
+                        && matches!(c2.as_ref(), Constant::Integer(..))
+                } else {
+                    false
+                }
+            }
+
+            DefaultFunction::ReplicateByte => {
+                if let (Term::Constant { value: c1, .. }, Term::Constant { value: c2, .. }) =
+                    (&arg_stack[0], &arg_stack[1])
+                {
+                    matches!(c1.as_ref(), Constant::Integer(i) if i >= &0.into())
+                        && matches!(c2.as_ref(), Constant::Integer(i) if i >= &0.into() && i <= &255.into() )
                 } else {
                     false
                 }
@@ -1121,10 +1242,8 @@ impl Term<Name> {
                 parameter_name,
                 body,
                 ..
-            } => {
-                if *parameter_name != original {
-                    Rc::make_mut(body).replace_identity_usage(original.clone());
-                }
+            } if *parameter_name != original => {
+                Rc::make_mut(body).replace_identity_usage(original.clone());
             }
             Term::Apply { function, argument, .. } => {
                 let func = Rc::make_mut(function);
@@ -1867,11 +1986,11 @@ impl Term<Name> {
                 changed = true;
                 context.inlined_apply_ids.push(id);
                 *self = std::mem::replace(Rc::make_mut(d), Term::Error { uniq_id: next_uniq_id() }.force())
-            } else if let Term::Force { body: var, .. } = d.as_ref() {
-                if let Term::Var { .. } = var.as_ref() {
-                    changed = true;
-                    *self = var.as_ref().clone();
-                }
+            } else if let Term::Force { body: var, .. } = d.as_ref()
+                && let Term::Var { .. } = var.as_ref()
+            {
+                changed = true;
+                *self = var.as_ref().clone();
             }
         }
         changed
@@ -1921,13 +2040,11 @@ impl Term<Name> {
                 body,
                 ..
             } = Rc::make_mut(function)
+                && (parameter_name.text == CONSTR_INDEX_EXPOSER
+                    || parameter_name.text == CONSTR_FIELDS_EXPOSER)
             {
-                if parameter_name.text == CONSTR_INDEX_EXPOSER
-                    || parameter_name.text == CONSTR_FIELDS_EXPOSER
-                {
-                    let body = Rc::make_mut(body);
-                    *self = std::mem::replace(body, Term::Error { uniq_id: next_uniq_id() }.force())
-                }
+                let body = Rc::make_mut(body);
+                *self = std::mem::replace(body, Term::Error { uniq_id: next_uniq_id() }.force())
             }
         }
     }
@@ -2070,24 +2187,25 @@ impl Term<Name> {
         _scope: &Scope,
         context: &mut Context,
     ) -> bool {
-        let mut changed = false;
         match self {
-            Term::Builtin { fun: d @ DefaultFunction::SubtractInteger, .. } => {
-                if arg_stack.len() == d.arity() {
-                    let Some(Args::Apply(apply_id, Term::Constant { value: _, .. })) = arg_stack.last() else {
-                        return false;
-                    };
-                    changed = true;
-                    context.constants_to_flip.push(*apply_id);
-
-                    *self = Term::Builtin { fun: DefaultFunction::AddInteger, uniq_id: next_uniq_id() };
-                }
+            Term::Builtin {
+                fun: d @ DefaultFunction::SubtractInteger,
+                ..
+            } if arg_stack.len() == d.arity() => {
+                let Some(Args::Apply(apply_id, Term::Constant { .. })) = arg_stack.last() else {
+                    return false;
+                };
+                context.constants_to_flip.push(*apply_id);
+                *self = Term::Builtin {
+                    fun: DefaultFunction::AddInteger,
+                    uniq_id: next_uniq_id(),
+                };
+                true
             }
             Term::Constr { .. } => todo!(),
             Term::Case { .. } => todo!(),
-            _ => {}
+            _ => false,
         }
-        changed
     }
 
     fn builtin_eval_reducer(
@@ -2505,16 +2623,7 @@ impl Program<Name> {
             false,
             &mut |_id, term, arg_stack, scope, _context| match term {
                 Term::Builtin { fun: func, .. } => {
-                    if func.can_curry_builtin() && arg_stack.len() == func.arity() {
-                        let arg_stack = arg_stack
-                            .into_iter()
-                            .map(|item| {
-                                let Args::Apply(arg_id, arg) = item else {
-                                    unreachable!()
-                                };
-                                (arg_id, arg)
-                            })
-                            .collect_vec();
+                    if let Some(arg_stack) = func.try_curry_builtin(arg_stack) {
                         // In the case of order agnostic builtins we want to sort the args by constant first
                         // This gives us the opportunity to curry constants that often pop up in the code
 
@@ -2556,6 +2665,10 @@ impl Program<Name> {
                         };
 
                         while let Some(node) = id_vec.pop() {
+                            if !matches!(node.term, Term::Constant { .. }) {
+                                continue;
+                            }
+
                             let mut id_only_vec =
                                 id_vec.iter().map(|item| item.curried_id).collect_vec();
 
@@ -2622,17 +2735,7 @@ impl Program<Name> {
             false,
             &mut |id, term, arg_stack, scope, _context| match term {
                 Term::Builtin { fun: func, .. } => {
-                    if func.can_curry_builtin() && arg_stack.len() == func.arity() {
-                        let mut arg_stack = arg_stack
-                            .into_iter()
-                            .map(|item| {
-                                let Args::Apply(arg_id, arg) = item else {
-                                    unreachable!()
-                                };
-                                (arg_id, arg)
-                            })
-                            .collect_vec();
-
+                    if let Some(mut arg_stack) = func.try_curry_builtin(arg_stack) {
                         let Some(curried_builtin) =
                             curried_terms.iter().find(|curry| curry.func == *func)
                         else {

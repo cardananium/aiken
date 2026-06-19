@@ -6,7 +6,9 @@ mod test {
     };
     use aiken_lang::{
         IdGenerator,
-        ast::{DataTypeKey, Definition, ModuleKind, TraceLevel, Tracing, TypedDataType},
+        ast::{
+            DataTypeKey, Definition, ModuleKind, OnTestFailure, TraceLevel, Tracing, TypedDataType,
+        },
         builtins,
         expr::UntypedExpr,
         format::Formatter,
@@ -32,8 +34,8 @@ mod test {
         let module_name = "";
 
         let mut module_types = HashMap::new();
-        module_types.insert("aiken".to_string(), builtins::prelude(&id_gen));
-        module_types.insert("aiken/builtin".to_string(), builtins::plutus(&id_gen));
+        module_types.insert(builtins::PRELUDE.to_string(), builtins::prelude(&id_gen));
+        module_types.insert(builtins::BUILTIN.to_string(), builtins::plutus(&id_gen));
 
         let mut warnings = vec![];
         let (ast, _) = parser::module(src, TEST_KIND).expect("Failed to parse module");
@@ -222,6 +224,31 @@ mod test {
         }
     }
 
+    fn unit_test(src: &str) -> Option<String> {
+        match test_from_source(src) {
+            (Test::PropertyTest(..), _) => {
+                panic!("Expected to yield a UnitTest but found a PropertyTest")
+            }
+            (Test::UnitTest(test), data_types) => {
+                let expected_failure =
+                    matches!(test.on_test_failure, OnTestFailure::SucceedImmediately);
+
+                let data_types_refs = utils::indexmap::as_ref_values(&data_types);
+
+                let result = test
+                    .run(&PlutusVersion::V3, Tracing::verbose())
+                    .reify(&data_types_refs);
+
+                result
+                    .assertion
+                    .map(|a| a.to_string(expected_failure, &AssertionStyleOptions::new(None)))
+            }
+            (Test::Benchmark(..), _) => {
+                panic!("Expected to yield a PropertyTest but found a Benchmark")
+            }
+        }
+    }
+
     fn expect_failure<'a>(
         prop: &'a PropertyTest,
         plutus_version: &'a PlutusVersion,
@@ -237,6 +264,40 @@ mod test {
             Ok(Some(counterexample)) => counterexample,
             _ => panic!("expected property to fail but it didn't."),
         }
+    }
+
+    #[test]
+    fn reify_conflicting_generics() {
+        let assertion = unit_test(
+            r#"
+            type Foo {
+              some_int: Option<Int>,
+              some_bool: Option<Bool>,
+            }
+
+            test parse_kind() {
+              let left = Foo { some_int: Some(14), some_bool: Some(True) }
+
+              let right = Foo { some_int: Some(42), some_bool: Some(True) }
+
+              left == right
+            }
+            "#,
+        );
+
+        assert_eq!(
+            assertion,
+            Some(
+                indoc! {"
+                    × expected
+                    │ Foo { some_int: Some(14), some_bool: Some(True) }
+                    × to equal
+                    │ Foo { some_int: Some(42), some_bool: Some(True) }
+                "}
+                .trim()
+                .to_string()
+            ),
+        );
     }
 
     #[test]

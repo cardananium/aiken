@@ -3,7 +3,7 @@ use crate::{
     blueprint::definitions::{Definitions, Reference},
 };
 use aiken_lang::{
-    ast::{Definition, TypedDataType, TypedDefinition},
+    ast::{DecoratorKind, Definition, TypedDataType, TypedDefinition},
     tipo::{Type, TypeVar, pretty},
 };
 use owo_colors::{OwoColorize, Stream::Stdout};
@@ -26,6 +26,16 @@ pub struct Annotated<T> {
     pub description: Option<String>,
     #[serde(flatten)]
     pub annotated: T,
+}
+
+impl<T> Annotated<T> {
+    fn with_title(title: Option<String>, to_annotate: T) -> Annotated<T> {
+        Annotated {
+            title,
+            description: None,
+            annotated: to_annotate,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
@@ -155,7 +165,7 @@ pub enum Data {
 #[serde(untagged)]
 pub enum Items<T> {
     One(Declaration<T>),
-    Many(Vec<Declaration<T>>),
+    Many(Vec<Annotated<Declaration<T>>>),
 }
 
 /// Captures a single UPLC constructor with its
@@ -441,7 +451,7 @@ impl Annotated<Schema> {
                         .iter()
                         .map(|elem| {
                             Annotated::do_from_type(elem, modules, type_parameters, definitions)
-                                .map(Declaration::Referenced)
+                                .map(|refr| Annotated::from(Declaration::Referenced(refr)))
                         })
                         .collect::<Result<Vec<_>, _>>()
                         .map_err(|e| e.backtrack(type_info))?;
@@ -463,14 +473,24 @@ impl Annotated<Schema> {
                         .get(id)
                         .ok_or_else(|| Error::new(ErrorContext::FreeTypeVariable, type_info))?
                         .clone();
-                    Annotated::do_from_type(&tipo, modules, type_parameters, definitions)
+
+                    if tipo.get_generic_id() == Some(*id) {
+                        Annotated::do_from_type(
+                            &Type::data(),
+                            modules,
+                            type_parameters,
+                            definitions,
+                        )
+                    } else {
+                        Annotated::do_from_type(&tipo, modules, type_parameters, definitions)
+                    }
                 }
                 TypeVar::Unbound { .. } => {
                     Err(Error::new(ErrorContext::UnboundTypeVariable, type_info))
                 }
             },
 
-            Type::Fn { .. } => unreachable!(),
+            Type::Fn { .. } => Err(Error::new(ErrorContext::UnexpectedFunction, type_info)),
         }
     }
 }
@@ -493,6 +513,27 @@ impl Data {
 
         let mut variants = vec![];
 
+        if data_type.constructors.len() == 1
+            && data_type.constructors[0].sugar
+            && data_type
+                .decorators
+                .iter()
+                .any(|d| matches!(d.kind, DecoratorKind::List))
+        {
+            let items = data_type.constructors[0]
+                .arguments
+                .iter()
+                .map(|elem| {
+                    let title_override = elem.label.clone();
+                    Annotated::do_from_type(&elem.tipo, modules, type_parameters, definitions).map(
+                        |refr| Annotated::with_title(title_override, Declaration::Referenced(refr)),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            return Ok(Data::List(Items::Many(items)));
+        }
+
         for (index, constructor) in data_type.constructors.iter().enumerate() {
             let mut fields = vec![];
 
@@ -506,6 +547,23 @@ impl Data {
                     annotated: Declaration::Referenced(reference),
                 });
             }
+
+            let decorators = if constructor.sugar {
+                &data_type.decorators
+            } else {
+                &constructor.decorators
+            };
+
+            let index = decorators
+                .iter()
+                .find_map(|decorator| {
+                    if let DecoratorKind::Tag { value, .. } = &decorator.kind {
+                        Some(value.parse().unwrap())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(index);
 
             let variant = Annotated {
                 title: Some(constructor.name.clone()),
@@ -996,7 +1054,7 @@ pub struct Error {
     breadcrumbs: Vec<Type>,
 }
 
-#[derive(Debug, PartialEq, Clone, thiserror::Error)]
+#[derive(Debug, PartialEq, Clone, Copy, thiserror::Error)]
 pub enum ErrorContext {
     #[error(
         "I failed at my own job and couldn't figure out how to generate a specification for a type."
@@ -1022,6 +1080,10 @@ impl Error {
             context,
             breadcrumbs: vec![type_info.clone()],
         }
+    }
+
+    pub fn context(&self) -> ErrorContext {
+        self.context
     }
 
     pub fn backtrack(self, type_info: &Type) -> Self {
@@ -1332,8 +1394,8 @@ pub mod tests {
     fn deserialize_data_list_many() {
         assert_eq!(
             Data::List(Items::Many(vec![
-                Declaration::Referenced(Reference::new("foo")),
-                Declaration::Referenced(Reference::new("bar"))
+                Annotated::from(Declaration::Referenced(Reference::new("foo"))),
+                Annotated::from(Declaration::Referenced(Reference::new("bar")))
             ])),
             serde_json::from_value(json!({
                 "dataType": "list",
@@ -1443,7 +1505,13 @@ pub mod tests {
             prop_oneof![
                 (r.clone(), r.clone()).prop_map(|(k, v)| Data::Map(k, v)),
                 r.clone().prop_map(|x| Data::List(Items::One(x))),
-                prop::collection::vec(r, 1..3).prop_map(|xs| Data::List(Items::Many(xs))),
+                prop::collection::vec(r, 1..3).prop_map(|xs| Data::List(Items::Many(
+                    xs.iter()
+                        .map(|decl| -> Annotated<Declaration<Data>> {
+                            Annotated::from(decl.clone())
+                        })
+                        .collect()
+                ))),
                 prop::collection::vec(constructor, 1..3).prop_map(Data::AnyOf)
             ]
         })
@@ -1474,7 +1542,11 @@ pub mod tests {
             prop_oneof![
                 (r.clone(), r.clone()).prop_map(|(l, r)| Schema::Pair(l, r)),
                 r.clone().prop_map(|x| Schema::List(Items::One(x))),
-                prop::collection::vec(r, 1..3).prop_map(|xs| Schema::List(Items::Many(xs))),
+                prop::collection::vec(r, 1..3).prop_map(|xs| Schema::List(Items::Many(
+                    xs.iter()
+                        .map(|decl| Annotated::from(decl.clone()))
+                        .collect()
+                ))),
             ]
         })
     }

@@ -1,6 +1,8 @@
 use super::{
     RecordAccessor, Type, ValueConstructor, ValueConstructorVariant,
-    environment::{EntityKind, Environment, assert_no_labeled_arguments, generalise},
+    environment::{
+        EntityKind, Environment, ScopeResetData, assert_no_labeled_arguments, generalise,
+    },
     error::{Error, Warning},
     hydrator::Hydrator,
     pattern::PatternTyper,
@@ -39,6 +41,7 @@ pub(crate) fn infer_function(
     hydrators: &mut HashMap<String, Hydrator>,
     environment: &mut Environment<'_>,
     tracing: Tracing,
+    top_level_scope: &ScopeResetData,
 ) -> Result<Function<Rc<Type>, TypedExpr, TypedArg>, Error> {
     if let Some(typed_fun) = environment.inferred_functions.get(&fun.name) {
         return Ok(typed_fun.clone());
@@ -139,6 +142,7 @@ pub(crate) fn infer_function(
     // Note that we need to close the scope before backtracking to not mess with the scope of the
     // callee. Otherwise, identifiers present in the caller's scope may become available to the
     // callee.
+
     if let Err(Error::MustInferFirst { function, .. }) = inferred {
         // Reset the environment & scope.
         hydrators.insert(name.to_string(), expr_typer.hydrator);
@@ -146,16 +150,29 @@ pub(crate) fn infer_function(
         *environment.warnings = warnings;
 
         // Backtrack and infer callee first.
+        let temp_scope = environment.open_new_scope();
+        environment.close_scope(top_level_scope.clone());
         infer_function(
             &function,
             environment.current_module,
             hydrators,
             environment,
             tracing,
+            top_level_scope,
         )?;
 
+        environment.open_new_scope();
+        environment.close_scope(temp_scope);
+
         // Then, try again the entire function definition.
-        return infer_function(fun, module_name, hydrators, environment, tracing);
+        return infer_function(
+            fun,
+            module_name,
+            hydrators,
+            environment,
+            tracing,
+            top_level_scope,
+        );
     }
 
     let (arguments, body, return_type) = inferred?;
@@ -490,6 +507,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                 patterns,
                 value,
                 kind,
+                comment,
             } => {
                 // at this point due to backpassing rewrites,
                 // patterns is guaranteed to have one item
@@ -499,7 +517,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                     location: _,
                 } = patterns.into_vec().swap_remove(0);
 
-                self.infer_assignment(pattern, *value, kind, &annotation, location)
+                self.infer_assignment(pattern, *value, kind, &annotation, comment, location)
             }
 
             UntypedExpr::Trace {
@@ -1303,7 +1321,6 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
 
         // Error constructor helper function
         let unknown_field = |fields| Error::UnknownRecordField {
-            situation: None,
             typ: record.tipo(),
             location,
             label: label.clone(),
@@ -1425,6 +1442,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
         untyped_value: UntypedExpr,
         kind: UntypedAssignmentKind,
         annotation: &Option<Annotation>,
+        comment: Option<String>,
         location: Span,
     ) -> Result<TypedExpr, Error> {
         let typed_value = self.infer(untyped_value.clone())?;
@@ -1466,7 +1484,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
 
                 Err(Error::CastDataNoAnn {
                     location,
-                    value: UntypedExpr::Assignment {
+                    value: Box::new(UntypedExpr::Assignment {
                         location,
                         value: untyped_value.clone().into(),
                         patterns: AssignmentPattern::new(
@@ -1475,8 +1493,9 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                             Span::empty(),
                         )
                         .into(),
+                        comment: comment.clone(),
                         kind,
-                    },
+                    }),
                 })
             };
 
@@ -1543,10 +1562,10 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                 //
                 // The following check removes the warning by marking the new let-binding as used
                 // in this particular context.
-                if let Some(pattern_var_name) = pattern_var_name {
-                    if Some(pattern_var_name) == value_var_name {
-                        self.environment.increment_usage(pattern_var_name);
-                    }
+                if let Some(pattern_var_name) = pattern_var_name
+                    && Some(pattern_var_name) == value_var_name
+                {
+                    self.environment.increment_usage(pattern_var_name);
                 }
             }
             AssignmentKind::Let { .. } => {
@@ -1570,7 +1589,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                             },
                             pattern_location: untyped_pattern.location(),
                             value_location: untyped_value.location(),
-                            sample: match untyped_value {
+                            sample: Box::new(match untyped_value {
                                 UntypedExpr::Var { name, .. } if name == ast::BACKPASS_VARIABLE => {
                                     UntypedExpr::Assignment {
                                         location: Span::empty(),
@@ -1584,6 +1603,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                                             Span::empty(),
                                         )
                                         .into(),
+                                        comment: None,
                                         kind: AssignmentKind::Let { backpassing: true },
                                     }
                                 }
@@ -1596,9 +1616,10 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                                         Span::empty(),
                                     )
                                     .into(),
+                                    comment: None,
                                     kind: AssignmentKind::let_(),
                                 },
-                            },
+                            }),
                         });
                 }
             }
@@ -1610,6 +1631,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
             kind: kind.into(),
             pattern,
             value: Box::new(typed_value),
+            comment,
         })
     }
 
@@ -1811,6 +1833,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                     branch.condition.clone(),
                     AssignmentKind::is(),
                     &annotation,
+                    None,
                     location,
                 )?
                 else {
@@ -2091,6 +2114,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
             value,
             kind,
             patterns,
+            comment,
         } = breakpoint
         else {
             unreachable!("backpass misuse: breakpoint isn't an Assignment ?!");
@@ -2099,7 +2123,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
         if continuation.is_empty() {
             return Err(Error::LastExpressionIsAssignment {
                 location,
-                expr: *value,
+                expr: Box::new(*value),
                 patterns: patterns.clone(),
                 kind,
             });
@@ -2199,6 +2223,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                                 }
                                 AssignmentKind::Expect { .. } => AssignmentKind::expect(),
                             },
+                            comment: comment.clone(),
                         },
                     );
 
@@ -2303,6 +2328,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                         location,
                         value: _,
                         kind: _,
+                        comment: _,
                     } if patterns.len() > 1 => {
                         return Err(Error::UnexpectedMultiPatternAssignment {
                             arrow: patterns
@@ -2509,7 +2535,17 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
     #[allow(clippy::result_large_err)]
     fn infer_trace_arg(&mut self, arg: UntypedExpr) -> Result<TypedExpr, Error> {
         let location = arg.location();
-        let typed_arg = self.infer(arg)?;
+
+        let typed_arg = self.in_new_scope(|scope| {
+            if let Some(filler) =
+                recover_from_no_assignment(assert_no_assignment(&arg), arg.location())?
+            {
+                Ok(scope.infer(arg)?.and_then(filler))
+            } else {
+                scope.infer(arg)
+            }
+        })?;
+
         match self.unify(
             Type::string(),
             typed_arg.tipo(),
@@ -2524,7 +2560,8 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                 }
 
                 self.unify(Type::data(), typed_arg.tipo(), typed_arg.location(), true)?;
-                Ok(diagnose_expr(typed_arg))
+
+                diagnose_expr(typed_arg)
             }
             Ok(()) => Ok(typed_arg),
         }
@@ -2655,8 +2692,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                         // encountered it.
                         if self.not_yet_inferred.contains(&fun.name) {
                             return Err(Error::MustInferFirst {
-                                function: fun.clone(),
-                                location: *location,
+                                function: Box::new(fun.clone()),
                             });
                         }
                     }
@@ -2733,7 +2769,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
         if clauses.len() == 1 && clauses[0].patterns.len() == 1 {
             sample = Some(Warning::SingleWhenClause {
                 location: clauses[0].patterns[0].location(),
-                sample: UntypedExpr::Assignment {
+                sample: Box::new(UntypedExpr::Assignment {
                     location: Span::empty(),
                     value: Box::new(subject.clone()),
                     patterns: AssignmentPattern::new(
@@ -2743,7 +2779,8 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                     )
                     .into(),
                     kind: AssignmentKind::let_(),
-                },
+                    comment: None,
+                }),
             });
         }
 
@@ -2825,10 +2862,9 @@ fn recover_from_no_assignment(
         ref kind,
         ..
     }) = result
+        && matches!(kind, AssignmentKind::Expect { ..} if patterns.len() == 1)
     {
-        if matches!(kind, AssignmentKind::Expect { ..} if patterns.len() == 1) {
-            return Ok(Some(TypedExpr::void(span)));
-        }
+        return Ok(Some(TypedExpr::void(span)));
     }
 
     result.map(|()| None)
@@ -2844,7 +2880,7 @@ fn assert_no_assignment(expr: &UntypedExpr) -> Result<(), Error> {
             ..
         } => Err(Error::LastExpressionIsAssignment {
             location: expr.location(),
-            expr: *value.clone(),
+            expr: Box::new(*value.clone()),
             patterns: patterns.clone(),
             kind: *kind,
         }),
@@ -2896,6 +2932,7 @@ fn assert_assignment(expr: TypedExpr) -> Result<TypedExpr, Error> {
                     tipo: Type::void(),
                 },
                 kind: AssignmentKind::let_(),
+                comment: None,
             });
         }
 
@@ -2977,7 +3014,8 @@ pub fn ensure_serialisable(is_top_level: bool, t: Rc<Type>, location: Span) -> R
     }
 }
 
-fn diagnose_expr(expr: TypedExpr) -> TypedExpr {
+#[allow(clippy::result_large_err)]
+fn diagnose_expr(expr: TypedExpr) -> Result<TypedExpr, Error> {
     // NOTE: The IdGenerator is unused. See similar note in 'append_string_expr'
     let decode_utf8_constructor =
         from_default_function(DefaultFunction::DecodeUtf8, &IdGenerator::new());
@@ -3014,7 +3052,11 @@ fn diagnose_expr(expr: TypedExpr) -> TypedExpr {
 
     let location = expr.location();
 
-    TypedExpr::Call {
+    if expr.tipo().is_ml_result() {
+        return Err(Error::IllegalTraceArgument { location });
+    }
+
+    Ok(TypedExpr::Call {
         tipo: Type::string(),
         fun: Box::new(decode_utf8.clone()),
         args: vec![CallArg {
@@ -3044,7 +3086,7 @@ fn diagnose_expr(expr: TypedExpr) -> TypedExpr {
             },
         }],
         location,
-    }
+    })
 }
 
 fn append_string_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {

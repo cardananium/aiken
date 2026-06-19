@@ -21,7 +21,7 @@ use std::{
     rc::Rc,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ScopeResetData {
     local_values: HashMap<String, ValueConstructor>,
 }
@@ -1237,6 +1237,7 @@ impl<'a> Environment<'a> {
                 parameters,
                 location,
                 constructors,
+                decorators: _,
                 doc: _,
                 typed_parameters: _,
             }) => {
@@ -1581,6 +1582,7 @@ impl<'a> Environment<'a> {
                 location: _,
                 parameters: _,
                 typed_parameters: _,
+                decorators: _,
             }) => {
                 let mut hydrator = hydrators
                     .remove(name)
@@ -1720,16 +1722,24 @@ impl<'a> Environment<'a> {
         }
 
         // Collapse right hand side type links. Left hand side will be collapsed in the next block.
-        if let Type::Var { tipo, alias } = rhs.deref() {
-            if let TypeVar::Link { tipo } = tipo.borrow().deref() {
-                return self.unify(
-                    lhs,
-                    Type::with_alias(tipo.clone(), alias.clone()),
-                    location,
-                    allow_cast,
-                );
-            }
+        if let Type::Var { tipo, alias } = rhs.deref()
+            && let TypeVar::Link { tipo } = tipo.borrow().deref()
+        {
+            return self.unify(
+                lhs,
+                Type::with_alias(tipo.clone(), alias.clone()),
+                location,
+                allow_cast,
+            );
         }
+
+        let could_not_unify = || Error::CouldNotUnify {
+            location,
+            expected: lhs.clone(),
+            given: rhs.clone(),
+            situation: None,
+            rigid_type_names: HashMap::new(),
+        };
 
         if let Type::Var { tipo, alias } = lhs.deref() {
             enum Action {
@@ -1749,11 +1759,11 @@ impl<'a> Environment<'a> {
                 }
 
                 TypeVar::Generic { id } => {
-                    if let Type::Var { tipo, alias: _ } = rhs.deref() {
-                        if tipo.borrow().is_unbound() {
-                            *tipo.borrow_mut() = TypeVar::Generic { id: *id };
-                            return Ok(());
-                        }
+                    if let Type::Var { tipo, alias: _ } = rhs.deref()
+                        && tipo.borrow().is_unbound()
+                    {
+                        *tipo.borrow_mut() = TypeVar::Generic { id: *id };
+                        return Ok(());
                     }
                     Action::CouldNotUnify
                 }
@@ -1764,16 +1774,8 @@ impl<'a> Environment<'a> {
                     *tipo.borrow_mut() = TypeVar::Link { tipo: rhs };
                     Ok(())
                 }
-
                 Action::Unify(t) => self.unify(t, rhs, location, allow_cast),
-
-                Action::CouldNotUnify => Err(Error::CouldNotUnify {
-                    location,
-                    expected: lhs.clone(),
-                    given: rhs,
-                    situation: None,
-                    rigid_type_names: HashMap::new(),
-                }),
+                Action::CouldNotUnify => Err(could_not_unify()),
             };
         }
 
@@ -1868,31 +1870,13 @@ impl<'a> Environment<'a> {
             ) if args1.len() == args2.len() => {
                 for (a, b) in args1.iter().zip(args2) {
                     self.unify(a.clone(), b.clone(), location, allow_cast)
-                        .map_err(|_| Error::CouldNotUnify {
-                            location,
-                            expected: lhs.clone(),
-                            given: rhs.clone(),
-                            situation: None,
-                            rigid_type_names: HashMap::new(),
-                        })?;
+                        .map_err(|_| could_not_unify())?;
                 }
                 self.unify(retrn1.clone(), retrn2.clone(), location, false)
-                    .map_err(|_| Error::CouldNotUnify {
-                        location,
-                        expected: lhs.clone(),
-                        given: rhs.clone(),
-                        situation: None,
-                        rigid_type_names: HashMap::new(),
-                    })
+                    .map_err(|_| could_not_unify())
             }
 
-            _ => Err(Error::CouldNotUnify {
-                location,
-                expected: lhs.clone(),
-                given: rhs.clone(),
-                situation: None,
-                rigid_type_names: HashMap::new(),
-            }),
+            _ => Err(could_not_unify()),
         }
     }
 

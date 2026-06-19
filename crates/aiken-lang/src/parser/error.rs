@@ -1,3 +1,7 @@
+// NOTE: Required because clippy is unable to see through miette's Diagnostic macro expansion to
+// correctly assert that fields are used in the diagnostic precisely.
+#![allow(unused_assignments)]
+
 use crate::{
     ast::{CurveType, Span},
     parser::token::Token,
@@ -13,7 +17,7 @@ use std::collections::HashSet;
 #[diagnostic(
     help(
         "{}",
-        match kind {
+        match kind.as_ref() {
             ErrorKind::Unexpected(..) if !expected.is_empty() => {
                 format!(
                     "I am looking for one of the following patterns:\n{}",
@@ -36,11 +40,9 @@ use std::collections::HashSet;
     )
 )]
 pub struct ParseError {
-    pub kind: ErrorKind,
+    pub kind: Box<ErrorKind>,
     #[label("{}", .label.unwrap_or_default())]
-    pub span: Span,
-    #[allow(dead_code)]
-    while_parsing: Option<(Span, &'static str)>,
+    span: Span,
     expected: HashSet<Pattern>,
     label: Option<&'static str>,
 }
@@ -54,21 +56,28 @@ impl ParseError {
         self
     }
 
+    pub fn illegal_multiline_expect_comment(span: Span) -> Self {
+        Self {
+            kind: Box::new(ErrorKind::IllegalMultilineExpectComment),
+            expected: HashSet::new(),
+            span,
+            label: Some("too many lines"),
+        }
+    }
+
     pub fn expected_but_got(expected: Pattern, got: Pattern, span: Span) -> Self {
         Self {
-            kind: ErrorKind::Unexpected(got),
+            kind: Box::new(ErrorKind::Unexpected(got)),
             expected: HashSet::from_iter([expected]),
             span,
-            while_parsing: None,
             label: None,
         }
     }
 
     pub fn invalid_assignment_right_hand_side(span: Span) -> Self {
         Self {
-            kind: ErrorKind::UnfinishedAssignmentRightHandSide,
+            kind: Box::new(ErrorKind::UnfinishedAssignmentRightHandSide),
             span,
-            while_parsing: None,
             expected: HashSet::new(),
             label: Some("invalid assignment right-hand side"),
         }
@@ -77,9 +86,8 @@ impl ParseError {
     pub fn invalid_tuple_index(span: Span, index: String, suffix: Option<String>) -> Self {
         let hint = suffix.map(|suffix| format!("Did you mean '{index}{suffix}'?"));
         Self {
-            kind: ErrorKind::InvalidTupleIndex { hint },
+            kind: Box::new(ErrorKind::InvalidTupleIndex { hint }),
             span,
-            while_parsing: None,
             expected: HashSet::new(),
             label: None,
         }
@@ -87,9 +95,8 @@ impl ParseError {
 
     pub fn deprecated_when_clause_guard(span: Span) -> Self {
         Self {
-            kind: ErrorKind::DeprecatedWhenClause,
+            kind: Box::new(ErrorKind::DeprecatedWhenClause),
             span,
-            while_parsing: None,
             expected: HashSet::new(),
             label: Some("deprecated"),
         }
@@ -97,9 +104,8 @@ impl ParseError {
 
     pub fn point_not_on_curve(curve: CurveType, span: Span) -> Self {
         Self {
-            kind: ErrorKind::PointNotOnCurve { curve },
+            kind: Box::new(ErrorKind::PointNotOnCurve { curve }),
             span,
-            while_parsing: None,
             expected: HashSet::new(),
             label: Some("out off curve"),
         }
@@ -113,9 +119,8 @@ impl ParseError {
         };
 
         Self {
-            kind: ErrorKind::UnknownCurvePoint { curve, point },
+            kind: Box::new(ErrorKind::UnknownCurvePoint { curve, point }),
             span,
-            while_parsing: None,
             expected: HashSet::new(),
             label,
         }
@@ -123,9 +128,8 @@ impl ParseError {
 
     pub fn malformed_base16_string_literal(span: Span) -> Self {
         Self {
-            kind: ErrorKind::MalformedBase16StringLiteral,
+            kind: Box::new(ErrorKind::MalformedBase16StringLiteral),
             span,
-            while_parsing: None,
             expected: HashSet::new(),
             label: None,
         }
@@ -133,9 +137,8 @@ impl ParseError {
 
     pub fn malformed_base16_digits(span: Span) -> Self {
         Self {
-            kind: ErrorKind::MalformedBase16Digits,
+            kind: Box::new(ErrorKind::MalformedBase16Digits),
             span,
-            while_parsing: None,
             expected: HashSet::new(),
             label: None,
         }
@@ -143,9 +146,8 @@ impl ParseError {
 
     pub fn hybrid_notation_in_bytearray(span: Span) -> Self {
         Self {
-            kind: ErrorKind::HybridNotationInByteArray,
+            kind: Box::new(ErrorKind::HybridNotationInByteArray),
             span,
-            while_parsing: None,
             expected: HashSet::new(),
             label: None,
         }
@@ -153,9 +155,8 @@ impl ParseError {
 
     pub fn match_on_curve(span: Span) -> Self {
         Self {
-            kind: ErrorKind::PatternMatchOnCurvePoint,
+            kind: Box::new(ErrorKind::PatternMatchOnCurvePoint),
             span,
-            while_parsing: None,
             expected: HashSet::new(),
             label: Some("cannot pattern-match on curve point"),
         }
@@ -163,9 +164,8 @@ impl ParseError {
 
     pub fn match_string(span: Span) -> Self {
         Self {
-            kind: ErrorKind::PatternMatchOnString,
+            kind: Box::new(ErrorKind::PatternMatchOnString),
             span,
-            while_parsing: None,
             expected: HashSet::new(),
             label: Some("cannot pattern-match on string"),
         }
@@ -189,17 +189,18 @@ impl<T: Into<Pattern>> chumsky::Error<T> for ParseError {
         found: Option<T>,
     ) -> Self {
         Self {
-            kind: found
-                .map(Into::into)
-                .map(ErrorKind::Unexpected)
-                .unwrap_or(ErrorKind::UnexpectedEnd),
+            kind: Box::new(
+                found
+                    .map(Into::into)
+                    .map(ErrorKind::Unexpected)
+                    .unwrap_or(ErrorKind::UnexpectedEnd),
+            ),
             span,
-            while_parsing: None,
             expected: expected
                 .into_iter()
                 .map(|x| x.map(Into::into).unwrap_or(Pattern::End))
                 .collect(),
-            label: None,
+            label: Some("not quite a pattern"),
         }
     }
 
@@ -294,6 +295,12 @@ pub enum ErrorKind {
         "You can pattern-match on bytearrays but not on strings. Note that I can parse utf-8 encoded bytearrays just fine, so you probably want to drop the extra '@' and only manipulate bytearrays wherever you need to. On-chain, strings shall be avoided as much as possible."
     ))]
     PatternMatchOnString,
+
+    #[error("I noticed you've been overly enthusiastic about expect comments.")]
+    #[diagnostic(help(
+        "Expect doc-comments are turned into traces and must remain short.\nHence, I will only allow a single line of doc-comment above an 'expect'. And yet, you've put many."
+    ))]
+    IllegalMultilineExpectComment,
 }
 
 fn fmt_curve_type(curve: &CurveType) -> String {
@@ -335,6 +342,9 @@ pub enum Pattern {
     #[error("I found a malformed list spread pattern.")]
     #[diagnostic(help("List spread in matches can use a discard '_' or var."))]
     Match,
+    #[error("I found an empty list of patterns followed by a spread")]
+    #[diagnostic(help("Use [_, ..] if you want to check if the list is non-empty."))]
+    SpreadNoSubject,
     #[error("I found an out-of-bound byte literal.")]
     #[diagnostic(help("Bytes must be between 0-255."))]
     Byte,
@@ -354,6 +364,7 @@ impl Pattern {
             Char(c) => c.to_string(),
             End => "<END OF FILE>".to_string(),
             Match => "A pattern (a discard, a var, etc...)".to_string(),
+            SpreadNoSubject => "A non-empty list of patterns".to_string(),
             Byte => "A byte between [0; 255]".to_string(),
             Label => "A label".to_string(),
             Discard => "_".to_string(),

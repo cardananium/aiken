@@ -8,10 +8,11 @@ use super::{
 use crate::{
     IdGenerator,
     ast::{
-        Annotation, ArgBy, ArgName, ArgVia, DataType, Definition, Function, ModuleConstant,
-        ModuleKind, RecordConstructor, RecordConstructorArg, Tracing, TypeAlias, TypedArg,
-        TypedDefinition, TypedModule, TypedValidator, UntypedArg, UntypedDefinition, UntypedModule,
-        UntypedPattern, UntypedValidator, Use, Validator,
+        Annotation, ArgBy, ArgName, ArgVia, DataType, Decorator, DecoratorKind, Definition,
+        Function, ModuleConstant, ModuleKind, RecordConstructor, RecordConstructorArg, Tracing,
+        TypeAlias, TypedArg, TypedDataType, TypedDefinition, TypedModule, TypedValidator,
+        UntypedArg, UntypedDefinition, UntypedModule, UntypedPattern, UntypedValidator, Use,
+        Validator,
     },
     expr::{TypedExpr, UntypedAssignmentKind, UntypedExpr},
     parser::token::Token,
@@ -19,7 +20,8 @@ use crate::{
 };
 use std::{
     borrow::Borrow,
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
+    fmt,
     ops::Deref,
     rc::Rc,
 };
@@ -130,7 +132,7 @@ impl UntypedModule {
                         }
                         _ => None,
                     },
-                    leaked,
+                    leaked: Box::new(leaked),
                 });
             }
         }
@@ -187,13 +189,19 @@ fn infer_definition(
     tracing: Tracing,
 ) -> Result<TypedDefinition, Error> {
     match def {
-        Definition::Fn(f) => Ok(Definition::Fn(infer_function(
-            &f,
-            module_name,
-            hydrators,
-            environment,
-            tracing,
-        )?)),
+        Definition::Fn(f) => {
+            let top_level_scope = environment.open_new_scope();
+            let ret = Definition::Fn(infer_function(
+                &f,
+                module_name,
+                hydrators,
+                environment,
+                tracing,
+                &top_level_scope,
+            )?);
+            environment.close_scope(top_level_scope);
+            Ok(ret)
+        }
 
         Definition::Validator(Validator {
             doc,
@@ -206,7 +214,9 @@ fn infer_definition(
         }) => {
             let params_length = params.len();
 
-            environment.in_new_scope(|environment| {
+            let top_level_scope = environment.open_new_scope();
+
+            let def = environment.in_new_scope(|environment| {
                 let fallback_name = TypedValidator::handler_name(&name, &fallback.name);
 
                 put_params_in_scope(&fallback_name, environment, &params);
@@ -223,8 +233,14 @@ fn infer_definition(
                         let old_name = handler.name;
                         handler.name = handler_name;
 
-                        let mut typed_fun =
-                            infer_function(&handler, module_name, hydrators, environment, tracing)?;
+                        let mut typed_fun = infer_function(
+                            &handler,
+                            module_name,
+                            hydrators,
+                            environment,
+                            tracing,
+                            &top_level_scope,
+                        )?;
 
                         typed_fun.name = old_name;
 
@@ -297,8 +313,14 @@ fn infer_definition(
                     let old_name = fallback.name;
                     fallback.name = fallback_name;
 
-                    let mut typed_fallback =
-                        infer_function(&fallback, module_name, hydrators, environment, tracing)?;
+                    let mut typed_fallback = infer_function(
+                        &fallback,
+                        module_name,
+                        hydrators,
+                        environment,
+                        tracing,
+                        &top_level_scope,
+                    )?;
 
                     typed_fallback.name = old_name;
 
@@ -347,10 +369,15 @@ fn infer_definition(
                     location,
                     params: typed_params,
                 }))
-            })
+            })?;
+
+            environment.close_scope(top_level_scope);
+
+            Ok(def)
         }
 
         Definition::Test(f) => {
+            let top_level_scope = environment.open_new_scope();
             let (typed_via, annotation) = match f.arguments.first() {
                 Some(arg) => {
                     if f.arguments.len() > 1 {
@@ -371,7 +398,14 @@ fn infer_definition(
                 None => Ok((None, None)),
             }?;
 
-            let typed_f = infer_function(&f.into(), module_name, hydrators, environment, tracing)?;
+            let typed_f = infer_function(
+                &f.into(),
+                module_name,
+                hydrators,
+                environment,
+                tracing,
+                &top_level_scope,
+            )?;
 
             let is_bool = environment.unify(
                 typed_f.return_type.clone(),
@@ -386,6 +420,8 @@ fn infer_definition(
                 typed_f.location,
                 false,
             );
+
+            environment.close_scope(top_level_scope);
 
             if is_bool.or(is_void).is_err() {
                 return Err(Error::IllegalTestType {
@@ -425,6 +461,7 @@ fn infer_definition(
         }
 
         Definition::Benchmark(f) => {
+            let top_level_scope = environment.open_new_scope();
             let err_incorrect_arity = || {
                 Err(Error::IncorrectBenchmarkArity {
                     location: f
@@ -444,7 +481,14 @@ fn infer_definition(
                 }
             }?;
 
-            let typed_f = infer_function(&f.into(), module_name, hydrators, environment, tracing)?;
+            let typed_f = infer_function(
+                &f.into(),
+                module_name,
+                hydrators,
+                environment,
+                tracing,
+                &top_level_scope,
+            )?;
 
             let arguments = {
                 let arg = typed_f
@@ -462,6 +506,8 @@ fn infer_definition(
                     via: typed_via.0,
                 }]
             };
+
+            environment.close_scope(top_level_scope);
 
             Ok(Definition::Benchmark(Function {
                 doc: typed_f.doc,
@@ -492,7 +538,7 @@ fn infer_definition(
                 .tipo
                 .clone();
 
-            Ok(Definition::TypeAlias(TypeAlias {
+            let typed_type_alias = TypeAlias {
                 doc,
                 location,
                 public,
@@ -500,7 +546,9 @@ fn infer_definition(
                 parameters,
                 annotation,
                 tipo,
-            }))
+            };
+
+            Ok(Definition::TypeAlias(typed_type_alias))
         }
 
         Definition::DataType(DataType {
@@ -510,6 +558,7 @@ fn infer_definition(
             opaque,
             name,
             parameters,
+            decorators,
             constructors: untyped_constructors,
             typed_parameters: _,
         }) => {
@@ -566,6 +615,7 @@ fn infer_definition(
                         location: constructor.location,
                         name: constructor.name,
                         arguments: args,
+                        decorators: constructor.decorators,
                         doc: constructor.doc,
                         sugar: constructor.sugar,
                     })
@@ -586,6 +636,7 @@ fn infer_definition(
                 name,
                 parameters,
                 constructors,
+                decorators,
                 typed_parameters,
             };
 
@@ -612,6 +663,8 @@ fn infer_definition(
                     }
                 }
             }
+
+            typed_data.check_decorators()?;
 
             Ok(Definition::DataType(typed_data))
         }
@@ -650,6 +703,7 @@ fn infer_definition(
                 value,
                 UntypedAssignmentKind::Let { backpassing: false },
                 &annotation,
+                None,
                 location,
             )?;
 
@@ -978,5 +1032,137 @@ fn put_params_in_scope<'a>(
             }
             ArgName::Named { .. } | ArgName::Discarded { .. } => (),
         };
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum DecoratorContext {
+    Record,
+    Enum,
+    Constructor,
+}
+
+impl fmt::Display for DecoratorContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DecoratorContext::Record => write!(f, "record"),
+            DecoratorContext::Enum => write!(f, "enum"),
+            DecoratorContext::Constructor => write!(f, "constructor"),
+        }
+    }
+}
+
+impl TypedDataType {
+    #[allow(clippy::result_large_err)]
+    fn check_decorators(&self) -> Result<(), Error> {
+        // First determine if this is a record or enum type
+        let is_enum = self.constructors.len() > 1;
+
+        let context = if is_enum {
+            DecoratorContext::Enum
+        } else {
+            DecoratorContext::Record
+        };
+
+        validate_decorators_in_context(&self.decorators, context, None)?;
+
+        let mut seen = BTreeMap::new();
+
+        // Validate constructor decorators
+        for (index, constructor) in self.constructors.iter().enumerate() {
+            validate_decorators_in_context(
+                &constructor.decorators,
+                DecoratorContext::Constructor,
+                None,
+            )?;
+
+            let (tag, location) = constructor
+                .decorators
+                .iter()
+                .find_map(|decorator| {
+                    if let DecoratorKind::Tag { value, .. } = &decorator.kind {
+                        Some((value.parse().unwrap(), &decorator.location))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or((index, &constructor.location));
+
+            if let Some(first) = seen.insert(tag, location) {
+                return Err(Error::DecoratorTagOverlap {
+                    tag,
+                    first: *first,
+                    second: *location,
+                });
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_decorators_in_context(
+    decorators: &[Decorator],
+    context: DecoratorContext,
+    tipo: Option<&Type>,
+) -> Result<(), Error> {
+    // Check for conflicts between decorators
+    for (i, d1) in decorators.iter().enumerate() {
+        // Validate context
+        if !d1.kind.allowed_contexts().contains(&context) {
+            return Err(Error::DecoratorValidation {
+                location: d1.location,
+                message: format!("this decorator not allowed in a {context} context"),
+            });
+        }
+
+        // Validate type constraints if applicable
+        if let Some(t) = tipo {
+            d1.kind.validate_type(&context, t, d1.location)?;
+        }
+
+        // Check for conflicts with other decorators
+        for d2 in decorators.iter().skip(i + 1) {
+            if d1.kind.conflicts_with(&d2.kind) {
+                return Err(Error::ConflictingDecorators {
+                    location: d1.location,
+                    conflicting_location: d2.location,
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+impl DecoratorKind {
+    fn allowed_contexts(&self) -> &[DecoratorContext] {
+        match self {
+            DecoratorKind::Tag { .. } => &[DecoratorContext::Record, DecoratorContext::Constructor],
+            DecoratorKind::List => &[DecoratorContext::Record],
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn validate_type(
+        &self,
+        _context: &DecoratorContext,
+        _tipo: &Type,
+        _loc: Span,
+    ) -> Result<(), Error> {
+        match self {
+            DecoratorKind::Tag { .. } => Ok(()),
+            DecoratorKind::List => Ok(()),
+        }
+    }
+
+    fn conflicts_with(&self, other: &DecoratorKind) -> bool {
+        match (self, other) {
+            (DecoratorKind::Tag { .. }, DecoratorKind::List) => true,
+            (DecoratorKind::Tag { .. }, DecoratorKind::Tag { .. }) => true,
+            (DecoratorKind::List, DecoratorKind::Tag { .. }) => true,
+            (DecoratorKind::List, DecoratorKind::List) => true,
+        }
     }
 }

@@ -1,7 +1,12 @@
+// NOTE: Required because clippy is unable to see through miette's Diagnostic macro expansion to
+// correctly assert that fields are used in the diagnostic precisely.
+#![allow(unused_assignments)]
+
 pub mod well_known;
 
 use crate::{
     ast::well_known::VALIDATOR_ELSE,
+    builtins,
     expr::{TypedExpr, UntypedExpr},
     line_numbers::LineNumbers,
     parser::token::{Base, Token},
@@ -109,38 +114,8 @@ impl TypedModule {
             .find_map(|definition| definition.find_node(byte_index))
     }
 
-    pub fn has_definition(&self, name: &str) -> bool {
-        self.definitions.iter().any(|def| match def {
-            Definition::Fn(f) => f.public && f.name == name,
-            Definition::TypeAlias(alias) => alias.public && alias.alias == name,
-            Definition::ModuleConstant(cst) => cst.public && cst.name == name,
-            Definition::DataType(t) => t.public && t.name == name,
-            Definition::Use(_) => false,
-            Definition::Test(_) => false,
-            Definition::Validator(_) => false,
-            Definition::Benchmark(_) => false,
-        })
-    }
-
-    pub fn has_constructor(&self, name: &str) -> bool {
-        self.definitions.iter().any(|def| match def {
-            Definition::DataType(t) if t.public && !t.opaque => t
-                .constructors
-                .iter()
-                .any(|constructor| constructor.name == name),
-            Definition::DataType(_) => false,
-            Definition::Fn(_) => false,
-            Definition::TypeAlias(_) => false,
-            Definition::ModuleConstant(_) => false,
-            Definition::Use(_) => false,
-            Definition::Test(_) => false,
-            Definition::Validator(_) => false,
-            Definition::Benchmark(_) => false,
-        })
-    }
-
     pub fn validate_module_name(&self) -> Result<(), Error> {
-        if self.name == "aiken" || self.name == "aiken/builtin" {
+        if self.name == builtins::PRELUDE || self.name == builtins::BUILTIN {
             return Err(Error::ReservedModuleName {
                 name: self.name.to_string(),
             });
@@ -438,6 +413,7 @@ impl TypedDataType {
 
     pub fn known_data_type(name: &str, constructors: &[RecordConstructor<Rc<Type>>]) -> Self {
         Self {
+            decorators: vec![],
             name: name.to_string(),
             constructors: constructors.to_vec(),
             location: Span::empty(),
@@ -464,7 +440,20 @@ impl TypedDataType {
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Decorator {
+    pub kind: DecoratorKind,
+    pub location: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum DecoratorKind {
+    Tag { value: String, base: Base },
+    List,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DataType<T> {
+    pub decorators: Vec<Decorator>,
     pub constructors: Vec<RecordConstructor<T>>,
     pub doc: Option<String>,
     pub location: Span,
@@ -981,6 +970,7 @@ impl CallArg<TypedPattern> {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RecordConstructor<T> {
+    pub decorators: Vec<Decorator>,
     pub location: Span,
     pub name: String,
     pub arguments: Vec<RecordConstructorArg<T>>,
@@ -1000,6 +990,7 @@ where
         names
             .iter()
             .map(|name| RecordConstructor {
+                decorators: vec![],
                 location: Span::empty(),
                 name: name.to_string(),
                 arguments: vec![],
@@ -1011,6 +1002,7 @@ where
 
     pub fn known_record(name: &str, args: &[RecordConstructorArg<A>]) -> Self {
         RecordConstructor {
+            decorators: vec![],
             location: Span::empty(),
             name: name.to_string(),
             arguments: args.to_vec(),
@@ -1063,6 +1055,7 @@ impl ArgBy {
                     annotation: annotation.cloned(),
                 }],
                 kind: AssignmentKind::Let { backpassing: false },
+                comment: None,
             }),
         }
     }
@@ -1529,6 +1522,20 @@ impl BinOp {
             Self::AddInt | Self::SubInt => 6,
 
             Self::MultInt | Self::DivInt | Self::ModInt => 7,
+        }
+    }
+
+    pub fn is_symmetric(&self) -> bool {
+        match self {
+            Self::Or
+            | Self::LtInt
+            | Self::LtEqInt
+            | Self::GtEqInt
+            | Self::GtInt
+            | Self::SubInt
+            | Self::ModInt
+            | Self::DivInt => false,
+            Self::And | Self::Eq | Self::NotEq | Self::AddInt | Self::MultInt => true,
         }
     }
 }

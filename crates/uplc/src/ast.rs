@@ -6,15 +6,15 @@ use crate::{
         Machine,
         cost_model::{CostModel, ExBudget, initialize_cost_model},
         eval_result::EvalResult,
+        value::to_pallas_bigint,
     },
     optimize::interner::CodeGenInterner,
     tx::script_context::PlutusScript,
 };
 use num_bigint::BigInt;
-use num_traits::ToPrimitive;
 use pallas_addresses::{Network, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart};
 use pallas_primitives::{
-    alonzo::{self, Constr, PlutusData},
+    alonzo::{Constr, PlutusData},
     conway::{self, Language},
 };
 use pallas_traverse::ComputeHash;
@@ -359,6 +359,19 @@ pub enum Term<T> {
 }
 
 impl<T> Term<T> {
+    pub fn is_constant(&self) -> bool {
+        matches!(self, Term::Constant { .. })
+            || matches!(self, Term::Delay { body: term, .. } | Term::Force { body: term, .. } if term.is_constant())
+    }
+
+    pub fn is_true(&self) -> bool {
+        matches!(self, Term::Constant { value: c, .. } if c.as_ref() == &Constant::Bool(true))
+    }
+
+    pub fn is_false(&self) -> bool {
+        matches!(self, Term::Constant { value: c, .. } if c.as_ref() == &Constant::Bool(false))
+    }
+
     pub fn is_unit(&self) -> bool {
         matches!(self, Term::Constant { value: c, .. } if c.as_ref() == &Constant::Unit)
     }
@@ -393,6 +406,30 @@ where
                 c1 == c2 && b1 == b2
             }
             _ => false,
+        }
+    }
+}
+
+impl<T> Term<T> {
+    /// Change a constant integer to its opposite.
+    pub fn try_negate(&self) -> Option<Self> {
+        match self {
+            Self::Constant { value: cst, .. } => match cst.as_ref() {
+                Constant::Integer(i) => Some(Self::Constant {
+                    value: Rc::new(Constant::Integer(-1 * i)),
+                    uniq_id: next_uniq_id(),
+                }),
+                _ => None,
+            },
+            Self::Delay { body: rc, .. } => rc.try_negate().map(Rc::new).map(|body| Self::Delay {
+                body,
+                uniq_id: next_uniq_id(),
+            }),
+            Self::Force { body: rc, .. } => rc.try_negate().map(Rc::new).map(|body| Self::Force {
+                body,
+                uniq_id: next_uniq_id(),
+            }),
+            _ => None,
         }
     }
 }
@@ -458,19 +495,9 @@ impl Data {
             .expect("failed to encode Plutus Data as cbor?");
         hex::encode(bytes)
     }
+
     pub fn integer(i: BigInt) -> PlutusData {
-        match i.to_i128().map(|n| n.try_into()) {
-            Some(Ok(i)) => PlutusData::BigInt(alonzo::BigInt::Int(i)),
-            _ => {
-                let (sign, bytes) = i.to_bytes_be();
-                match sign {
-                    num_bigint::Sign::Minus => {
-                        PlutusData::BigInt(alonzo::BigInt::BigNInt(bytes.into()))
-                    }
-                    _ => PlutusData::BigInt(alonzo::BigInt::BigUInt(bytes.into())),
-                }
-            }
-        }
+        PlutusData::BigInt(to_pallas_bigint(&i))
     }
 
     pub fn bytestring(bytes: Vec<u8>) -> PlutusData {
@@ -999,5 +1026,28 @@ impl Program<DeBruijn> {
 impl Term<NamedDeBruijn> {
     pub fn is_valid_script_result(&self) -> bool {
         !matches!(self, Term::Error { .. })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ast::Data;
+    use num_bigint::{BigInt, Sign};
+    use pallas_codec::minicbor;
+
+    // Data's negative integers are encoded with an offset of 1, as an unsigned payload. This is unlike
+    // num_bigint's BigInt; so both types representations aren't quite compatible with one another.
+    #[test]
+    fn integer_bigint_negative() {
+        let large_negative_num: BigInt = BigInt::from(i128::MIN) - 1;
+
+        let mut buf = vec![];
+        minicbor::encode(Data::integer(large_negative_num.clone()), &mut buf)
+            .expect("failed to encode bigint to CBOR");
+
+        // NOTE: [2..] removes the CBOR tag and bytes len declaration.
+        let large_negative_num_decoded = BigInt::from_bytes_be(Sign::Plus, &buf[2..]);
+
+        assert_eq!(large_negative_num_decoded, -1 - large_negative_num);
     }
 }

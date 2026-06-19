@@ -54,6 +54,12 @@ where
         }
     }
 
+    pub fn error() -> Self {
+        Term::Error {
+            uniq_id: next_uniq_id(),
+        }
+    }
+
     // Primitives
     pub fn integer(i: num_bigint::BigInt) -> Self {
         Term::Constant {

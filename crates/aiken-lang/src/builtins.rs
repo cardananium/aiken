@@ -140,16 +140,24 @@ pub fn prelude(id_gen: &IdGenerator) -> TypeInfo {
     );
 
     // Pair(a, b)
+    let pair_left = Type::generic_var(id_gen.next());
+    let pair_right = Type::generic_var(id_gen.next());
     prelude.types.insert(
         well_known::PAIR.to_string(),
-        TypeConstructor::primitive(Type::pair(
-            Type::generic_var(id_gen.next()),
-            Type::generic_var(id_gen.next()),
-        )),
+        TypeConstructor::primitive(Type::pair(pair_left.clone(), pair_right.clone())),
     );
     prelude.types_constructors.insert(
         well_known::PAIR.to_string(),
-        vec![well_known::PAIR.to_string()],
+        ValueConstructor::known_adt(
+            &mut prelude.values,
+            &[(
+                well_known::PAIR,
+                Type::function(
+                    vec![pair_left.clone(), pair_right.clone()],
+                    Type::pair(pair_left, pair_right),
+                ),
+            )],
+        ),
     );
 
     // Pairs<k, v> = List<Pair<k, v>>
@@ -418,6 +426,23 @@ pub fn prelude(id_gen: &IdGenerator) -> TypeInfo {
         ),
     );
 
+    // tautology
+    let tautology_var = Type::generic_var(id_gen.next());
+    prelude.values.insert(
+        "tautology".to_string(),
+        ValueConstructor::public(
+            Type::function(vec![tautology_var], Type::void()),
+            ValueConstructorVariant::ModuleFn {
+                name: "tautology".to_string(),
+                field_map: None,
+                module: "".to_string(),
+                arity: 1,
+                location: Span::empty(),
+                builtin: None,
+            },
+        ),
+    );
+
     // flip
     let flip_a_var = Type::generic_var(id_gen.next());
     let flip_b_var = Type::generic_var(id_gen.next());
@@ -565,7 +590,7 @@ pub fn plutus(id_gen: &IdGenerator) -> TypeInfo {
             ValueConstructorVariant::ModuleFn {
                 name: "unconstr_index".to_string(),
                 field_map: None,
-                module: "aiken/builtin".to_string(),
+                module: BUILTIN.to_string(),
                 arity: 1,
                 location: Span::empty(),
                 builtin: None,
@@ -581,7 +606,7 @@ pub fn plutus(id_gen: &IdGenerator) -> TypeInfo {
             ValueConstructorVariant::ModuleFn {
                 name: "unconstr_fields".to_string(),
                 field_map: None,
-                module: "aiken/builtin".to_string(),
+                module: BUILTIN.to_string(),
                 arity: 1,
                 location: Span::empty(),
                 builtin: None,
@@ -1141,7 +1166,7 @@ pub fn prelude_functions(
 
     functions.insert(
         FunctionAccessKey {
-            module_name: "aiken/builtin".to_string(),
+            module_name: BUILTIN.to_string(),
             function_name: "unconstr_index".to_string(),
         },
         unconstr_index_func,
@@ -1205,7 +1230,7 @@ pub fn prelude_functions(
 
     functions.insert(
         FunctionAccessKey {
-            module_name: "aiken/builtin".to_string(),
+            module_name: BUILTIN.to_string(),
             function_name: "unconstr_fields".to_string(),
         },
         unconstr_fields_func,
@@ -1439,6 +1464,48 @@ pub fn prelude_functions(
             return_type: a_var,
             end_position: 0,
         },
+    );
+
+    // /// A function that absorbs any expression and returns true. Useful to write failing test
+    // /// scenarios regardless of the output of a function.
+    // pub fn tautology(a: a) -> Bool {
+    //   a == a
+    // }
+    functions.insert(
+        FunctionAccessKey {
+            module_name: "".to_string(),
+            function_name: "tautology".to_string(),
+        },
+        aiken_fn!(
+            &module_types,
+            &id_gen,
+            r#"
+                pub fn tautology(a: a) -> Bool {
+                  a == a
+                }
+            "#
+        ),
+    );
+
+    // /// A function that absorbs any expression and returns true. Useful to write failing test
+    // // scenarios regardless of the output of a function.
+    // pub fn tautology(a: a) -> Bool {
+    //   a == a
+    // }
+    functions.insert(
+        FunctionAccessKey {
+            module_name: "".to_string(),
+            function_name: "tautology".to_string(),
+        },
+        aiken_fn!(
+            &module_types,
+            &id_gen,
+            r#"
+                pub fn tautology(a: a) -> Bool {
+                  a == a
+                }
+            "#
+        ),
     );
 
     // /// A function that flips the arguments of a function.
@@ -1855,6 +1922,19 @@ pub fn prelude_data_types(id_gen: &IdGenerator) -> IndexMap<DataTypeKey, TypedDa
         option_data_type,
     );
 
+    // Pair
+    let pair_data_type = TypedDataType::pair(
+        Type::generic_var(id_gen.next()),
+        Type::generic_var(id_gen.next()),
+    );
+    data_types.insert(
+        DataTypeKey {
+            module_name: "".to_string(),
+            defined_type: well_known::PAIR.to_string(),
+        },
+        pair_data_type,
+    );
+
     // Never
     data_types.insert(
         DataTypeKey {
@@ -1968,8 +2048,10 @@ impl TypedDataType {
 
     pub fn option(tipo: Rc<Type>) -> Self {
         DataType {
+            decorators: vec![],
             constructors: vec![
                 RecordConstructor {
+                    decorators: vec![],
                     location: Span::empty(),
                     name: well_known::OPTION_CONSTRUCTORS[0].to_string(),
                     arguments: vec![RecordConstructorArg {
@@ -1986,6 +2068,7 @@ impl TypedDataType {
                     sugar: false,
                 },
                 RecordConstructor {
+                    decorators: vec![],
                     location: Span::empty(),
                     name: well_known::OPTION_CONSTRUCTORS[1].to_string(),
                     arguments: vec![],
@@ -2000,6 +2083,48 @@ impl TypedDataType {
             parameters: vec!["a".to_string()],
             public: true,
             typed_parameters: vec![tipo],
+        }
+    }
+
+    pub fn pair(left: Rc<Type>, right: Rc<Type>) -> Self {
+        DataType {
+            decorators: vec![],
+            constructors: vec![RecordConstructor {
+                decorators: vec![],
+                location: Span::empty(),
+                name: well_known::PAIR.to_string(),
+                arguments: vec![
+                    RecordConstructorArg {
+                        label: None,
+                        annotation: Annotation::Var {
+                            location: Span::empty(),
+                            name: "left".to_string(),
+                        },
+                        location: Span::empty(),
+                        tipo: left.clone(),
+                        doc: None,
+                    },
+                    RecordConstructorArg {
+                        label: None,
+                        annotation: Annotation::Var {
+                            location: Span::empty(),
+                            name: "right".to_string(),
+                        },
+                        location: Span::empty(),
+                        tipo: right.clone(),
+                        doc: None,
+                    },
+                ],
+                doc: None,
+                sugar: false,
+            }],
+            doc: None,
+            location: Span::empty(),
+            name: well_known::PAIR.to_string(),
+            opaque: false,
+            parameters: vec!["left".to_string(), "right".to_string()],
+            public: true,
+            typed_parameters: vec![left, right],
         }
     }
 

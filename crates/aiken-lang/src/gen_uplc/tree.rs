@@ -162,6 +162,7 @@ pub enum AirTree {
     },
     // Field Access
     FieldsExpose {
+        list_decorator: bool,
         indices: Vec<(usize, String, Rc<Type>)>,
         record: Box<AirTree>,
         is_expect: bool,
@@ -206,6 +207,7 @@ pub enum AirTree {
         constr: Box<AirTree>,
         then: Box<AirTree>,
         otherwise: Box<AirTree>,
+        list_decorator: bool,
     },
     ListEmpty {
         list: Box<AirTree>,
@@ -277,7 +279,8 @@ pub enum AirTree {
         tipo: Rc<Type>,
         left: Box<AirTree>,
         right: Box<AirTree>,
-        argument_tipo: Rc<Type>,
+        left_tipo: Rc<Type>,
+        right_tipo: Rc<Type>,
     },
     UnOp {
         op: UnOp,
@@ -325,7 +328,7 @@ pub enum AirTree {
     },
     // Record Creation
     Constr {
-        tag: usize,
+        tag: Option<usize>,
         tipo: Rc<Type>,
         args: Vec<AirTree>,
     },
@@ -501,14 +504,16 @@ impl AirTree {
         tipo: Rc<Type>,
         left: AirTree,
         right: AirTree,
-        argument_tipo: Rc<Type>,
+        left_tipo: Rc<Type>,
+        right_tipo: Rc<Type>,
     ) -> AirTree {
         AirTree::BinOp {
             name: op,
             tipo,
             left: left.into(),
             right: right.into(),
-            argument_tipo,
+            left_tipo,
+            right_tipo,
         }
     }
 
@@ -634,7 +639,7 @@ impl AirTree {
         }
     }
 
-    pub fn create_constr(tag: usize, tipo: Rc<Type>, args: Vec<AirTree>) -> AirTree {
+    pub fn create_constr(tag: Option<usize>, tipo: Rc<Type>, args: Vec<AirTree>) -> AirTree {
         AirTree::Constr { tag, tipo, args }
     }
 
@@ -691,6 +696,7 @@ impl AirTree {
         is_expect: bool,
         then: AirTree,
         otherwise: AirTree,
+        list_decorator: bool,
     ) -> AirTree {
         AirTree::FieldsExpose {
             indices,
@@ -698,6 +704,7 @@ impl AirTree {
             is_expect,
             then: then.into(),
             otherwise: otherwise.into(),
+            list_decorator,
         }
     }
 
@@ -798,11 +805,17 @@ impl AirTree {
         AirTree::NoOp { then: then.into() }
     }
 
-    pub fn fields_empty(constr: AirTree, then: AirTree, otherwise: AirTree) -> AirTree {
+    pub fn fields_empty(
+        constr: AirTree,
+        then: AirTree,
+        otherwise: AirTree,
+        list_decorator: bool,
+    ) -> AirTree {
         AirTree::FieldsEmpty {
             constr: constr.into(),
             then: then.into(),
             otherwise: otherwise.into(),
+            list_decorator,
         }
     }
 
@@ -950,10 +963,12 @@ impl AirTree {
                 is_expect,
                 then,
                 otherwise,
+                list_decorator,
             } => {
                 air_vec.push(Air::FieldsExpose {
                     indices: indices.clone(),
                     is_expect: *is_expect,
+                    list_decorator: *list_decorator,
                 });
 
                 record.create_air_vec(air_vec);
@@ -1030,8 +1045,11 @@ impl AirTree {
                 constr,
                 then,
                 otherwise,
+                list_decorator,
             } => {
-                air_vec.push(Air::FieldsEmpty);
+                air_vec.push(Air::FieldsEmpty {
+                    list_decorator: *list_decorator,
+                });
 
                 constr.create_air_vec(air_vec);
                 then.create_air_vec(air_vec);
@@ -1135,12 +1153,14 @@ impl AirTree {
                 tipo,
                 left,
                 right,
-                argument_tipo,
+                left_tipo,
+                right_tipo,
             } => {
                 air_vec.push(Air::BinOp {
                     name: *name,
                     tipo: tipo.clone(),
-                    argument_tipo: argument_tipo.clone(),
+                    left_tipo: left_tipo.clone(),
+                    right_tipo: right_tipo.clone(),
                 });
                 left.create_air_vec(air_vec);
                 right.create_air_vec(air_vec);
@@ -1350,10 +1370,11 @@ impl AirTree {
             }
             AirTree::BinOp {
                 tipo,
-                argument_tipo,
+                left_tipo,
+                right_tipo,
                 ..
             } => {
-                vec![tipo, argument_tipo]
+                vec![tipo, left_tipo, right_tipo]
             }
             AirTree::When {
                 tipo, subject_tipo, ..
@@ -1466,6 +1487,7 @@ impl AirTree {
                 is_expect: _,
                 then: _,
                 otherwise,
+                list_decorator: _,
             } => {
                 record.do_traverse_tree_with(
                     tree_path,
@@ -1534,6 +1556,7 @@ impl AirTree {
                 constr,
                 then: _,
                 otherwise,
+                list_decorator: _,
             } => {
                 constr.do_traverse_tree_with(
                     tree_path,
@@ -1702,7 +1725,8 @@ impl AirTree {
                 tipo: _,
                 left,
                 right,
-                argument_tipo: _,
+                left_tipo: _,
+                right_tipo: _,
             } => {
                 left.do_traverse_tree_with(tree_path, current_depth + 1, Fields::ThirdField, with);
 
@@ -1913,6 +1937,7 @@ impl AirTree {
                 is_expect: _,
                 then,
                 otherwise: _,
+                list_decorator: _,
             } => {
                 then.do_traverse_tree_with(tree_path, current_depth + 1, Fields::FourthField, with);
             }
@@ -1952,6 +1977,7 @@ impl AirTree {
                 constr: _,
                 then,
                 otherwise: _,
+                list_decorator: _,
             } => {
                 then.do_traverse_tree_with(tree_path, current_depth + 1, Fields::SecondField, with);
             }
@@ -2023,6 +2049,7 @@ impl AirTree {
                     is_expect: _,
                     then,
                     otherwise,
+                    list_decorator: _,
                 } => match field {
                     Fields::SecondField => record.as_mut().do_find_air_tree_node(tree_path_iter),
                     Fields::FourthField => then.as_mut().do_find_air_tree_node(tree_path_iter),
@@ -2083,6 +2110,7 @@ impl AirTree {
                     constr,
                     then,
                     otherwise,
+                    list_decorator: _,
                 } => match field {
                     Fields::FirstField => constr.as_mut().do_find_air_tree_node(tree_path_iter),
                     Fields::SecondField => then.as_mut().do_find_air_tree_node(tree_path_iter),
@@ -2143,7 +2171,8 @@ impl AirTree {
                     tipo: _,
                     left,
                     right,
-                    argument_tipo: _,
+                    left_tipo: _,
+                    right_tipo: _,
                 } => match field {
                     Fields::ThirdField => left.as_mut().do_find_air_tree_node(tree_path_iter),
                     Fields::FourthField => right.as_mut().do_find_air_tree_node(tree_path_iter),

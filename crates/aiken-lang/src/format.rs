@@ -1,10 +1,10 @@
 use crate::{
     ast::{
         Annotation, ArgBy, ArgName, ArgVia, AssignmentKind, AssignmentPattern, BinOp,
-        ByteArrayFormatPreference, CAPTURE_VARIABLE, CallArg, CurveType, DataType, Definition,
-        Function, LogicalOpChainKind, ModuleConstant, Namespace, OnTestFailure, Pattern,
-        RecordConstructor, RecordConstructorArg, RecordUpdateSpread, Span, TraceKind, TypeAlias,
-        TypedArg, TypedValidator, UnOp, UnqualifiedImport, UntypedArg, UntypedArgVia,
+        ByteArrayFormatPreference, CAPTURE_VARIABLE, CallArg, CurveType, DataType, Decorator,
+        Definition, Function, LogicalOpChainKind, ModuleConstant, Namespace, OnTestFailure,
+        Pattern, RecordConstructor, RecordConstructorArg, RecordUpdateSpread, Span, TraceKind,
+        TypeAlias, TypedArg, TypedValidator, UnOp, UnqualifiedImport, UntypedArg, UntypedArgVia,
         UntypedAssignmentKind, UntypedClause, UntypedDefinition, UntypedFunction, UntypedIfBranch,
         UntypedModule, UntypedPattern, UntypedRecordUpdateArg, Use, Validator,
     },
@@ -285,8 +285,17 @@ impl<'comments> Formatter<'comments> {
                 constructors,
                 location,
                 opaque,
+                decorators,
                 ..
-            }) => self.data_type(*public, *opaque, name, parameters, constructors, location),
+            }) => self.data_type(
+                *public,
+                *opaque,
+                name,
+                parameters,
+                constructors,
+                decorators,
+                location,
+            ),
 
             Definition::Use(import) => self.import(import),
 
@@ -327,19 +336,20 @@ impl<'comments> Formatter<'comments> {
             .append(if unqualified.is_empty() {
                 nil()
             } else {
-                let unqualified = Itertools::intersperse(
+                let unqualified = join(
                     unqualified
                         .iter()
                         .sorted_by(|a, b| a.name.cmp(&b.name))
                         .map(|e| e.to_doc()),
                     flex_break(",", ", "),
                 );
-                let unqualified = break_("", "")
-                    .append(concat(unqualified))
+
+                break_(".{", ".{")
+                    .append(unqualified)
                     .nest(INDENT)
                     .append(break_(",", ""))
-                    .group();
-                ".{".to_doc().append(unqualified).append("}")
+                    .append("}")
+                    .group()
             })
             .append(if let Some(name) = as_name {
                 docvec![" as ", name]
@@ -417,6 +427,10 @@ impl<'comments> Formatter<'comments> {
                 )
             }
             TypedExpr::Var { name, .. } => name.to_doc(),
+            TypedExpr::UnOp { value, op, .. } => match op {
+                UnOp::Not => docvec!["!", self.const_expr(value)],
+                UnOp::Negate => docvec!["-", self.const_expr(value)],
+            },
             _ => Document::Str(""),
         }
     }
@@ -832,6 +846,7 @@ impl<'comments> Formatter<'comments> {
         patterns: &'a Vec1<AssignmentPattern>,
         value: &'a UntypedExpr,
         kind: UntypedAssignmentKind,
+        comment: Option<&'_ str>,
     ) -> Document<'a> {
         let keyword = match kind {
             AssignmentKind::Is => unreachable!(),
@@ -840,6 +855,14 @@ impl<'comments> Formatter<'comments> {
         };
 
         let symbol = if kind.is_backpassing() { "<-" } else { "=" };
+
+        let header = comment
+            .map(|comment| {
+                Document::String(format!("/// {comment}"))
+                    .append(Document::Line(1))
+                    .append(keyword.to_doc())
+            })
+            .unwrap_or_else(|| keyword.to_doc());
 
         match patterns.first() {
             AssignmentPattern {
@@ -854,7 +877,7 @@ impl<'comments> Formatter<'comments> {
                 && kind.is_expect()
                 && patterns.len() == 1 =>
             {
-                keyword.to_doc().append(self.case_clause_value(value))
+                header.append(self.case_clause_value(value))
             }
             _ => {
                 let patterns = patterns.into_iter().map(
@@ -875,31 +898,16 @@ impl<'comments> Formatter<'comments> {
                     },
                 );
 
-                let pattern_len = patterns.len();
-
-                let assignment = keyword
-                    .to_doc()
-                    .append(if pattern_len == 1 {
-                        " ".to_doc()
-                    } else {
-                        break_("", " ")
-                    })
-                    .append(join(patterns, break_(",", ", ")));
-
-                let assignment = if pattern_len == 1 {
-                    assignment
-                } else {
-                    assignment.nest(INDENT)
-                };
-
-                assignment
-                    .append(if pattern_len == 1 {
-                        " ".to_doc()
-                    } else {
-                        break_(",", " ")
-                    })
+                header
+                    .append(break_("  ", " "))
+                    .append(join(patterns, break_(",", ", ")))
+                    .group()
+                    .nest(INDENT)
+                    .append(break_("", " "))
                     .append(symbol)
-                    .append(self.case_clause_value(value))
+                    .group()
+                    .nest(INDENT)
+                    .append(self.assignment_value(value))
             }
         }
     }
@@ -1122,8 +1130,9 @@ impl<'comments> Formatter<'comments> {
                 value,
                 patterns,
                 kind,
+                comment,
                 ..
-            } => self.assignment(patterns, value, *kind),
+            } => self.assignment(patterns, value, *kind, comment.as_deref()),
 
             UntypedExpr::Trace {
                 kind,
@@ -1697,7 +1706,13 @@ impl<'comments> Formatter<'comments> {
         let doc_comments = self.doc_comments(constructor.location.start);
 
         let doc = if constructor.arguments.is_empty() {
-            constructor.name.to_doc()
+            self.decorator(&constructor.decorators)
+                .append(if constructor.decorators.is_empty() {
+                    nil()
+                } else {
+                    line()
+                })
+                .append(constructor.name.as_str())
         } else if constructor.sugar {
             wrap_fields(constructor.arguments.iter().map(
                 |RecordConstructorArg {
@@ -1721,9 +1736,13 @@ impl<'comments> Formatter<'comments> {
             ))
             .group()
         } else {
-            constructor
-                .name
-                .to_doc()
+            self.decorator(&constructor.decorators)
+                .append(if constructor.decorators.is_empty() {
+                    nil()
+                } else {
+                    line()
+                })
+                .append(constructor.name.as_str())
                 .append(wrap_args(constructor.arguments.iter().map(
                     |RecordConstructorArg {
                          label,
@@ -1753,6 +1772,7 @@ impl<'comments> Formatter<'comments> {
         commented(doc_comments.append(doc).group(), comments)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn data_type<'a, A>(
         &mut self,
         public: bool,
@@ -1760,14 +1780,16 @@ impl<'comments> Formatter<'comments> {
         name: &'a str,
         args: &'a [String],
         constructors: &'a [RecordConstructor<A>],
+        decorators: &'a [Decorator],
         location: &'a Span,
     ) -> Document<'a> {
         self.pop_empty_lines(location.start);
 
         let mut is_sugar = false;
 
-        pub_(public)
-            .to_doc()
+        self.decorator(decorators)
+            .append(if decorators.is_empty() { nil() } else { line() })
+            .append(pub_(public))
             .append(if opaque { "opaque type " } else { "type " })
             .append(if args.is_empty() {
                 name.to_doc()
@@ -1795,6 +1817,18 @@ impl<'comments> Formatter<'comments> {
             })
             .append(if is_sugar { nil() } else { line() })
             .append("}")
+    }
+
+    pub fn decorator<'a>(&mut self, decorators: &'a [Decorator]) -> Document<'a> {
+        join(
+            decorators.iter().map(|d| match &d.kind {
+                crate::ast::DecoratorKind::Tag { value, base } => {
+                    docvec!["@tag(", self.uint(value, base), ")"]
+                }
+                crate::ast::DecoratorKind::List => "@list".to_doc(),
+            }),
+            line(),
+        )
     }
 
     pub fn docs_data_type<'a, A>(
@@ -2024,6 +2058,28 @@ impl<'comments> Formatter<'comments> {
         }
     }
 
+    fn assignment_value<'a>(&mut self, expr: &'a UntypedExpr) -> Document<'a> {
+        match expr {
+            UntypedExpr::Trace {
+                kind: TraceKind::Trace,
+                ..
+            }
+            | UntypedExpr::Sequence { .. }
+            | UntypedExpr::Assignment { .. } => Document::Str(" {")
+                .append(break_("", " ").nest(INDENT))
+                .append(
+                    self.expr(expr, true)
+                        .nest(INDENT)
+                        .group()
+                        .append(line())
+                        .append("}")
+                        .force_break(),
+                ),
+
+            _ => Document::Str(" ").append(self.expr(expr, false)).group(),
+        }
+    }
+
     fn clause<'a>(&mut self, clause: &'a UntypedClause, index: u32) -> Document<'a> {
         let space_before = self.pop_empty_lines(clause.location.start);
         let clause_doc = join(
@@ -2126,10 +2182,10 @@ impl<'comments> Formatter<'comments> {
     fn pattern_call_arg<'a>(&mut self, arg: &'a CallArg<UntypedPattern>) -> Document<'a> {
         let comments = self.pop_comments(arg.location.start);
 
-        if let (UntypedPattern::Var { name, .. }, Some(label)) = (&arg.value, &arg.label) {
-            if name == label {
-                return self.pattern(&arg.value);
-            }
+        if let (UntypedPattern::Var { name, .. }, Some(label)) = (&arg.value, &arg.label)
+            && name == label
+        {
+            return self.pattern(&arg.value);
         }
 
         let doc = arg

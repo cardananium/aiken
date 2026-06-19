@@ -124,7 +124,7 @@ impl Definitions<Annotated<Schema>> {
                 }
                 Schema::List(Items::Many(items)) => {
                     items.iter().for_each(|item| {
-                        mark(src.clone(), item, usage, traverse_schema);
+                        mark(src.clone(), &item.annotated, usage, traverse_schema);
                     });
                 }
                 Schema::Data(data) => traverse_data(src, data, usage),
@@ -143,7 +143,7 @@ impl Definitions<Annotated<Schema>> {
                 }
                 Data::List(Items::Many(items)) => {
                     items.iter().for_each(|item| {
-                        mark(src.clone(), item, usage, traverse_data);
+                        mark(src.clone(), &item.annotated, usage, traverse_data);
                     });
                 }
                 Data::Map(keys, values) => {
@@ -184,10 +184,10 @@ impl Definitions<Annotated<Schema>> {
 
         // 1. List all Pairs definitions
         for (src, annotated) in self.inner.iter() {
-            if let Some(schema) = annotated.as_ref().map(|entry| &entry.annotated) {
-                if matches!(schema, Schema::Pair(_, _)) {
-                    usage.insert(Reference::new(src), BTreeSet::new());
-                }
+            if let Some(schema) = annotated.as_ref().map(|entry| &entry.annotated)
+                && matches!(schema, Schema::Pair(_, _))
+            {
+                usage.insert(Reference::new(src), BTreeSet::new());
             }
         }
 
@@ -263,14 +263,17 @@ impl Definitions<Annotated<Schema>> {
                 Schema::Pair(left, right) => {
                     let left = swap_declaration(left);
                     let right = swap_declaration(right);
-                    Some(Items::Many(vec![left, right]))
+                    Some(Items::Many(vec![left.into(), right.into()]))
                 }
                 Schema::List(Items::One(item)) => {
                     let item = swap_declaration(item);
                     Some(Items::One(item))
                 }
                 Schema::List(Items::Many(items)) => Some(Items::Many(
-                    items.iter_mut().map(swap_declaration).collect(),
+                    items
+                        .iter_mut()
+                        .map(|annot| swap_declaration(&mut annot.annotated).into())
+                        .collect(),
                 )),
                 Schema::Integer => {
                     *schema = Schema::Data(Data::Integer);
@@ -351,16 +354,15 @@ impl Reference {
             annotation,
             module,
         }) = type_info.alias().as_deref()
+            && let Some(resolved_parameters) = resolve_alias(parameters, annotation, type_info)
         {
-            if let Some(resolved_parameters) = resolve_alias(parameters, annotation, type_info) {
-                return Self::from_type_alias(
-                    type_info,
-                    alias,
-                    module.as_deref(),
-                    resolved_parameters,
-                    type_parameters,
-                );
-            }
+            return Self::from_type_alias(
+                type_info,
+                alias,
+                module.as_deref(),
+                resolved_parameters,
+                type_parameters,
+            );
         }
 
         match type_info {
@@ -379,13 +381,13 @@ impl Reference {
 
             Type::Tuple { elems, .. } => Self {
                 inner: format!(
-                    "Tuple{elems}",
+                    "Tuple<{elems}>",
                     elems = Self::from_types(elems, type_parameters)
                 ),
             },
             Type::Pair { fst, snd, .. } => Self {
                 inner: format!(
-                    "Pair${fst}_{snd}",
+                    "Pair<{fst},{snd}>",
                     fst = Self::from_type(fst, type_parameters),
                     snd = Self::from_type(snd, type_parameters)
                 ),
@@ -398,14 +400,17 @@ impl Reference {
             Type::Var { tipo, .. } => match tipo.borrow().deref() {
                 TypeVar::Link { tipo } => Self::from_type(tipo.as_ref(), type_parameters),
                 TypeVar::Generic { id } | TypeVar::Unbound { id } => {
-                    let tipo = type_parameters.get(id).unwrap();
-                    Self::from_type(tipo, type_parameters)
+                    if let Some(tipo) = type_parameters.get(id) {
+                        Self::from_type(tipo, type_parameters)
+                    } else {
+                        Self::from_type(&Type::data(), type_parameters)
+                    }
                 }
             },
 
             Type::Fn { args, ret, .. } => Self {
                 inner: format!(
-                    "Fn{args}_{ret}",
+                    "Fn({args})->{ret}",
                     args = Self::from_types(args, type_parameters),
                     ret = Self::from_type(ret, type_parameters)
                 ),
@@ -419,11 +424,11 @@ impl Reference {
         } else {
             Reference {
                 inner: format!(
-                    "${}",
+                    "<{}>",
                     args.iter()
                         .map(|s| Self::from_type(s.as_ref(), type_parameters).inner)
                         .collect::<Vec<_>>()
-                        .join("_")
+                        .join(",")
                 ),
             }
         }
@@ -444,7 +449,7 @@ impl Reference {
         if !parameters.is_empty() {
             Reference {
                 inner: format!(
-                    "{prefix}${}",
+                    "{prefix}<{}>",
                     parameters
                         .iter()
                         .map(|param| {
@@ -460,7 +465,7 @@ impl Reference {
                                 Self::from_type(param, type_parameters).inner
                             }
                         })
-                        .join("_"),
+                        .join(","),
                 ),
             }
         } else {

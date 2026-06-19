@@ -627,7 +627,7 @@ fn format_newline_module_comments() {
 }
 
 #[test]
-fn format_many_assignment_patterns() {
+fn backpassing_format_many_assignment_patterns() {
     assert_format!(
         r#"
         fn backpassing() -> Int {
@@ -649,6 +649,44 @@ fn format_many_assignment_patterns() {
           0)
 
           elem + accumulator
+        }
+        "#
+    );
+}
+
+#[test]
+fn long_backpassing_over_two_lines_when_possible() {
+    assert_format!(
+        r#"
+        fn foo() {
+          expect
+            head_output_tokens,
+            tail_output_assets,
+            tail_output_assets,
+            tail_output_assets,
+            tail_output_assets,
+            tail_output_assets,
+            tail_output_assets,
+            tail_output_assets,
+          <- pairs.pop_until(output_assets, equals_bytearray(policy, _), alfdljfdskfjdsfsf, lfjsdfjsfsdmf, kfdsfkjhsdfhskjfs)
+
+          head_output_tokens + tail_output_assets
+        }
+        "#
+    );
+}
+
+#[test]
+fn long_backpassing_over_two_lines_when_possible_2() {
+    assert_format!(
+        r#"
+        fn foo() {
+          let
+            head_output_tokens,
+            tail_output_assets,
+          <- pairs.pop_until(output_assets, equals_bytearray(policy, _))
+
+          head_output_tokens + tail_output_assets
         }
         "#
     );
@@ -1516,6 +1554,89 @@ fn types_as_namespace() {
             predicate(foo.Foo.I(42)),
             predicate(Foo.b("aiken"))
           }
+        }
+        "#
+    );
+}
+
+#[test]
+fn list_decorator() {
+    assert_format!(
+        r#"
+        @list
+        type Datum {
+          wow: Int
+        }
+        "#
+    );
+}
+
+#[test]
+fn tag_decorator() {
+    assert_format!(
+        r#"
+        @tag(420)
+        type Datum {
+          wow: Int
+        }
+        "#
+    );
+}
+
+#[test]
+fn more_than_one_decorator() {
+    assert_format!(
+        r#"
+        @tag(420)
+        @list
+        type Datum {
+          wow: Int
+        }
+        "#
+    );
+}
+
+#[test]
+fn decorators_on_constructor() {
+    assert_format!(
+        r#"
+        type Datum {
+          @tag(420)
+          Yes
+          @tag(69)
+          No
+        }
+        "#
+    );
+}
+
+#[test]
+fn long_import_line() {
+    assert_format!(
+        r#"
+        use cardano/transaction.{Input,
+          Output, OutputReference, Transaction, find_input}
+        "#
+    );
+}
+
+#[test]
+fn long_import_line_2() {
+    assert_format!(
+        r#"
+        use cardano/transaction.{Input,
+          Output, OutputReference, Transaction, find_input, stuff, thing, wow, yea}
+        "#
+    );
+}
+
+#[test]
+fn expect_comment() {
+    assert_format!(
+        r#"
+        test foo() {
+          /// Prevent silly mistake
+          expect 1 + 1 == 3
         }
         "#
     );

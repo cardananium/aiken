@@ -36,7 +36,7 @@ where
             .join("\n")
     }
 
-    fn to_doc(&self) -> RcDoc<()> {
+    fn to_doc(&self) -> RcDoc<'_, ()> {
         let version = format!("{}.{}.{}", self.version.0, self.version.1, self.version.2);
 
         RcDoc::text("(")
@@ -77,7 +77,7 @@ where
             .join("\n")
     }
 
-    fn to_doc(&self) -> RcDoc<()> {
+    fn to_doc(&self) -> RcDoc<'_, ()> {
         match self {
             Term::Var { name, .. } => RcDoc::text(name.text()),
             Term::Delay { body, .. } => RcDoc::text("(")
@@ -136,11 +136,7 @@ where
                 )
                 .append(RcDoc::line_())
                 .append(RcDoc::text(")")),
-            Term::Error { .. } => RcDoc::text("(")
-                .append(RcDoc::text("error").nest(2))
-                .append(RcDoc::line())
-                .append(RcDoc::line_())
-                .append(RcDoc::text(")")),
+            Term::Error { .. } => RcDoc::text("(error)").nest(2),
             Term::Builtin { fun, .. } => RcDoc::text("(")
                 .append(
                     RcDoc::text("builtin")
@@ -157,11 +153,16 @@ where
                         .append(RcDoc::as_string(tag))
                         .nest(2),
                 )
-                .append(RcDoc::line_())
-                .append(RcDoc::intersperse(
-                    fields.iter().map(|f| f.to_doc()),
-                    RcDoc::line_(),
-                ))
+                .append(if fields.is_empty() {
+                    RcDoc::nil()
+                } else {
+                    RcDoc::line()
+                        .append(
+                            RcDoc::intersperse(fields.iter().map(|f| f.to_doc()), RcDoc::line())
+                                .nest(2),
+                        )
+                        .append(RcDoc::line_())
+                })
                 .append(RcDoc::text(")")),
             Term::Case { constr, branches, .. } => RcDoc::text("(")
                 .append(
@@ -170,11 +171,16 @@ where
                         .append(constr.to_doc())
                         .nest(2),
                 )
-                .append(RcDoc::line_())
-                .append(RcDoc::intersperse(
-                    branches.iter().map(|f| f.to_doc()),
-                    RcDoc::line_(),
-                ))
+                .append(if branches.is_empty() {
+                    RcDoc::nil()
+                } else {
+                    RcDoc::line()
+                        .append(
+                            RcDoc::intersperse(branches.iter().map(|f| f.to_doc()), RcDoc::line())
+                                .nest(2),
+                        )
+                        .append(RcDoc::line_())
+                })
                 .append(RcDoc::text(")")),
         }
         .group()
@@ -204,7 +210,7 @@ impl Constant {
             .join("\n")
     }
 
-    fn to_doc(&self) -> RcDoc<()> {
+    fn to_doc(&self) -> RcDoc<'_, ()> {
         match self {
             Constant::Integer(i) => RcDoc::text("integer")
                 .append(RcDoc::line())
@@ -273,7 +279,7 @@ impl Constant {
         }
     }
 
-    fn to_doc_list(&self) -> RcDoc<()> {
+    fn to_doc_list(&self) -> RcDoc<'_, ()> {
         match self {
             Constant::Integer(i) => RcDoc::as_string(i),
             Constant::ByteString(bs) => RcDoc::text("#").append(RcDoc::text(hex::encode(bs))),
@@ -314,7 +320,7 @@ impl Constant {
     }
 
     // This feels a little awkward here; not sure if it should be upstreamed to pallas
-    fn to_doc_list_plutus_data(data: &PlutusData) -> RcDoc<()> {
+    fn to_doc_list_plutus_data(data: &PlutusData) -> RcDoc<'_, ()> {
         match data {
             PlutusData::Constr(Constr {
                 tag,
@@ -366,7 +372,7 @@ impl Constant {
 }
 
 impl Type {
-    fn to_doc(&self) -> RcDoc<()> {
+    fn to_doc(&self) -> RcDoc<'_, ()> {
         match self {
             Type::Bool => RcDoc::text("bool"),
             Type::Integer => RcDoc::text("integer"),

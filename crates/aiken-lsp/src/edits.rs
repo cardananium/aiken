@@ -3,7 +3,6 @@ use aiken_lang::{
     ast::{Definition, ModuleKind, Span, UntypedDefinition, Use},
     line_numbers::LineNumbers,
 };
-use aiken_project::module::CheckedModule;
 use itertools::Itertools;
 use std::fs;
 
@@ -64,12 +63,8 @@ impl ParsedDocument {
         }
     }
 
-    pub fn import(
-        &self,
-        import: &CheckedModule,
-        unqualified: Option<&str>,
-    ) -> Option<AnnotatedEdit> {
-        let import_path = import.name.split('/').collect_vec();
+    pub fn import(&self, import: &str, unqualified: Option<&str>) -> Option<AnnotatedEdit> {
+        let import_path = import.split('/').collect_vec();
 
         let mut last_import = None;
 
@@ -197,7 +192,7 @@ impl ParsedDocument {
 
     pub fn use_qualified(
         &self,
-        module: &CheckedModule,
+        module: &str,
         unqualified: &str,
         range: &lsp_types::Range,
     ) -> Option<AnnotatedEdit> {
@@ -209,22 +204,27 @@ impl ParsedDocument {
                 as_name: imported_as,
                 ..
             }) = def
+                && path.join("/") == module
             {
-                if path.join("/") == module.name {
-                    as_name = imported_as.as_deref();
-                }
+                as_name = imported_as.as_deref();
             }
         }
 
-        let title = format!(
-            "Use qualified from {}",
-            as_name.unwrap_or(module.name.as_str())
-        );
-        let suffix = as_name.or_else(|| module.name.split("/").last())?;
+        let title = format!("Use qualified from {}", as_name.unwrap_or(module));
+        let suffix = as_name.or_else(|| module.split("/").last())?;
         Some(AnnotatedEdit::SimpleEdit(
             title,
             lsp_types::TextEdit {
-                range: *range,
+                range: lsp_types::Range {
+                    start: range.start,
+                    // NOTE:
+                    // Only replace the constructor name, so that we preserve any generic
+                    // already present.
+                    end: lsp_types::Position::new(
+                        range.start.line,
+                        range.start.character + unqualified.len() as u32,
+                    ),
+                },
                 new_text: format!("{suffix}.{unqualified}"),
             },
         ))
@@ -232,7 +232,7 @@ impl ParsedDocument {
 
     fn insert_qualified_before(
         &self,
-        import: &CheckedModule,
+        import: &str,
         as_name: Option<&str>,
         unqualified: &str,
         location: Span,
@@ -240,7 +240,7 @@ impl ParsedDocument {
         let title = format!(
             "Import '{}' from {}",
             unqualified,
-            as_name.unwrap_or(import.name.as_str())
+            as_name.unwrap_or(import)
         );
         AnnotatedEdit::SimpleEdit(
             title,
@@ -254,7 +254,7 @@ impl ParsedDocument {
 
     fn insert_qualified_after(
         &self,
-        import: &CheckedModule,
+        import: &str,
         as_name: Option<&str>,
         unqualified: &str,
         location: Span,
@@ -262,7 +262,7 @@ impl ParsedDocument {
         let title = format!(
             "Import '{}' from {}",
             unqualified,
-            as_name.unwrap_or(import.name.as_str())
+            as_name.unwrap_or(import)
         );
         AnnotatedEdit::SimpleEdit(
             title,
@@ -272,7 +272,7 @@ impl ParsedDocument {
 
     fn add_new_qualified(
         &self,
-        import: &CheckedModule,
+        import: &str,
         as_name: Option<&str>,
         unqualified: &str,
         position: usize,
@@ -280,7 +280,7 @@ impl ParsedDocument {
         let title = format!(
             "Import '{}' from {}",
             unqualified,
-            as_name.unwrap_or(import.name.as_str())
+            as_name.unwrap_or(import)
         );
         AnnotatedEdit::SimpleEdit(
             title,
@@ -290,13 +290,13 @@ impl ParsedDocument {
 
     fn add_new_import_line(
         &self,
-        import: &CheckedModule,
+        import: &str,
         unqualified: Option<&str>,
         location: Option<Span>,
     ) -> AnnotatedEdit {
         let import_line = format!(
             "use {}{}",
-            import.name,
+            import,
             match unqualified {
                 Some(unqualified) => format!(".{{{unqualified}}}"),
                 None => String::new(),

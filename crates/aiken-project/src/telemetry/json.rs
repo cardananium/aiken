@@ -39,7 +39,9 @@ impl EventListener for Json {
                 });
                 println!("{}", serde_json::to_string_pretty(&json_output).unwrap());
             }
-            Event::FinishedBenchmarks { benchmarks, seed } => {
+            Event::FinishedBenchmarks {
+                benchmarks, seed, ..
+            } => {
                 let benchmark_results: Vec<_> = benchmarks
                     .into_iter()
                     .filter_map(|test| {
@@ -101,11 +103,11 @@ fn fmt_test_json(result: &TestResult<UntypedExpr, UntypedExpr>) -> serde_json::V
                 "mem": spent_budget.mem,
                 "cpu": spent_budget.cpu,
             });
-            if !result.is_success() {
-                if let Some(assertion) = assertion {
-                    test["assertion"] =
-                        json!(assertion.to_string(false, &AssertionStyleOptions::new(None)));
-                }
+            if !result.is_success()
+                && let Some(assertion) = assertion
+            {
+                test["assertion"] =
+                    json!(assertion.to_string(false, &AssertionStyleOptions::new(None)));
             }
         }
         TestResult::PropertyTestResult(PropertyTestResult {

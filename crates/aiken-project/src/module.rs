@@ -2,10 +2,11 @@ use crate::{Error, Warning};
 use aiken_lang::{
     IdGenerator,
     ast::{
-        DataType, DataTypeKey, Definition, Function, FunctionAccessKey, Located, ModuleKind,
-        Tracing, TypedDataType, TypedFunction, TypedModule, TypedValidator, UntypedModule,
-        Validator,
+        DataType, DataTypeKey, Definition, Function, FunctionAccessKey, Located, ModuleConstant,
+        ModuleKind, Tracing, TypeAlias, TypedDataType, TypedFunction, TypedModule, TypedValidator,
+        UntypedModule, Validator,
     },
+    builtins,
     expr::TypedExpr,
     line_numbers::LineNumbers,
     parser::extra::{Comment, ModuleExtra, comments_before},
@@ -15,7 +16,7 @@ use indexmap::IndexMap;
 use miette::NamedSource;
 use petgraph::{Direction, Graph, algo, graph::NodeIndex};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     io,
     ops::{Deref, DerefMut},
     path::PathBuf,
@@ -68,9 +69,12 @@ impl ParsedModule {
                 env,
             )
             .map_err(|error| Error::Type {
-                path: self.path.clone(),
-                src: self.code.clone(),
-                named: NamedSource::new(self.path.display().to_string(), self.code.clone()),
+                path: Box::new(self.path.clone()),
+                src: Box::new(self.code.clone()),
+                named: Box::new(NamedSource::new(
+                    self.path.display().to_string(),
+                    self.code.clone(),
+                )),
                 error: error.into(),
             })?;
 
@@ -112,11 +116,129 @@ impl ParsedModule {
     }
 }
 
+/// Used by the LSP to lookup missing definitions in modules.
+#[derive(Debug)]
+pub struct Glossary(BTreeMap<String, ModuleGlossary>);
+
+impl Default for Glossary {
+    fn default() -> Self {
+        let id_gen = IdGenerator::new();
+        Self(BTreeMap::from([(
+            builtins::BUILTIN.to_string(),
+            ModuleGlossary {
+                public_definitions: builtins::plutus(&id_gen).values.keys().cloned().collect(),
+                public_constructors: BTreeSet::new(),
+            },
+        )]))
+    }
+}
+
+impl Glossary {
+    pub fn add(&mut self, module: &ParsedModule) {
+        let glossary =
+            module
+                .ast
+                .definitions
+                .iter()
+                .fold(ModuleGlossary::default(), |mut glossary, def| {
+                    match def {
+                        Definition::Fn(Function { public, name, .. })
+                        | Definition::ModuleConstant(ModuleConstant { public, name, .. })
+                        | Definition::TypeAlias(TypeAlias {
+                            public,
+                            alias: name,
+                            ..
+                        }) if *public => {
+                            glossary.public_definitions.insert(name.clone());
+                        }
+                        Definition::DataType(t) if t.public => {
+                            glossary.public_definitions.insert(t.name.clone());
+                            if !t.opaque {
+                                for constructor in t.constructors.iter() {
+                                    glossary
+                                        .public_constructors
+                                        .insert(constructor.name.clone());
+                                }
+                            }
+                        }
+                        Definition::Fn(_)
+                        | Definition::TypeAlias(_)
+                        | Definition::ModuleConstant(_)
+                        | Definition::DataType(_)
+                        | Definition::Use(_)
+                        | Definition::Test(_)
+                        | Definition::Validator(_)
+                        | Definition::Benchmark(_) => (),
+                    };
+
+                    glossary
+                });
+
+        if !glossary.is_empty() {
+            self.0.insert(module.name.clone(), glossary);
+        }
+    }
+
+    /// Check whether a module is in the glossary
+    pub fn find_module(&self, needle: &str) -> Option<&str> {
+        self.0
+            .keys()
+            .find(|module_name| module_name.ends_with(needle))
+            .map(|k| k.as_str())
+    }
+
+    /// Find a module with a matching definition
+    pub fn find_definition(&self, needle: &str) -> Vec<&str> {
+        self.0
+            .iter()
+            .filter(|(_, definitions)| {
+                definitions
+                    .public_definitions
+                    .iter()
+                    .any(|def| def == needle)
+            })
+            .map(|(k, _)| k.as_str())
+            .collect()
+    }
+
+    /// Find a module with a matching constructor
+    pub fn find_constructor(&self, needle: &str) -> Vec<&str> {
+        self.0
+            .iter()
+            .filter(|(_, definitions)| {
+                definitions
+                    .public_constructors
+                    .iter()
+                    .any(|def| def == needle)
+            })
+            .map(|(k, _)| k.as_str())
+            .collect()
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct ModuleGlossary {
+    public_definitions: BTreeSet<String>,
+    public_constructors: BTreeSet<String>,
+}
+
+impl ModuleGlossary {
+    pub fn is_empty(&self) -> bool {
+        self.public_definitions.is_empty() && self.public_constructors.is_empty()
+    }
+}
+
 pub struct ParsedModules(HashMap<String, ParsedModule>);
 
 impl ParsedModules {
     pub fn new() -> Self {
         Self(HashMap::new())
+    }
+
+    pub fn extends_glossary(&self, glossary: &mut Glossary) {
+        for module in self.0.values() {
+            glossary.add(module);
+        }
     }
 
     #[allow(clippy::result_large_err)]
@@ -343,7 +465,7 @@ impl CheckedModule {
 
         // Order definitions to avoid dissociating doc comments from them
         let mut definitions: Vec<_> = self.ast.definitions.iter_mut().collect();
-        definitions.sort_by(|a, b| a.location().start.cmp(&b.location().start));
+        definitions.sort_by_key(|a| a.location().start);
 
         // Doc Comments
         let mut doc_comments = self.extra.doc_comments.iter().peekable();
