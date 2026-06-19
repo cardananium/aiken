@@ -15,7 +15,7 @@ use pallas_primitives::conway::Language;
 
 use self::{
     cost_model::CostModel,
-    runtime::BuiltinRuntime,
+    runtime::{BuiltinRuntime, BuiltinSemantics},
     value::{Env, Value},
 };
 
@@ -85,7 +85,7 @@ pub struct Machine {
     unbudgeted_steps: [u32; 10],
     pub traces: Vec<Trace>,
     pub spend_counter: Option<[i64; (TERM_COUNT + BUILTIN_COUNT) * 2]>,
-    version: Language,
+    semantics: BuiltinSemantics,
 }
 
 impl Machine {
@@ -95,6 +95,8 @@ impl Machine {
         initial_budget: ExBudget,
         slippage: u32,
     ) -> Machine {
+        let semantics = BuiltinSemantics::for_language(&version);
+
         Machine {
             costs,
             ex_budget: initial_budget,
@@ -102,7 +104,28 @@ impl Machine {
             unbudgeted_steps: [0; 10],
             traces: vec![],
             spend_counter: None,
-            version,
+            semantics,
+        }
+    }
+
+    pub fn new_with_protocol(
+        version: Language,
+        protocol_major_version: u16,
+        costs: CostModel,
+        initial_budget: ExBudget,
+        slippage: u32,
+    ) -> Machine {
+        let semantics =
+            BuiltinSemantics::for_language_and_protocol(&version, protocol_major_version);
+
+        Machine {
+            costs,
+            ex_budget: initial_budget,
+            slippage,
+            unbudgeted_steps: [0; 10],
+            traces: vec![],
+            spend_counter: None,
+            semantics,
         }
     }
 
@@ -112,6 +135,8 @@ impl Machine {
         initial_budget: ExBudget,
         slippage: u32,
     ) -> Machine {
+        let semantics = BuiltinSemantics::for_language(&version);
+
         Machine {
             costs,
             ex_budget: initial_budget,
@@ -119,7 +144,28 @@ impl Machine {
             unbudgeted_steps: [0; 10],
             traces: vec![],
             spend_counter: Some([0; (TERM_COUNT + BUILTIN_COUNT) * 2]),
-            version,
+            semantics,
+        }
+    }
+
+    pub fn new_debug_with_protocol(
+        version: Language,
+        protocol_major_version: u16,
+        costs: CostModel,
+        initial_budget: ExBudget,
+        slippage: u32,
+    ) -> Machine {
+        let semantics =
+            BuiltinSemantics::for_language_and_protocol(&version, protocol_major_version);
+
+        Machine {
+            costs,
+            ex_budget: initial_budget,
+            slippage,
+            unbudgeted_steps: [0; 10],
+            traces: vec![],
+            spend_counter: Some([0; (TERM_COUNT + BUILTIN_COUNT) * 2]),
+            semantics,
         }
     }
 
@@ -391,7 +437,7 @@ impl Machine {
     }
 
     fn eval_builtin_app(&mut self, runtime: BuiltinRuntime) -> Result<Value, Error> {
-        let cost = runtime.to_ex_budget(&self.costs.builtin_costs)?;
+        let cost = runtime.to_ex_budget(&self.costs.builtin_costs, self.semantics)?;
 
         self.spend_budget(cost)?;
 
@@ -402,7 +448,7 @@ impl Machine {
             counter[i + 1] += cost.cpu;
         }
 
-        runtime.call(&self.version, &mut self.traces)
+        runtime.call(self.semantics, &mut self.traces)
     }
 
     fn lookup_var(&mut self, name: &NamedDeBruijn, env: &[Value], term_id: isize) -> Result<Value, Error> {

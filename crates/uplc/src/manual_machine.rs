@@ -4,7 +4,7 @@ use crate::ast::{NamedDeBruijn, Term};
 use crate::global_uniq::next_uniq_id;
 use crate::machine::{
     cost_model::{ExBudget, StepKind, CostModel},
-    runtime::BuiltinRuntime,
+    runtime::{BuiltinRuntime, BuiltinSemantics},
     value::{Value, Env},
     Context, MachineState, Trace, BUILTIN_COUNT, TERM_COUNT, Error,
 };
@@ -496,7 +496,9 @@ impl ManualMachine {
     }
 
     fn eval_builtin_app(&mut self, runtime: BuiltinRuntime) -> Result<Value, Error> {
-        let cost = runtime.to_ex_budget(&self.costs.builtin_costs)?;
+        let semantics = BuiltinSemantics::for_language(&self.version);
+
+        let cost = runtime.to_ex_budget(&self.costs.builtin_costs, semantics)?;
 
         self.spend_budget(cost)?;
 
@@ -507,7 +509,7 @@ impl ManualMachine {
             counter[i + 1] += cost.cpu;
         }
 
-        runtime.call(&self.version, &mut self.traces)
+        runtime.call(semantics, &mut self.traces)
     }
 
     fn lookup_var(&mut self, name: &NamedDeBruijn, env: &[Value], term_id: isize) -> Result<Value, Error> {
