@@ -41,6 +41,10 @@ pub struct ManualMachine {
     version: Language,
     /// Execution status
     status: ExecutionStatus,
+    /// uniq_id of the most recent term entered in a Compute step. After completion the Done state
+    /// holds a discharged value (synthetic id), so this is the last REAL source term that ran —
+    /// used to point "where execution finished" at actual code on a successful run.
+    last_term_id: isize,
 }
 
 impl ManualMachine {
@@ -75,6 +79,7 @@ impl ManualMachine {
             spend_counter: None,
             version,
             status: ExecutionStatus::Ready,
+            last_term_id: -1,
         })
     }
 
@@ -99,6 +104,12 @@ impl ManualMachine {
     /// Returns the current machine state
     pub fn current_state(&self) -> &MachineState {
         &self.state
+    }
+
+    /// uniq_id of the last term entered in a Compute step (the last real source term that ran),
+    /// or -1 if none. Useful for pointing at "where execution finished" once the machine is Done.
+    pub fn last_term_id(&self) -> isize {
+        self.last_term_id
     }
 
     /// Returns the current context (queue)
@@ -135,8 +146,9 @@ impl ManualMachine {
             MachineState::Compute(context, env, term) => {
                 // Capture the id of the term being computed before it is moved, so on failure the
                 // resulting Error state names the actual source term that failed (e.g. a source
-                // `(error)`) rather than the -1 sentinel.
+                // `(error)`) rather than the -1 sentinel; also record it as the last real term run.
                 let failing_id = term.uniq_id();
+                self.last_term_id = failing_id;
                 match self.compute(context, env, term) {
                     Ok(new_state) => {
                         self.state = new_state;
@@ -211,6 +223,7 @@ impl ManualMachine {
         self.status = ExecutionStatus::Ready;
         self.unbudgeted_steps = [0; 10];
         self.traces.clear();
+        self.last_term_id = -1;
         
         if let Some(counter) = &mut self.spend_counter {
             counter.fill(0);
