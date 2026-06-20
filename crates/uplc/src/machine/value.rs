@@ -40,6 +40,18 @@ pub enum Value {
 }
 
 impl Value {
+    /// The source term id this value originated from, if any. A bare `Con` constant result carries
+    /// no term id.
+    pub fn term_id(&self) -> Option<isize> {
+        match self {
+            Value::Con(_) => None,
+            Value::Delay { term_id, .. }
+            | Value::Lambda { term_id, .. }
+            | Value::Builtin { term_id, .. }
+            | Value::Constr { term_id, .. } => Some(*term_id),
+        }
+    }
+
     pub fn integer(n: BigInt) -> Self {
         let constant = Constant::Integer(n);
 

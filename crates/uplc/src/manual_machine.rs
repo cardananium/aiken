@@ -1,7 +1,6 @@
 use std::rc::Rc;
 
 use crate::ast::{NamedDeBruijn, Term};
-use crate::global_uniq::next_uniq_id;
 use crate::machine::{
     cost_model::{ExBudget, StepKind, CostModel},
     runtime::{BuiltinRuntime, BuiltinSemantics},
@@ -126,25 +125,40 @@ impl ManualMachine {
             return &self.status;
         }
 
-        match std::mem::replace(&mut self.state, MachineState::Done(Term::Error { uniq_id: next_uniq_id() })) {
+        // The replaced-in value is only a temporary placeholder so we can move `self.state` out
+        // (mem::replace). It is overwritten on the Ready path and only survives into `self.state`
+        // when a step errors — so it must be a STABLE sentinel, not `next_uniq_id()`. Using a fresh
+        // global id here burned one id per step and, because the global counter never resets in a
+        // long-lived host (e.g. the de-uplc-web worker), made the error term's id differ every run.
+        // -1 matches the engine's "no specific term" sentinel and is fully deterministic.
+        match std::mem::replace(&mut self.state, MachineState::Done(Term::Error { uniq_id: -1 })) {
             MachineState::Compute(context, env, term) => {
+                // Capture the id of the term being computed before it is moved, so on failure the
+                // resulting Error state names the actual source term that failed (e.g. a source
+                // `(error)`) rather than the -1 sentinel.
+                let failing_id = term.uniq_id();
                 match self.compute(context, env, term) {
                     Ok(new_state) => {
                         self.state = new_state;
                         self.status = ExecutionStatus::Ready;
                     }
                     Err(error) => {
+                        self.state = MachineState::Done(Term::Error { uniq_id: failing_id });
                         self.status = ExecutionStatus::Error(error);
                     }
                 }
             }
             MachineState::Return(context, value) => {
+                // The value being returned carries the id of the term it came from (a failing
+                // builtin application, etc.); `Con` constants have none, so fall back to -1.
+                let failing_id = value.term_id().unwrap_or(-1);
                 match self.return_compute(context, value) {
                     Ok(new_state) => {
                         self.state = new_state;
                         self.status = ExecutionStatus::Ready;
                     }
                     Err(error) => {
+                        self.state = MachineState::Done(Term::Error { uniq_id: failing_id });
                         self.status = ExecutionStatus::Error(error);
                     }
                 }

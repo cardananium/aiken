@@ -361,6 +361,22 @@ pub enum Term<T> {
 }
 
 impl<T> Term<T> {
+    /// The term's unique id (every variant carries one).
+    pub fn uniq_id(&self) -> isize {
+        match self {
+            Term::Var { uniq_id, .. }
+            | Term::Delay { uniq_id, .. }
+            | Term::Lambda { uniq_id, .. }
+            | Term::Apply { uniq_id, .. }
+            | Term::Constant { uniq_id, .. }
+            | Term::Force { uniq_id, .. }
+            | Term::Error { uniq_id, .. }
+            | Term::Builtin { uniq_id, .. }
+            | Term::Constr { uniq_id, .. }
+            | Term::Case { uniq_id, .. } => *uniq_id,
+        }
+    }
+
     pub fn is_constant(&self) -> bool {
         matches!(self, Term::Constant { .. })
             || matches!(self, Term::Delay { body: term, .. } | Term::Force { body: term, .. } if term.is_constant())
