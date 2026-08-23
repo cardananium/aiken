@@ -167,7 +167,11 @@ where
 {
     fn decode(d: &mut Decoder) -> Result<Self, de::Error> {
         let version = (usize::decode(d)?, usize::decode(d)?, usize::decode(d)?);
-        let term_start = d.pos;
+        // Flat is bit-addressed, so a position is a byte offset AND a bit
+        // offset within that byte. Rewinding needs both: restoring `pos`
+        // alone resumes on the right byte at whatever bit the failed decode
+        // stopped on.
+        let (term_pos, term_used_bits) = (d.pos, d.used_bits);
 
         match Term::decode(d) {
             Ok(term) => Ok(Program { version, term }),
@@ -175,7 +179,8 @@ where
             // the term it was. Rewind and re-run the recursive decoder, whose
             // state log names the path it took, purely to build the message.
             Err(fast_error) => {
-                d.pos = term_start;
+                d.pos = term_pos;
+                d.used_bits = term_used_bits;
 
                 let mut state_log: Vec<String> = vec![];
 
@@ -1315,5 +1320,39 @@ mod tests {
         let program = parser::program(source).unwrap();
 
         assert_eq!(program.to_pretty(), source);
+    }
+
+    /// A malformed program must still report WHERE decoding failed, not just
+    /// what failed. `Program::decode` runs the fast iterative decoder and, on
+    /// error, rewinds and re-runs the recursive one purely to build that
+    /// message. Flat is bit-addressed, so the rewind has to restore the bit
+    /// offset as well as the byte offset — restoring `pos` alone resumes on
+    /// the right byte at the wrong bit and the path it reports is nonsense.
+    #[test]
+    fn flat_decode_error_reports_the_path_into_the_term() {
+        let source = indoc! { r#"
+            (program
+              1.0.0
+              (lam x (delay (con integer 11)))
+            )"#};
+
+        let program = parser::program(source).unwrap();
+        let bytes = program.to_flat().unwrap();
+
+        // Cut the term short so decoding runs off the end inside the `delay`.
+        let truncated = &bytes[..bytes.len() - 6];
+
+        let error = Program::<DeBruijn>::unflat(truncated)
+            .expect_err("a truncated program must not decode");
+
+        // The state log names the constructors it walked into before the
+        // failure. Reaching the `lam` proves the rewind landed on the exact
+        // bit the term starts at.
+        let message = format!("{error}");
+
+        assert!(
+            message.contains("(lam") && message.contains("(delay"),
+            "decode error lost the path into the term: {message}"
+        );
     }
 }
