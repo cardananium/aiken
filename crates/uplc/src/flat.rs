@@ -283,6 +283,10 @@ where
             6 => Ok(Term::Error {
                 uniq_id: next_uniq_id(),
             }),
+            7 => Ok(Term::Builtin {
+                fun: DefaultFunction::decode(d)?,
+                uniq_id: next_uniq_id(),
+            }),
             8 => {
                 let tag = usize::decode(d)?;
                 let fields = d.decode_list_with(Term::<T>::decode)?;
