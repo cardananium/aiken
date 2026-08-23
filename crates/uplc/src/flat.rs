@@ -166,16 +166,27 @@ where
     T: Binder<'b>,
 {
     fn decode(d: &mut Decoder) -> Result<Self, de::Error> {
-        let mut state_log: Vec<String> = vec![];
         let version = (usize::decode(d)?, usize::decode(d)?, usize::decode(d)?);
-        let term_option = Term::decode_debug(d, &mut state_log);
+        let term_start = d.pos;
 
-        match term_option {
+        match Term::decode(d) {
             Ok(term) => Ok(Program { version, term }),
-            Err(error) => Err(de::Error::Message(format!(
-                "{} {error}",
-                state_log.join("")
-            ))),
+            // The iterative decoder reports what went wrong but not where in
+            // the term it was. Rewind and re-run the recursive decoder, whose
+            // state log names the path it took, purely to build the message.
+            Err(fast_error) => {
+                d.pos = term_start;
+
+                let mut state_log: Vec<String> = vec![];
+
+                match Term::<T>::decode_debug(d, &mut state_log) {
+                    Ok(_) => Err(fast_error),
+                    Err(error) => Err(de::Error::Message(format!(
+                        "{} {error}",
+                        state_log.join("")
+                    ))),
+                }
+            }
         }
     }
 }
@@ -252,73 +263,141 @@ where
     T: Binder<'b>,
 {
     fn decode(d: &mut Decoder) -> Result<Self, de::Error> {
-        match decode_term_tag(d)? {
-            0 => Ok(Term::Var {
-                name: T::decode(d)?.into(),
-                uniq_id: next_uniq_id(),
-            }),
-            1 => Ok(Term::Delay {
-                body: Rc::new(Term::decode(d)?),
-                uniq_id: next_uniq_id(),
-            }),
-            2 => Ok(Term::Lambda {
-                parameter_name: T::binder_decode(d)?.into(),
-                body: Rc::new(Term::decode(d)?),
-                uniq_id: next_uniq_id(),
-            }),
-            3 => Ok(Term::Apply {
-                function: Rc::new(Term::decode(d)?),
-                argument: Rc::new(Term::decode(d)?),
-                uniq_id: next_uniq_id(),
-            }),
-            // Need size limit for Constant
-            4 => Ok(Term::Constant {
-                value: Constant::decode(d)?.into(),
-                uniq_id: next_uniq_id(),
-            }),
-            5 => Ok(Term::Force {
-                body: Rc::new(Term::decode(d)?),
-                uniq_id: next_uniq_id(),
-            }),
-            6 => Ok(Term::Error {
-                uniq_id: next_uniq_id(),
-            }),
-            7 => Ok(Term::Builtin {
-                fun: DefaultFunction::decode(d)?,
-                uniq_id: next_uniq_id(),
-            }),
-            8 => {
-                let tag = usize::decode(d)?;
-                let fields = d.decode_list_with(Term::<T>::decode)?;
-                let uniq_id = next_uniq_id();
+        enum Frame<U> {
+            Delay,
+            Force,
+            Lambda { parameter_name: Rc<U> },
+            ApplyFn,
+            ApplyArg { function: Rc<Term<U>> },
+        }
 
-                Ok(Term::Constr { tag, fields, uniq_id })
+        let mut frames: Vec<Frame<T>> = Vec::new();
+        let mut current: Option<Term<T>> = None;
+
+        loop {
+            if current.is_none() {
+                let parsed = match decode_term_tag(d)? {
+                    0 => Term::Var {
+                        name: T::decode(d)?.into(),
+                        uniq_id: next_uniq_id(),
+                    },
+                    1 => {
+                        frames.push(Frame::Delay);
+                        continue;
+                    }
+                    2 => {
+                        let parameter_name: Rc<T> = T::binder_decode(d)?.into();
+                        frames.push(Frame::Lambda { parameter_name });
+                        continue;
+                    }
+                    3 => {
+                        frames.push(Frame::ApplyFn);
+                        continue;
+                    }
+                    // Need size limit for Constant
+                    4 => Term::Constant {
+                        value: Constant::decode(d)?.into(),
+                        uniq_id: next_uniq_id(),
+                    },
+                    5 => {
+                        frames.push(Frame::Force);
+                        continue;
+                    }
+                    6 => Term::Error {
+                        uniq_id: next_uniq_id(),
+                    },
+                    7 => Term::Builtin {
+                        fun: DefaultFunction::decode(d)?,
+                        uniq_id: next_uniq_id(),
+                    },
+                    8 => {
+                        let tag = usize::decode(d)?;
+                        let fields = d.decode_list_with(Term::<T>::decode)?;
+                        let uniq_id = next_uniq_id();
+                        Term::Constr {
+                            tag,
+                            fields,
+                            uniq_id,
+                        }
+                    }
+                    9 => {
+                        let constr = Rc::new(Term::<T>::decode(d)?);
+                        let branches = d.decode_list_with(Term::<T>::decode)?;
+                        let uniq_id = next_uniq_id();
+                        Term::Case {
+                            constr,
+                            branches,
+                            uniq_id,
+                        }
+                    }
+                    x => {
+                        let buffer_slice: Vec<u8> = d
+                            .buffer
+                            .to_vec()
+                            .iter()
+                            .skip(d.pos.saturating_sub(5))
+                            .take(10)
+                            .cloned()
+                            .collect();
+
+                        return Err(de::Error::UnknownTermConstructor(
+                            x,
+                            if d.pos > 5 { 5 } else { d.pos },
+                            format!("{buffer_slice:02X?}"),
+                            d.pos,
+                            d.buffer.len(),
+                        ));
+                    }
+                };
+
+                current = Some(parsed);
             }
-            9 => {
-                let constr = (Term::<T>::decode(d)?).into();
 
-                let branches = d.decode_list_with(Term::<T>::decode)?;
-                let uniq_id = next_uniq_id();
-
-                Ok(Term::Case { constr, branches, uniq_id })
+            while let Some(frame) = frames.pop() {
+                match frame {
+                    Frame::Delay => {
+                        let body = Rc::new(current.take().expect("term present"));
+                        current = Some(Term::Delay {
+                            body,
+                            uniq_id: next_uniq_id(),
+                        });
+                    }
+                    Frame::Force => {
+                        let body = Rc::new(current.take().expect("term present"));
+                        current = Some(Term::Force {
+                            body,
+                            uniq_id: next_uniq_id(),
+                        });
+                    }
+                    Frame::Lambda { parameter_name } => {
+                        let body = Rc::new(current.take().expect("term present"));
+                        current = Some(Term::Lambda {
+                            parameter_name,
+                            body,
+                            uniq_id: next_uniq_id(),
+                        });
+                    }
+                    Frame::ApplyFn => {
+                        let function = Rc::new(current.take().expect("term present"));
+                        frames.push(Frame::ApplyArg { function });
+                        current = None;
+                        break;
+                    }
+                    Frame::ApplyArg { function } => {
+                        let argument = Rc::new(current.take().expect("term present"));
+                        current = Some(Term::Apply {
+                            function,
+                            argument,
+                            uniq_id: next_uniq_id(),
+                        });
+                    }
+                }
             }
-            x => {
-                let buffer_slice: Vec<u8> = d
-                    .buffer
-                    .to_vec()
-                    .iter()
-                    .skip(d.pos.saturating_sub(5))
-                    .take(10)
-                    .cloned()
-                    .collect();
 
-                Err(de::Error::UnknownTermConstructor(
-                    x,
-                    if d.pos > 5 { 5 } else { d.pos },
-                    format!("{buffer_slice:02X?}"),
-                    d.pos,
-                    d.buffer.len(),
-                ))
+            if frames.is_empty() {
+                if let Some(done) = current.take() {
+                    return Ok(done);
+                }
             }
         }
     }
