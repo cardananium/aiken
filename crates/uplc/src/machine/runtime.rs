@@ -1114,7 +1114,7 @@ impl DefaultFunction {
                 let d1 = args[0].unwrap_data()?;
                 let d2 = args[1].unwrap_data()?;
 
-                let value = Value::bool(d1.eq(d2));
+                let value = Value::bool(plutus_data_structural_eq(d1, d2));
 
                 Ok(value)
             }
@@ -2081,5 +2081,57 @@ mod tests {
     #[test]
     fn to_any_tag() {
         assert_eq!(convert_tag_to_constr(102), None);
+    }
+}
+
+/// `equalsData` on the ledger's own terms.
+///
+/// Plutus `Data` is a pure algebraic value — `Constr Integer [Data] | Map | List
+/// | I | B`. It carries no record of how it was serialised. `PlutusData` here
+/// does: `MaybeIndefArray`/`KeyValuePairs` remember definite vs indefinite CBOR,
+/// `BigInt` remembers whether a small number arrived as a machine int or a
+/// bignum, and a constructor remembers whether it arrived under tag 121..127 or
+/// under tag 102 with an explicit index. Derived `PartialEq` compares all of
+/// that, so two values the node calls equal compare unequal here whenever they
+/// reached the machine by different routes — a datum lifted verbatim off the
+/// chain against the same value rebuilt while constructing a script context.
+///
+/// This compares the algebraic value and nothing else.
+fn plutus_data_structural_eq(left: &PlutusData, right: &PlutusData) -> bool {
+    match (left, right) {
+        (PlutusData::Constr(a), PlutusData::Constr(b)) => {
+            constr_index(a) == constr_index(b)
+                && a.fields.len() == b.fields.len()
+                && a.fields
+                    .iter()
+                    .zip(b.fields.iter())
+                    .all(|(x, y)| plutus_data_structural_eq(x, y))
+        }
+        (PlutusData::Map(a), PlutusData::Map(b)) => {
+            a.len() == b.len()
+                && a.iter().zip(b.iter()).all(|((ak, av), (bk, bv))| {
+                    plutus_data_structural_eq(ak, bk) && plutus_data_structural_eq(av, bv)
+                })
+        }
+        (PlutusData::Array(a), PlutusData::Array(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(x, y)| plutus_data_structural_eq(x, y))
+        }
+        (PlutusData::BoundedBytes(a), PlutusData::BoundedBytes(b)) => a.deref() == b.deref(),
+        (PlutusData::BigInt(a), PlutusData::BigInt(b)) => {
+            from_pallas_bigint(a) == from_pallas_bigint(b)
+        }
+        _ => false,
+    }
+}
+
+/// The constructor index the ledger sees, whatever tag carried it.
+fn constr_index(constr: &pallas_primitives::conway::Constr<PlutusData>) -> u64 {
+    match constr.any_constructor {
+        Some(index) => index,
+        None if constr.tag >= 1280 => constr.tag - 1280 + 7,
+        None => constr.tag.saturating_sub(121),
     }
 }
