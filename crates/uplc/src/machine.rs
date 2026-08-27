@@ -1,4 +1,4 @@
-use std::{fmt::Display, rc::Rc};
+use std::{fmt::Display, mem, rc::Rc};
 
 use crate::ast::{Constant, NamedDeBruijn, Term, Type};
 
@@ -42,6 +42,55 @@ pub enum Context {
     ),
     FrameCases(Env, Vec<Term<NamedDeBruijn>>, Box<Context>),
     NoFrame,
+}
+
+/// The machine's control stack is a linked list of frames, one per pending application, force or
+/// case — so its length tracks the nesting depth of the term being evaluated, which is
+/// attacker-controlled just as the term itself is (see the `Drop` impl on `Term` in `ast.rs` for
+/// the full rationale). The derived destructor would unwind it one stack frame per machine frame,
+/// which is not survivable on `wasm32`. Do not remove this as redundant.
+impl Drop for Context {
+    fn drop(&mut self) {
+        let mut pending: Vec<Context> = Vec::new();
+
+        detach_context_child(self, &mut pending);
+
+        while let Some(mut context) = pending.pop() {
+            detach_context_child(&mut context, &mut pending);
+        }
+    }
+}
+
+/// Move the frame below `context` onto `pending`, leaving `context` at the bottom of the stack.
+///
+/// Unlike the `Rc` children of a term, a frame's tail is a `Box` and is therefore owned outright:
+/// there is never another holder to consider, so it is always ours to take. The `NoFrame` left
+/// behind is what makes the shallow `Drop` of the husk terminate immediately.
+fn detach_context_child(context: &mut Context, pending: &mut Vec<Context>) {
+    let tail = match context {
+        Context::NoFrame => return,
+        Context::FrameAwaitArg(_, tail)
+        | Context::FrameAwaitFunTerm(_, _, tail)
+        | Context::FrameAwaitFunValue(_, tail)
+        | Context::FrameForce(tail)
+        | Context::FrameConstr(_, _, _, _, tail, _)
+        | Context::FrameCases(_, _, tail) => tail,
+    };
+
+    let tail = take_context_tail(tail);
+
+    if !matches!(tail, Context::NoFrame) {
+        pending.push(tail);
+    }
+}
+
+/// Unlink a frame's tail, leaving `NoFrame` behind.
+///
+/// `Context` carries a manual `Drop` (see above), so the machine cannot move a tail out of a frame
+/// by pattern any more. Taking it this way is the same cost — no allocation, and the husk left
+/// behind drops for free.
+pub(crate) fn take_context_tail(tail: &mut Box<Context>) -> Context {
+    mem::replace(tail.as_mut(), Context::NoFrame)
 }
 
 pub const TERM_COUNT: usize = 9;
@@ -193,13 +242,17 @@ impl Machine {
         &mut self,
         context: Context,
         env: Env,
-        term: Term<NamedDeBruijn>,
+        mut term: Term<NamedDeBruijn>,
     ) -> Result<MachineState, Error> {
-        match term {
+        // `Term` carries a manual, iterative `Drop` (see `ast.rs`), which makes the compiler
+        // reject moving fields out of it by pattern. Matching on `&mut` instead costs nothing:
+        // every field taken here is either `Copy`, a cheap `Rc` handle, or a vector we can take
+        // outright.
+        match &mut term {
             Term::Var { name, uniq_id } => {
                 self.step_and_maybe_spend(StepKind::Var)?;
 
-                let val = self.lookup_var(name.as_ref(), &env, uniq_id)?;
+                let val = self.lookup_var(name.as_ref(), &env, *uniq_id)?;
 
                 Ok(MachineState::Return(context, val))
             }
@@ -207,9 +260,9 @@ impl Machine {
                 self.step_and_maybe_spend(StepKind::Delay)?;
 
                 Ok(MachineState::Return(context, Value::Delay {
-                    body,
+                    body: Rc::clone(body),
                     env,
-                    term_id: uniq_id,
+                    term_id: *uniq_id,
                 }))
             }
             Term::Lambda {
@@ -222,10 +275,10 @@ impl Machine {
                 Ok(MachineState::Return(
                     context,
                     Value::Lambda {
-                        parameter_name,
-                        body,
+                        parameter_name: Rc::clone(parameter_name),
+                        body: Rc::clone(body),
                         env,
-                        term_id: uniq_id,
+                        term_id: *uniq_id,
                     },
                 ))
             }
@@ -245,7 +298,7 @@ impl Machine {
             Term::Constant { value, .. } => {
                 self.step_and_maybe_spend(StepKind::Constant)?;
 
-                Ok(MachineState::Return(context, Value::Con(value)))
+                Ok(MachineState::Return(context, Value::Con(Rc::clone(value))))
             }
             Term::Force { body, .. } => {
                 self.step_and_maybe_spend(StepKind::Force)?;
@@ -260,15 +313,20 @@ impl Machine {
             Term::Builtin { fun, uniq_id } => {
                 self.step_and_maybe_spend(StepKind::Builtin)?;
 
+                let fun = *fun;
+
                 let runtime: BuiltinRuntime = fun.into();
 
                 Ok(MachineState::Return(
                     context,
-                    Value::Builtin { fun, runtime, term_id: uniq_id },
+                    Value::Builtin { fun, runtime, term_id: *uniq_id },
                 ))
             }
-            Term::Constr { tag, mut fields, uniq_id } => {
+            Term::Constr { tag, fields, uniq_id } => {
                 self.step_and_maybe_spend(StepKind::Constr)?;
+
+                let (tag, uniq_id) = (*tag, *uniq_id);
+                let mut fields = mem::take(fields);
 
                 fields.reverse();
 
@@ -295,7 +353,7 @@ impl Machine {
                 self.step_and_maybe_spend(StepKind::Case)?;
 
                 Ok(MachineState::Compute(
-                    Context::FrameCases(env.clone(), branches, context.into()),
+                    Context::FrameCases(env.clone(), mem::take(branches), context.into()),
                     env,
                     constr.as_ref().clone(),
                 ))
@@ -303,8 +361,16 @@ impl Machine {
         }
     }
 
-    fn return_compute(&mut self, context: Context, value: Value) -> Result<MachineState, Error> {
-        match context {
+    fn return_compute(
+        &mut self,
+        mut context: Context,
+        mut value: Value,
+    ) -> Result<MachineState, Error> {
+        // `Context` and `Value` both carry a manual, iterative `Drop` (see above and
+        // `machine/value.rs`), which makes the compiler reject moving their fields out by pattern.
+        // Every arm below takes only what it needs and leaves a free-to-drop husk in its place:
+        // `NoFrame` for a tail, an empty `Constr` for a value, `Error` for a term.
+        match &mut context {
             Context::NoFrame => {
                 if self.unbudgeted_steps[9] > 0 {
                     self.spend_unbudgeted_steps()?;
@@ -314,19 +380,46 @@ impl Machine {
 
                 Ok(MachineState::Done(term))
             }
-            Context::FrameForce(ctx) => self.force_evaluate(*ctx, value),
-            Context::FrameAwaitFunTerm(arg_env, arg, ctx) => Ok(MachineState::Compute(
-                Context::FrameAwaitArg(value, ctx),
-                arg_env,
-                arg,
-            )),
-            Context::FrameAwaitArg(fun, ctx) => self.apply_evaluate(*ctx, fun, value),
-            Context::FrameAwaitFunValue(arg, ctx) => self.apply_evaluate(*ctx, value, arg),
-            Context::FrameConstr(env, tag, mut fields, mut resolved_fields, ctx, term_id) => {
+            Context::FrameForce(ctx) => {
+                let ctx = take_context_tail(ctx);
+
+                self.force_evaluate(ctx, value)
+            }
+            Context::FrameAwaitFunTerm(arg_env, arg, ctx) => {
+                let arg_env = Rc::clone(arg_env);
+                let arg = mem::replace(arg, Term::Error { uniq_id: 0 });
+                // This is one of the two places the tail has to stay boxed, so it is re-boxed
+                // rather than unlinked in place.
+                let ctx = mem::replace(ctx, Box::new(Context::NoFrame));
+
+                Ok(MachineState::Compute(
+                    Context::FrameAwaitArg(value, ctx),
+                    arg_env,
+                    arg,
+                ))
+            }
+            Context::FrameAwaitArg(fun, ctx) => {
+                let fun = mem::replace(fun, Value::husk());
+                let ctx = take_context_tail(ctx);
+
+                self.apply_evaluate(ctx, fun, value)
+            }
+            Context::FrameAwaitFunValue(arg, ctx) => {
+                let arg = mem::replace(arg, Value::husk());
+                let ctx = take_context_tail(ctx);
+
+                self.apply_evaluate(ctx, value, arg)
+            }
+            Context::FrameConstr(env, tag, fields, resolved_fields, ctx, term_id) => {
+                let (env, tag, term_id) = (Rc::clone(env), *tag, *term_id);
+                let mut fields = mem::take(fields);
+                let mut resolved_fields = mem::take(resolved_fields);
+
                 resolved_fields.push(value);
 
                 if !fields.is_empty() {
                     let popped_field = fields.pop().unwrap();
+                    let ctx = mem::replace(ctx, Box::new(Context::NoFrame));
 
                     Ok(MachineState::Compute(
                         Context::FrameConstr(env.clone(), tag, fields, resolved_fields, ctx, term_id),
@@ -335,7 +428,7 @@ impl Machine {
                     ))
                 } else {
                     Ok(MachineState::Return(
-                        *ctx,
+                        take_context_tail(ctx),
                         Value::Constr {
                             tag,
                             fields: resolved_fields,
@@ -344,29 +437,46 @@ impl Machine {
                     ))
                 }
             }
-            Context::FrameCases(env, branches, ctx,) => match value {
-                Value::Constr { tag, fields, term_id } => match branches.get(tag) {
-                    Some(t) => Ok(MachineState::Compute(
-                        transfer_arg_stack(fields, *ctx),
-                        env,
-                        t.clone(),
-                    )),
-                    None => Err(Error::MissingCaseBranch(
-                        branches,
-                        Value::Constr { tag, fields, term_id: term_id },
-                    )),
-                },
-                v => Err(Error::NonConstrScrutinized(v)),
-            },
+            Context::FrameCases(env, branches, ctx) => {
+                let env = Rc::clone(env);
+                let branches = mem::take(branches);
+                let ctx = take_context_tail(ctx);
+
+                // The scrutinee's fields are only taken on the branch that consumes them; the
+                // error branches hand the value on untouched.
+                match &mut value {
+                    Value::Constr { tag, fields, .. } => match branches.get(*tag) {
+                        Some(t) => {
+                            let t = t.clone();
+
+                            Ok(MachineState::Compute(
+                                transfer_arg_stack(mem::take(fields), ctx),
+                                env,
+                                t,
+                            ))
+                        }
+                        None => Err(Error::MissingCaseBranch(branches, value)),
+                    },
+                    _ => Err(Error::NonConstrScrutinized(value)),
+                }
+            }
         }
     }
 
-    fn force_evaluate(&mut self, context: Context, value: Value) -> Result<MachineState, Error> {
-        match value {
-            Value::Delay { body, env, .. } => {
-                Ok(MachineState::Compute(context, env, body.as_ref().clone()))
-            }
-            Value::Builtin { fun, mut runtime, term_id } => {
+    fn force_evaluate(&mut self, context: Context, mut value: Value) -> Result<MachineState, Error> {
+        // `Value` carries a manual, iterative `Drop` (see `machine/value.rs`), which makes the
+        // compiler reject moving fields out of it by pattern. The runtime is swapped out for a
+        // fresh, empty one instead — same cost, and the husk left behind drops for free.
+        match &mut value {
+            Value::Delay { body, env, .. } => Ok(MachineState::Compute(
+                context,
+                Rc::clone(env),
+                body.as_ref().clone(),
+            )),
+            Value::Builtin { fun, runtime, term_id } => {
+                let (fun, term_id) = (*fun, *term_id);
+                let mut runtime = mem::replace(runtime, BuiltinRuntime::new(fun));
+
                 if runtime.needs_force() {
                     runtime.consume_force();
 
@@ -387,19 +497,24 @@ impl Machine {
                     Err(Error::BuiltinTermArgumentExpected(term))
                 }
             }
-            rest => Err(Error::NonPolymorphicInstantiation(rest)),
+            _ => Err(Error::NonPolymorphicInstantiation(value)),
         }
     }
 
     fn apply_evaluate(
         &mut self,
         context: Context,
-        function: Value,
+        mut function: Value,
         argument: Value,
     ) -> Result<MachineState, Error> {
-        match function {
-            Value::Lambda { body, mut env, .. } => {
-                let e = Rc::make_mut(&mut env);
+        // `Value` carries a manual, iterative `Drop` (see `machine/value.rs`), which makes the
+        // compiler reject moving fields out of it by pattern; the payloads are taken out
+        // explicitly instead.
+        match &mut function {
+            Value::Lambda { body, env, .. } => {
+                let body = Rc::clone(body);
+
+                let e = Rc::make_mut(env);
 
                 e.push(argument);
 
@@ -410,6 +525,9 @@ impl Machine {
                 ))
             }
             Value::Builtin { fun, runtime, term_id } => {
+                let (fun, term_id) = (*fun, *term_id);
+                let runtime = mem::replace(runtime, BuiltinRuntime::new(fun));
+
                 if runtime.is_arrow() && !runtime.needs_force() {
                     let mut runtime = runtime;
 
@@ -432,7 +550,7 @@ impl Machine {
                     Err(Error::UnexpectedBuiltinTermArgument(term))
                 }
             }
-            rest => Err(Error::NonFunctionalApplication(rest, argument)),
+            _ => Err(Error::NonFunctionalApplication(function, argument)),
         }
     }
 
@@ -542,11 +660,29 @@ impl From<&Constant> for Type {
 mod tests {
     use num_bigint::BigInt;
 
-    use super::{cost_model::ExBudget, runtime::Compressable};
+    use super::{Context, cost_model::ExBudget, runtime::Compressable};
     use crate::{
         ast::{Constant, NamedDeBruijn, Program, Term},
         builtins::DefaultFunction,
     };
+
+    /// Deep enough that a destructor taking one stack frame per level cannot survive the test
+    /// harness's ~2 MiB thread stack, let alone the ~1 MiB a `wasm32` engine gives us.
+    const DEEP: usize = 100_000;
+
+    /// The control stack grows one frame per pending force/apply, so its depth follows the nesting
+    /// depth of the term being evaluated, which is attacker-controlled. Built with a loop on
+    /// purpose: a recursive builder would overflow before the drop ever ran.
+    #[test]
+    fn deep_context_drops_without_overflowing_the_stack() {
+        let mut context = Context::NoFrame;
+
+        for _ in 0..DEEP {
+            context = Context::FrameForce(Box::new(context));
+        }
+
+        drop(context);
+    }
 
     #[test]
     fn add_big_ints() {

@@ -87,7 +87,9 @@ impl EvalResult {
 
     #[allow(clippy::result_unit_err)]
     pub fn unwrap_constant(self) -> Result<Constant, ()> {
-        match self.result {
+        // `Term` has a manual `Drop` (see `ast.rs`), so its fields cannot be moved out by
+        // pattern; the constant is cloned out of the borrow instead, exactly as before.
+        match &self.result {
             Ok(Term::Constant { value, .. }) => Ok(value.as_ref().to_owned()),
             _ => Err(()),
         }

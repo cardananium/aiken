@@ -29,6 +29,7 @@ use std::{
     convert::AsRef,
     fmt::{self, Display},
     hash::{self, Hash},
+    mem,
     rc::Rc,
 };
 
@@ -456,8 +457,10 @@ impl<T> TryInto<PlutusData> for Term<T> {
     type Error = String;
 
     fn try_into(self) -> Result<PlutusData, String> {
-        match self {
-            Term::Constant { value: rc, .. } => match &*rc {
+        // `Term` has a manual `Drop` (see below), so its fields cannot be moved out by pattern.
+        // Nothing is moved out here anyway: the data is copied out of the borrowed constant.
+        match &self {
+            Term::Constant { value: rc, .. } => match rc.as_ref() {
                 Constant::Data(data) => Ok(data.to_owned()),
                 _ => Err("not a data".to_string()),
             },
@@ -472,6 +475,100 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.to_pretty())
+    }
+}
+
+/// The compiler-derived destructor for `Term` is recursive: dropping a node drops its `Rc`
+/// children, which drop theirs, one stack frame per level of nesting. The nesting depth of a
+/// term is attacker-controlled — the cheapest flat encoding of one level is a single 4-bit
+/// `delay` (or `force`) tag, so a script that fits inside the on-chain size limit is already
+/// tens of thousands of levels deep — and on `wasm32` the engine's call stack is about a
+/// megabyte and cannot be grown from the page. `Term::decode` is iterative for exactly that
+/// reason; without this impl, a term that decodes fine still blows the stack when it is
+/// released. Do not remove this as redundant.
+///
+/// The teardown moves every child out of the node it is dismantling and onto an explicit
+/// worklist, so the stack stays O(1) no matter how deep the tree is.
+impl<T> Drop for Term<T> {
+    fn drop(&mut self) {
+        let mut pending: Vec<Term<T>> = Vec::new();
+        let mut filler: Option<Rc<Term<T>>> = None;
+
+        detach_term_children(self, &mut pending, &mut filler);
+
+        while let Some(mut term) = pending.pop() {
+            detach_term_children(&mut term, &mut pending, &mut filler);
+
+            // Every child `term` owned has been moved onto `pending`, so the `Drop` that runs
+            // here is shallow: it re-enters this impl once, finds nothing left to detach, and
+            // returns without recursing any further.
+        }
+    }
+}
+
+/// Move the children `term` solely owns onto `pending`, leaving `term` childless.
+fn detach_term_children<T>(
+    term: &mut Term<T>,
+    pending: &mut Vec<Term<T>>,
+    filler: &mut Option<Rc<Term<T>>>,
+) {
+    match term {
+        Term::Var { .. }
+        | Term::Constant { .. }
+        | Term::Error { .. }
+        | Term::Builtin { .. } => {}
+
+        Term::Delay { body, .. } | Term::Lambda { body, .. } | Term::Force { body, .. } => {
+            detach_term_child(body, pending, filler);
+        }
+
+        Term::Apply {
+            function, argument, ..
+        } => {
+            detach_term_child(function, pending, filler);
+            detach_term_child(argument, pending, filler);
+        }
+
+        Term::Constr { fields, .. } => {
+            // Fields are owned outright, so they always come along.
+            pending.append(fields);
+        }
+
+        Term::Case {
+            constr, branches, ..
+        } => {
+            detach_term_child(constr, pending, filler);
+            pending.append(branches);
+        }
+    }
+}
+
+/// Take the subtree behind `slot`, but only when we are its sole owner.
+///
+/// `Rc` children may be shared, and a shared subtree is not ours to dismantle: unwrapping it
+/// would strip it out from under the other holders. So we look at the strong count first — the
+/// exact condition under which `Rc::try_unwrap` hands the value back — and when the handle is
+/// shared we leave it where it is. Dropping a shared `Rc` along with its node is O(1) and never
+/// touches the pointee, so nothing recurses.
+///
+/// When we *are* the sole owner we swap in a leaf before unwrapping, so the node we are
+/// dismantling is left holding something harmless. That stand-in is a clone of a single `Error`
+/// leaf shared by the whole teardown, which means the shallow `Drop` that later visits those
+/// slots sees a strong count above one and skips them — no allocation, no extra work per node.
+fn detach_term_child<T>(
+    slot: &mut Rc<Term<T>>,
+    pending: &mut Vec<Term<T>>,
+    filler: &mut Option<Rc<Term<T>>>,
+) {
+    if Rc::strong_count(slot) != 1 {
+        return;
+    }
+
+    // The leaf never escapes this teardown, so its id is never observed.
+    let filler = filler.get_or_insert_with(|| Rc::new(Term::Error { uniq_id: 0 }));
+
+    if let Ok(term) = Rc::try_unwrap(mem::replace(slot, Rc::clone(filler))) {
+        pending.push(term);
     }
 }
 
@@ -500,6 +597,72 @@ pub enum Constant {
     Bls12_381G1Element(Box<blst::blst_p1>),
     Bls12_381G2Element(Box<blst::blst_p2>),
     Bls12_381MlResult(Box<blst::blst_fp12>),
+}
+
+/// `Constant` nests through `ProtoList` and `ProtoPair`, and its depth is attacker-controlled
+/// the same way `Term`'s is: the element type is a run of 4-bit tags, so `list (list (list …))`
+/// costs a couple of bytes per level and an in-limit script reaches thousands of levels. See the
+/// `Drop` impl on `Term` for the full rationale; the teardown here works the same way.
+impl Drop for Constant {
+    fn drop(&mut self) {
+        let mut pending: Vec<Constant> = Vec::new();
+        let mut filler: Option<Rc<Constant>> = None;
+
+        detach_constant_children(self, &mut pending, &mut filler);
+
+        while let Some(mut constant) = pending.pop() {
+            detach_constant_children(&mut constant, &mut pending, &mut filler);
+        }
+    }
+}
+
+/// Move the constants `constant` solely owns onto `pending`, leaving it childless.
+///
+/// The `Type` fields are left in place on purpose: they carry their own iterative `Drop`, so the
+/// shallow drop of this node releases them without recursing.
+fn detach_constant_children(
+    constant: &mut Constant,
+    pending: &mut Vec<Constant>,
+    filler: &mut Option<Rc<Constant>>,
+) {
+    match constant {
+        Constant::Integer(..)
+        | Constant::ByteString(..)
+        | Constant::String(..)
+        | Constant::Unit
+        | Constant::Bool(..)
+        | Constant::Data(..)
+        | Constant::Bls12_381G1Element(..)
+        | Constant::Bls12_381G2Element(..)
+        | Constant::Bls12_381MlResult(..) => {}
+
+        Constant::ProtoList(_, items) => {
+            pending.append(items);
+        }
+
+        Constant::ProtoPair(_, _, fst, snd) => {
+            detach_constant_child(fst, pending, filler);
+            detach_constant_child(snd, pending, filler);
+        }
+    }
+}
+
+/// Take the constant behind `slot`, but only when we are its sole owner — same `Rc` reasoning as
+/// [`detach_term_child`].
+fn detach_constant_child(
+    slot: &mut Rc<Constant>,
+    pending: &mut Vec<Constant>,
+    filler: &mut Option<Rc<Constant>>,
+) {
+    if Rc::strong_count(slot) != 1 {
+        return;
+    }
+
+    let filler = filler.get_or_insert_with(|| Rc::new(Constant::Unit));
+
+    if let Ok(constant) = Rc::try_unwrap(mem::replace(slot, Rc::clone(filler))) {
+        pending.push(constant);
+    }
 }
 
 pub struct Data;
@@ -564,7 +727,7 @@ impl Data {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum Type {
     Bool,
     Integer,
@@ -577,6 +740,85 @@ pub enum Type {
     Bls12_381G1Element,
     Bls12_381G2Element,
     Bls12_381MlResult,
+}
+
+/// The derived `Clone` copies a whole type tree, one stack frame per level, and the flat decoder
+/// clones the element type at every level of a nested `list` -- so a deep constant would overflow
+/// on the way in. Cloning the top node and sharing its `Rc` children instead is O(1) and
+/// unobservable: a `Type` is immutable once built (nothing in the crate reaches through an
+/// `Rc<Type>` with `make_mut` or `get_mut`, and there is no interior mutability), and `PartialEq`
+/// and `Debug` on `Rc` both read straight through to the pointee. Do not put this back on the
+/// derive.
+impl Clone for Type {
+    fn clone(&self) -> Self {
+        match self {
+            Type::Bool => Type::Bool,
+            Type::Integer => Type::Integer,
+            Type::String => Type::String,
+            Type::ByteString => Type::ByteString,
+            Type::Unit => Type::Unit,
+            Type::Data => Type::Data,
+            Type::Bls12_381G1Element => Type::Bls12_381G1Element,
+            Type::Bls12_381G2Element => Type::Bls12_381G2Element,
+            Type::Bls12_381MlResult => Type::Bls12_381MlResult,
+            Type::List(inner) => Type::List(Rc::clone(inner)),
+            Type::Pair(fst, snd) => Type::Pair(Rc::clone(fst), Rc::clone(snd)),
+        }
+    }
+}
+
+/// `Type` nests through `List` and `Pair`, and a deep constant carries an equally deep element
+/// type along with it, so the derived destructor would recurse just as far. See the `Drop` impl
+/// on `Term` for the full rationale.
+impl Drop for Type {
+    fn drop(&mut self) {
+        let mut pending: Vec<Type> = Vec::new();
+        let mut filler: Option<Rc<Type>> = None;
+
+        detach_type_children(self, &mut pending, &mut filler);
+
+        while let Some(mut typ) = pending.pop() {
+            detach_type_children(&mut typ, &mut pending, &mut filler);
+        }
+    }
+}
+
+/// Move the types `typ` solely owns onto `pending`, leaving it childless.
+fn detach_type_children(typ: &mut Type, pending: &mut Vec<Type>, filler: &mut Option<Rc<Type>>) {
+    match typ {
+        Type::Bool
+        | Type::Integer
+        | Type::String
+        | Type::ByteString
+        | Type::Unit
+        | Type::Data
+        | Type::Bls12_381G1Element
+        | Type::Bls12_381G2Element
+        | Type::Bls12_381MlResult => {}
+
+        Type::List(inner) => {
+            detach_type_child(inner, pending, filler);
+        }
+
+        Type::Pair(fst, snd) => {
+            detach_type_child(fst, pending, filler);
+            detach_type_child(snd, pending, filler);
+        }
+    }
+}
+
+/// Take the type behind `slot`, but only when we are its sole owner — same `Rc` reasoning as
+/// [`detach_term_child`].
+fn detach_type_child(slot: &mut Rc<Type>, pending: &mut Vec<Type>, filler: &mut Option<Rc<Type>>) {
+    if Rc::strong_count(slot) != 1 {
+        return;
+    }
+
+    let filler = filler.get_or_insert_with(|| Rc::new(Type::Unit));
+
+    if let Ok(typ) = Rc::try_unwrap(mem::replace(slot, Rc::clone(filler))) {
+        pending.push(typ);
+    }
 }
 
 impl Display for Type {
@@ -1116,9 +1358,17 @@ impl Term<NamedDeBruijn> {
 
 #[cfg(test)]
 mod tests {
-    use crate::ast::Data;
+    use crate::ast::{Constant, Data, Name, Term, Type};
+    use crate::builtins::DefaultFunction;
     use num_bigint::{BigInt, Sign};
     use pallas_codec::minicbor;
+    use std::rc::Rc;
+
+    /// Deep enough that a destructor taking one stack frame per level cannot survive the test
+    /// harness's ~2 MiB thread stack, let alone the ~1 MiB a `wasm32` engine gives us. A script
+    /// inside the on-chain size limit can nest far deeper than this: the cheapest level in flat is
+    /// a 4-bit `delay` tag, half a byte.
+    const DEEP: usize = 100_000;
 
     // Data's negative integers are encoded with an offset of 1, as an unsigned payload. This is unlike
     // num_bigint's BigInt; so both types representations aren't quite compatible with one another.
@@ -1134,5 +1384,168 @@ mod tests {
         let large_negative_num_decoded = BigInt::from_bytes_be(Sign::Plus, &buf[2..]);
 
         assert_eq!(large_negative_num_decoded, -1 - large_negative_num);
+    }
+
+    /// Every spine below is built with a loop, never a recursive helper: a recursive builder would
+    /// overflow while setting the test up and hide the thing we are actually testing.
+    fn deep_delay_spine(depth: usize) -> Term<Name> {
+        let mut term = Term::Error { uniq_id: 0 };
+
+        for level in 0..depth {
+            term = Term::Delay {
+                body: Rc::new(term),
+                uniq_id: level as isize,
+            };
+        }
+
+        term
+    }
+
+    #[test]
+    fn deep_term_drops_without_overflowing_the_stack() {
+        drop(deep_delay_spine(DEEP));
+    }
+
+    #[test]
+    fn deep_apply_spine_drops_without_overflowing_the_stack() {
+        // `Apply` nests through two children at once, so this also covers a node being dismantled
+        // in more than one direction.
+        let mut term: Term<Name> = Term::Error { uniq_id: 0 };
+
+        for level in 0..DEEP {
+            term = Term::Apply {
+                function: Rc::new(term),
+                argument: Rc::new(Term::Error { uniq_id: 0 }),
+                uniq_id: level as isize,
+            };
+        }
+
+        drop(term);
+    }
+
+    #[test]
+    fn deep_constr_and_case_spine_drops_without_overflowing_the_stack() {
+        // `Constr` and `Case` nest through owned vectors rather than `Rc`s.
+        let mut term: Term<Name> = Term::Error { uniq_id: 0 };
+
+        for level in 0..DEEP {
+            term = if level % 2 == 0 {
+                Term::Constr {
+                    tag: 0,
+                    fields: vec![term],
+                    uniq_id: level as isize,
+                }
+            } else {
+                Term::Case {
+                    constr: Rc::new(Term::Error { uniq_id: 0 }),
+                    branches: vec![term],
+                    uniq_id: level as isize,
+                }
+            };
+        }
+
+        drop(term);
+    }
+
+    #[test]
+    fn dropping_a_term_leaves_shared_subterms_alone() {
+        let shared = Rc::new(Term::Builtin {
+            fun: DefaultFunction::AddInteger,
+            uniq_id: 7,
+        });
+
+        let term: Term<Name> = Term::Apply {
+            function: Rc::new(Term::Delay {
+                body: Rc::clone(&shared),
+                uniq_id: 1,
+            }),
+            argument: Rc::clone(&shared),
+            uniq_id: 2,
+        };
+
+        assert_eq!(Rc::strong_count(&shared), 3);
+
+        drop(term);
+
+        // The teardown released both handles and left the pointee alone.
+        assert_eq!(Rc::strong_count(&shared), 1);
+        assert!(matches!(
+            shared.as_ref(),
+            Term::Builtin {
+                fun: DefaultFunction::AddInteger,
+                uniq_id: 7,
+            }
+        ));
+    }
+
+    #[test]
+    fn dropping_a_term_leaves_a_shared_deep_subterm_intact() {
+        let spine = Rc::new(deep_delay_spine(DEEP));
+
+        let first = Term::Force {
+            body: Rc::clone(&spine),
+            uniq_id: -1,
+        };
+
+        let second = Term::Force {
+            body: Rc::clone(&spine),
+            uniq_id: -2,
+        };
+
+        drop(first);
+
+        // Walking (iteratively, again) still finds every level: the shared spine was not
+        // dismantled out from under the other holders.
+        let mut depth = 0;
+        let mut cursor = spine.as_ref();
+
+        while let Term::Delay { body, .. } = cursor {
+            depth += 1;
+            cursor = body.as_ref();
+        }
+
+        assert_eq!(depth, DEEP);
+        assert_eq!(Rc::strong_count(&spine), 2);
+
+        drop(second);
+        drop(spine);
+    }
+
+    #[test]
+    fn deep_constant_drops_without_overflowing_the_stack() {
+        // The element type is deliberately left flat here: `Type` derives `Clone`, which is itself
+        // recursive, so a matching nested type would overflow while the test was still setting up.
+        // Deep types get their own test below.
+        let mut constant = Constant::Integer(BigInt::from(1));
+
+        for _ in 0..DEEP {
+            constant = Constant::ProtoList(Type::Integer, vec![constant]);
+        }
+
+        drop(constant);
+
+        let mut constant = Constant::Unit;
+
+        for _ in 0..DEEP {
+            constant = Constant::ProtoPair(
+                Type::Unit,
+                Type::Unit,
+                Rc::new(constant),
+                Rc::new(Constant::Unit),
+            );
+        }
+
+        drop(constant);
+    }
+
+    #[test]
+    fn deep_type_drops_without_overflowing_the_stack() {
+        let mut typ = Type::Integer;
+
+        for _ in 0..DEEP {
+            typ = Type::List(Rc::new(typ));
+        }
+
+        drop(typ);
     }
 }

@@ -1,11 +1,11 @@
-use std::rc::Rc;
+use std::{mem, rc::Rc};
 
 use crate::ast::{NamedDeBruijn, Term};
 use crate::machine::{
     cost_model::{ExBudget, StepKind, CostModel},
     runtime::{BuiltinRuntime, BuiltinSemantics},
     value::{Value, Env},
-    Context, MachineState, Trace, BUILTIN_COUNT, TERM_COUNT, Error,
+    Context, MachineState, Trace, BUILTIN_COUNT, TERM_COUNT, Error, take_context_tail,
 };
 use crate::machine::discharge::value_as_term;
 use pallas_primitives::conway::Language;
@@ -291,20 +291,28 @@ impl ManualMachine {
         &mut self,
         context: Context,
         env: Env,
-        term: Term<NamedDeBruijn>,
+        mut term: Term<NamedDeBruijn>,
     ) -> Result<MachineState, Error> {
-        match term {
+        // `Term` carries a manual, iterative `Drop` (see `ast.rs`), which makes the compiler
+        // reject moving fields out of it by pattern. Matching on `&mut` instead costs nothing:
+        // every field taken here is either `Copy`, a cheap `Rc` handle, or a vector we can take
+        // outright.
+        match &mut term {
             Term::Var { name, uniq_id } => {
                 self.step_and_maybe_spend(StepKind::Var)?;
 
-                let val = self.lookup_var(name.as_ref(), &env, uniq_id)?;
+                let val = self.lookup_var(name.as_ref(), &env, *uniq_id)?;
 
                 Ok(MachineState::Return(context, val))
             }
             Term::Delay { body, uniq_id } => {
                 self.step_and_maybe_spend(StepKind::Delay)?;
 
-                Ok(MachineState::Return(context, Value::Delay { body, env, term_id: uniq_id }))
+                Ok(MachineState::Return(context, Value::Delay {
+                    body: Rc::clone(body),
+                    env,
+                    term_id: *uniq_id,
+                }))
             }
             Term::Lambda {
                 parameter_name,
@@ -316,10 +324,10 @@ impl ManualMachine {
                 Ok(MachineState::Return(
                     context,
                     Value::Lambda {
-                        parameter_name,
-                        body,
+                        parameter_name: Rc::clone(parameter_name),
+                        body: Rc::clone(body),
                         env,
-                        term_id: uniq_id,
+                        term_id: *uniq_id,
                     },
                 ))
             }
@@ -339,7 +347,7 @@ impl ManualMachine {
             Term::Constant { value, .. } => {
                 self.step_and_maybe_spend(StepKind::Constant)?;
 
-                Ok(MachineState::Return(context, Value::Con(value)))
+                Ok(MachineState::Return(context, Value::Con(Rc::clone(value))))
             }
             Term::Force { body, .. } => {
                 self.step_and_maybe_spend(StepKind::Force)?;
@@ -354,15 +362,20 @@ impl ManualMachine {
             Term::Builtin { fun, uniq_id } => {
                 self.step_and_maybe_spend(StepKind::Builtin)?;
 
+                let fun = *fun;
+
                 let runtime: BuiltinRuntime = fun.into();
 
                 Ok(MachineState::Return(
                     context,
-                    Value::Builtin { fun, runtime, term_id: uniq_id },
+                    Value::Builtin { fun, runtime, term_id: *uniq_id },
                 ))
             }
-            Term::Constr { tag, mut fields, uniq_id } => {
+            Term::Constr { tag, fields, uniq_id } => {
                 self.step_and_maybe_spend(StepKind::Constr)?;
+
+                let (tag, uniq_id) = (*tag, *uniq_id);
+                let mut fields = mem::take(fields);
 
                 fields.reverse();
 
@@ -389,7 +402,7 @@ impl ManualMachine {
                 self.step_and_maybe_spend(StepKind::Case)?;
 
                 Ok(MachineState::Compute(
-                    Context::FrameCases(env.clone(), branches, context.into()),
+                    Context::FrameCases(env.clone(), mem::take(branches), context.into()),
                     env,
                     constr.as_ref().clone(),
                 ))
@@ -397,8 +410,16 @@ impl ManualMachine {
         }
     }
 
-    fn return_compute(&mut self, context: Context, value: Value) -> Result<MachineState, Error> {
-        match context {
+    fn return_compute(
+        &mut self,
+        mut context: Context,
+        mut value: Value,
+    ) -> Result<MachineState, Error> {
+        // `Context` and `Value` both carry a manual, iterative `Drop` (see `machine.rs` and
+        // `machine/value.rs`), which makes the compiler reject moving their fields out by pattern.
+        // Every arm below takes only what it needs and leaves a free-to-drop husk in its place:
+        // `NoFrame` for a tail, an empty `Constr` for a value, `Error` for a term.
+        match &mut context {
             Context::NoFrame => {
                 if self.unbudgeted_steps[9] > 0 {
                     self.spend_unbudgeted_steps()?;
@@ -408,19 +429,46 @@ impl ManualMachine {
 
                 Ok(MachineState::Done(term))
             }
-            Context::FrameForce(ctx) => self.force_evaluate(*ctx, value),
-            Context::FrameAwaitFunTerm(arg_env, arg, ctx) => Ok(MachineState::Compute(
-                Context::FrameAwaitArg(value, ctx),
-                arg_env,
-                arg,
-            )),
-            Context::FrameAwaitArg(fun, ctx) => self.apply_evaluate(*ctx, fun, value),
-            Context::FrameAwaitFunValue(arg, ctx) => self.apply_evaluate(*ctx, value, arg),
-            Context::FrameConstr(env, tag, mut fields, mut resolved_fields, ctx, uniq_id) => {
+            Context::FrameForce(ctx) => {
+                let ctx = take_context_tail(ctx);
+
+                self.force_evaluate(ctx, value)
+            }
+            Context::FrameAwaitFunTerm(arg_env, arg, ctx) => {
+                let arg_env = Rc::clone(arg_env);
+                let arg = mem::replace(arg, Term::Error { uniq_id: 0 });
+                // This is one of the two places the tail has to stay boxed, so it is re-boxed
+                // rather than unlinked in place.
+                let ctx = mem::replace(ctx, Box::new(Context::NoFrame));
+
+                Ok(MachineState::Compute(
+                    Context::FrameAwaitArg(value, ctx),
+                    arg_env,
+                    arg,
+                ))
+            }
+            Context::FrameAwaitArg(fun, ctx) => {
+                let fun = mem::replace(fun, Value::husk());
+                let ctx = take_context_tail(ctx);
+
+                self.apply_evaluate(ctx, fun, value)
+            }
+            Context::FrameAwaitFunValue(arg, ctx) => {
+                let arg = mem::replace(arg, Value::husk());
+                let ctx = take_context_tail(ctx);
+
+                self.apply_evaluate(ctx, value, arg)
+            }
+            Context::FrameConstr(env, tag, fields, resolved_fields, ctx, uniq_id) => {
+                let (env, tag, uniq_id) = (Rc::clone(env), *tag, *uniq_id);
+                let mut fields = mem::take(fields);
+                let mut resolved_fields = mem::take(resolved_fields);
+
                 resolved_fields.push(value);
 
                 if !fields.is_empty() {
                     let popped_field = fields.pop().unwrap();
+                    let ctx = mem::replace(ctx, Box::new(Context::NoFrame));
 
                     Ok(MachineState::Compute(
                         Context::FrameConstr(env.clone(), tag, fields, resolved_fields, ctx, uniq_id),
@@ -429,7 +477,7 @@ impl ManualMachine {
                     ))
                 } else {
                     Ok(MachineState::Return(
-                        *ctx,
+                        take_context_tail(ctx),
                         Value::Constr {
                             tag,
                             fields: resolved_fields,
@@ -438,29 +486,46 @@ impl ManualMachine {
                     ))
                 }
             }
-            Context::FrameCases(env, branches, ctx) => match value {
-                Value::Constr { tag, fields, term_id } => match branches.get(tag) {
-                    Some(t) => Ok(MachineState::Compute(
-                        transfer_arg_stack(fields, *ctx),
-                        env,
-                        t.clone(),
-                    )),
-                    None => Err(Error::MissingCaseBranch(
-                        branches,
-                        Value::Constr { tag, fields, term_id },
-                    )),
-                },
-                v => Err(Error::NonConstrScrutinized(v)),
-            },
+            Context::FrameCases(env, branches, ctx) => {
+                let env = Rc::clone(env);
+                let branches = mem::take(branches);
+                let ctx = take_context_tail(ctx);
+
+                // The scrutinee's fields are only taken on the branch that consumes them; the
+                // error branches hand the value on untouched.
+                match &mut value {
+                    Value::Constr { tag, fields, .. } => match branches.get(*tag) {
+                        Some(t) => {
+                            let t = t.clone();
+
+                            Ok(MachineState::Compute(
+                                transfer_arg_stack(mem::take(fields), ctx),
+                                env,
+                                t,
+                            ))
+                        }
+                        None => Err(Error::MissingCaseBranch(branches, value)),
+                    },
+                    _ => Err(Error::NonConstrScrutinized(value)),
+                }
+            }
         }
     }
 
-    fn force_evaluate(&mut self, context: Context, value: Value) -> Result<MachineState, Error> {
-        match value {
-            Value::Delay { body, env, .. } => {
-                Ok(MachineState::Compute(context, env, body.as_ref().clone()))
-            }
-            Value::Builtin { fun, mut runtime, term_id } => {
+    fn force_evaluate(&mut self, context: Context, mut value: Value) -> Result<MachineState, Error> {
+        // `Value` carries a manual, iterative `Drop` (see `machine/value.rs`), which makes the
+        // compiler reject moving fields out of it by pattern. The runtime is swapped out for a
+        // fresh, empty one instead -- same cost, and the husk left behind drops for free.
+        match &mut value {
+            Value::Delay { body, env, .. } => Ok(MachineState::Compute(
+                context,
+                Rc::clone(env),
+                body.as_ref().clone(),
+            )),
+            Value::Builtin { fun, runtime, term_id } => {
+                let (fun, term_id) = (*fun, *term_id);
+                let mut runtime = mem::replace(runtime, BuiltinRuntime::new(fun));
+
                 if runtime.needs_force() {
                     runtime.consume_force();
 
@@ -477,19 +542,24 @@ impl ManualMachine {
                     Err(Error::BuiltinTermArgumentExpected(term))
                 }
             }
-            rest => Err(Error::NonPolymorphicInstantiation(rest)),
+            _ => Err(Error::NonPolymorphicInstantiation(value)),
         }
     }
 
     fn apply_evaluate(
         &mut self,
         context: Context,
-        function: Value,
+        mut function: Value,
         argument: Value,
     ) -> Result<MachineState, Error> {
-        match function {
-            Value::Lambda { body, mut env, .. } => {
-                let e = Rc::make_mut(&mut env);
+        // `Value` carries a manual, iterative `Drop` (see `machine/value.rs`), which makes the
+        // compiler reject moving fields out of it by pattern; the payloads are taken out
+        // explicitly instead.
+        match &mut function {
+            Value::Lambda { body, env, .. } => {
+                let body = Rc::clone(body);
+
+                let e = Rc::make_mut(env);
 
                 e.push(argument);
 
@@ -500,6 +570,9 @@ impl ManualMachine {
                 ))
             }
             Value::Builtin { fun, runtime, term_id } => {
+                let (fun, term_id) = (*fun, *term_id);
+                let runtime = mem::replace(runtime, BuiltinRuntime::new(fun));
+
                 if runtime.is_arrow() && !runtime.needs_force() {
                     let mut runtime = runtime;
 
@@ -518,7 +591,7 @@ impl ManualMachine {
                     Err(Error::UnexpectedBuiltinTermArgument(term))
                 }
             }
-            rest => Err(Error::NonFunctionalApplication(rest, argument)),
+            _ => Err(Error::NonFunctionalApplication(function, argument)),
         }
     }
 

@@ -9,7 +9,7 @@ use crate::{
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive, Zero};
 use pallas_primitives::conway::{self, PlutusData};
-use std::{collections::VecDeque, mem::size_of, ops::Deref, rc::Rc};
+use std::{collections::VecDeque, mem, mem::size_of, ops::Deref, rc::Rc};
 
 pub type Env = Rc<Vec<Value>>;
 
@@ -39,7 +39,80 @@ pub enum Value {
     },
 }
 
+/// `Value` nests two ways — through `Constr` fields and through the captured `Env` of a closure,
+/// which is a vector of further values — and both are as deep as the script makes them: every
+/// nested lambda the machine enters extends the environment chain. As with `Term` (see the `Drop`
+/// impl in `ast.rs` for the full rationale) the derived destructor would walk that chain one stack
+/// frame at a time, which is not survivable on `wasm32`. Do not remove this as redundant.
+impl Drop for Value {
+    fn drop(&mut self) {
+        let mut pending: Vec<Value> = Vec::new();
+        let mut filler: Option<Env> = None;
+
+        detach_value_children(self, &mut pending, &mut filler);
+
+        while let Some(mut value) = pending.pop() {
+            detach_value_children(&mut value, &mut pending, &mut filler);
+        }
+    }
+}
+
+/// Move the values `value` solely owns onto `pending`, leaving it childless.
+///
+/// The `Rc<Term>` and `Rc<Constant>` a value holds are left alone: those carry their own iterative
+/// `Drop`, so releasing them here does not recurse either.
+fn detach_value_children(value: &mut Value, pending: &mut Vec<Value>, filler: &mut Option<Env>) {
+    match value {
+        Value::Con(_) => {}
+
+        Value::Delay { env, .. } | Value::Lambda { env, .. } => {
+            detach_env(env, pending, filler);
+        }
+
+        Value::Builtin { runtime, .. } => {
+            // Partially applied arguments are owned outright.
+            pending.append(&mut runtime.args);
+        }
+
+        Value::Constr { fields, .. } => {
+            pending.append(fields);
+        }
+    }
+}
+
+/// Take the environment behind `slot`, but only when we are its sole owner.
+///
+/// Environments are shared by every closure captured under them, so an `Env` whose strong count is
+/// above one is not ours to empty — other closures still read it. That is also the exact condition
+/// under which `Rc::try_unwrap` refuses, and dropping a shared `Rc` alongside its value is O(1) and
+/// never touches the pointee. When we do own it we swap in a leaf first; that leaf is a clone of a
+/// single empty environment shared by the whole teardown, so the shallow `Drop` that later visits
+/// the vacated slot sees a strong count above one and skips it.
+fn detach_env(slot: &mut Env, pending: &mut Vec<Value>, filler: &mut Option<Env>) {
+    if Rc::strong_count(slot) != 1 {
+        return;
+    }
+
+    let filler = filler.get_or_insert_with(|| Rc::new(Vec::new()));
+
+    if let Ok(mut env) = Rc::try_unwrap(mem::replace(slot, Rc::clone(filler))) {
+        pending.append(&mut env);
+    }
+}
+
 impl Value {
+    /// A stand-in swapped into a machine frame when the real value is taken out of it.
+    ///
+    /// `Value` carries a manual `Drop` (see above), so the machine cannot move a value out of a
+    /// frame by pattern any more. This leaf allocates nothing and drops for free.
+    pub(crate) fn husk() -> Self {
+        Value::Constr {
+            tag: 0,
+            fields: Vec::new(),
+            term_id: 0,
+        }
+    }
+
     /// The source term id this value originated from, if any. A bare `Con` constant result carries
     /// no term id.
     pub fn term_id(&self) -> Option<isize> {
@@ -466,9 +539,11 @@ impl TryFrom<Value> for Constant {
     type Error = Error;
 
     fn try_from(value: Value) -> Result<Self, Self::Error> {
-        match value {
+        // `Value` has a manual `Drop` (see above), so its fields cannot be moved out by pattern;
+        // the constant is cloned out of the borrow, exactly as before.
+        match &value {
             Value::Con(constant) => Ok(constant.as_ref().clone()),
-            rest => Err(Error::NotAConstant(rest)),
+            _ => Err(Error::NotAConstant(value)),
         }
     }
 }
@@ -528,14 +603,18 @@ pub fn to_pallas_bigint(n: &BigInt) -> conway::BigInt {
 #[cfg(test)]
 mod tests {
     use crate::{
-        ast::{Constant, Type},
+        ast::{Constant, NamedDeBruijn, Term, Type},
         machine::{
             runtime::BuiltinSemantics,
-            value::{Value, integer_log2},
+            value::{Env, Value, integer_log2},
         },
     };
     use num_bigint::BigInt;
     use std::rc::Rc;
+
+    /// Deep enough that a destructor taking one stack frame per level cannot survive the test
+    /// harness's ~2 MiB thread stack, let alone the ~1 MiB a `wasm32` engine gives us.
+    const DEEP: usize = 100_000;
 
     #[test]
     fn to_ex_mem_bigint() {
@@ -706,5 +785,71 @@ mod tests {
 
         assert_eq!(value.to_ex_mem_with_semantics(BuiltinSemantics::C), 9);
         assert_eq!(value.to_ex_mem_with_semantics(BuiltinSemantics::D), 6);
+    }
+
+    /// Both spines below are built with a loop, never a recursive helper: a recursive builder
+    /// would overflow while setting the test up.
+    #[test]
+    fn deep_environment_chain_drops_without_overflowing_the_stack() {
+        // Every lambda the machine enters extends the environment, and each captured environment
+        // holds values that capture environments of their own.
+        let mut env: Env = Rc::new(vec![]);
+
+        for level in 0..DEEP {
+            let value = Value::Delay {
+                body: Rc::new(Term::<NamedDeBruijn>::Error { uniq_id: 0 }),
+                env,
+                term_id: level as isize,
+            };
+
+            env = Rc::new(vec![value]);
+        }
+
+        drop(env);
+    }
+
+    #[test]
+    fn deep_constr_value_drops_without_overflowing_the_stack() {
+        let mut value = Value::Con(Rc::new(Constant::Unit));
+
+        for level in 0..DEEP {
+            value = Value::Constr {
+                tag: 0,
+                fields: vec![value],
+                term_id: level as isize,
+            };
+        }
+
+        drop(value);
+    }
+
+    #[test]
+    fn dropping_a_value_leaves_a_shared_environment_alone() {
+        let shared: Env = Rc::new(vec![Value::Con(Rc::new(Constant::Bool(true)))]);
+
+        let first = Value::Delay {
+            body: Rc::new(Term::<NamedDeBruijn>::Error { uniq_id: 0 }),
+            env: Rc::clone(&shared),
+            term_id: 1,
+        };
+
+        let second = Value::Delay {
+            body: Rc::new(Term::<NamedDeBruijn>::Error { uniq_id: 0 }),
+            env: Rc::clone(&shared),
+            term_id: 2,
+        };
+
+        assert_eq!(Rc::strong_count(&shared), 3);
+
+        drop(first);
+
+        // The environment `second` still reads was not emptied out from under it.
+        assert_eq!(Rc::strong_count(&shared), 2);
+        assert_eq!(shared.len(), 1);
+
+        drop(second);
+
+        assert_eq!(Rc::strong_count(&shared), 1);
+        assert_eq!(shared.len(), 1);
     }
 }

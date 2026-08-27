@@ -1868,11 +1868,15 @@ impl Term<Name> {
                     return false;
                 };
 
+                // `Term` has a manual `Drop` (see `ast.rs`), so its fields cannot be moved out by
+                // pattern; the pierced term is kept alive and only borrowed from.
+                let identity_func = identity_func.pierce_no_inlines();
+
                 let Term::Lambda {
                     parameter_name: identity_name,
                     body: identity_body,
                     ..
-                } = identity_func.pierce_no_inlines()
+                } = &identity_func
                 else {
                     return false;
                 };
@@ -1881,7 +1885,7 @@ impl Term<Name> {
                     return false;
                 };
 
-                if *identity_var == identity_name {
+                if identity_var == identity_name {
                     // Replace all applied usages of identity with the arg
                     body.replace_identity_usage(parameter_name.clone());
                     // Have to check if the body still has any occurrences of the parameter

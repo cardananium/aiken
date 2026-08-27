@@ -175,9 +175,9 @@ where
 
         match Term::decode(d) {
             Ok(term) => Ok(Program { version, term }),
-            // The iterative decoder reports what went wrong but not where in
-            // the term it was. Rewind and re-run the recursive decoder, whose
-            // state log names the path it took, purely to build the message.
+            // The plain decoder reports what went wrong but not where in the
+            // term it was. Rewind and re-run the same walk with a state log,
+            // which names the path it took, purely to build the message.
             Err(fast_error) => {
                 d.pos = term_pos;
                 d.used_bits = term_used_bits;
@@ -196,66 +196,138 @@ where
     }
 }
 
+/// Emit one element of a flat list, or close the list.
+///
+/// `Encoder::encode_list_with` writes a `1` bit before every element and a `0` to close, but it
+/// takes the element encoder as a function, which is exactly the recursion we are trying to avoid.
+/// These two steps reproduce its bit pattern from inside the iterative walk instead. `Encoder::one`
+/// and `Encoder::zero` are private to `pallas-codec`; `Encoder::bool` is the public spelling and
+/// calls straight through to them, so the bits are identical.
+enum ListStep {
+    Item,
+    End,
+}
+
+/// Read the continuation bit that precedes each element of a flat list.
+///
+/// `Decoder::decode_list_with` does this with `Decoder::bit`, but it takes the element decoder as a
+/// function, which is exactly the recursion we are trying to avoid. `bit` is private to
+/// `pallas-codec`, and `Decoder::bool` -- the public one-bit read -- skips the bounds check and
+/// would panic on a truncated script rather than fail. `bits8(1)` reads the same bit and advances
+/// identically, and the guard in front of it reproduces `bit`'s `EndOfBuffer` instead of `bits8`'s
+/// `NotEnoughBits`, so a malformed script still fails exactly the way it always did.
+fn decode_list_bit(d: &mut Decoder) -> Result<bool, de::Error> {
+    if d.pos >= d.buffer.len() {
+        return Err(de::Error::EndOfBuffer);
+    }
+
+    Ok(d.bits8(1)? != 0)
+}
+
 impl<'b, T> Encode for Term<T>
 where
     T: Binder<'b> + Debug,
 {
     fn encode(&self, e: &mut Encoder) -> Result<(), en::Error> {
-        match self {
-            Term::Var { name, .. } => {
-                encode_term_tag(0, e)?;
-                name.encode(e)?;
-            }
-            Term::Delay { body, .. } => {
-                encode_term_tag(1, e)?;
-                body.encode(e)?;
-            }
-            Term::Lambda {
-                parameter_name,
-                body,
-                ..
-            } => {
-                encode_term_tag(2, e)?;
-                parameter_name.binder_encode(e)?;
-                body.encode(e)?;
-            }
-            Term::Apply { function, argument, .. } => {
-                encode_term_tag(3, e)?;
-                function.encode(e)?;
-                argument.encode(e)?;
-            }
+        // Encoding walks the same spine `decode` does, so it has to be iterative for the same
+        // reason: the nesting depth of a term is attacker-controlled -- the cheapest level in flat
+        // is a 4-bit `delay` tag, half a byte, so a script inside the on-chain size limit is tens
+        // of thousands of levels deep -- and on `wasm32` the engine's call stack is about a
+        // megabyte and cannot be grown from the page. Recursing here capped the whole
+        // decode-then-re-encode round-trip at roughly 10,500 levels, measured. Do not fold this
+        // back into a recursive walk.
+        //
+        // `Step` is the encoder's mirror of the `Frame` enum in `Term::decode`: the stack holds
+        // what is left to emit. It is LIFO, so children go on in reverse of the order they appear
+        // in the output.
+        enum Step<'a, U> {
+            /// Emit this term: its tag, its immediate payload, then its children.
+            Term(&'a Term<U>),
+            /// Emit a list's continuation bit before an element, or its terminating bit.
+            List(ListStep),
+        }
 
-            Term::Constant { value: constant, .. } => {
-                encode_term_tag(4, e)?;
-                constant.encode(e)?;
-            }
+        let mut steps: Vec<Step<'_, T>> = vec![Step::Term(self)];
 
-            Term::Force { body, .. } => {
-                encode_term_tag(5, e)?;
-                body.encode(e)?;
-            }
+        while let Some(step) = steps.pop() {
+            let term = match step {
+                Step::List(ListStep::Item) => {
+                    e.bool(true);
+                    continue;
+                }
+                Step::List(ListStep::End) => {
+                    e.bool(false);
+                    continue;
+                }
+                Step::Term(term) => term,
+            };
 
-            Term::Error { .. } => {
-                encode_term_tag(6, e)?;
-            }
-            Term::Builtin { fun, .. } => {
-                encode_term_tag(7, e)?;
+            match term {
+                Term::Var { name, .. } => {
+                    encode_term_tag(0, e)?;
+                    name.encode(e)?;
+                }
+                Term::Delay { body, .. } => {
+                    encode_term_tag(1, e)?;
+                    steps.push(Step::Term(body.as_ref()));
+                }
+                Term::Lambda {
+                    parameter_name,
+                    body,
+                    ..
+                } => {
+                    encode_term_tag(2, e)?;
+                    parameter_name.binder_encode(e)?;
+                    steps.push(Step::Term(body.as_ref()));
+                }
+                Term::Apply { function, argument, .. } => {
+                    encode_term_tag(3, e)?;
+                    steps.push(Step::Term(argument.as_ref()));
+                    steps.push(Step::Term(function.as_ref()));
+                }
 
-                fun.encode(e)?;
-            }
-            Term::Constr { tag, fields, .. } => {
-                encode_term_tag(8, e)?;
+                Term::Constant { value: constant, .. } => {
+                    encode_term_tag(4, e)?;
+                    constant.encode(e)?;
+                }
 
-                tag.encode(e)?;
+                Term::Force { body, .. } => {
+                    encode_term_tag(5, e)?;
+                    steps.push(Step::Term(body.as_ref()));
+                }
 
-                e.encode_list_with(fields, |term, e| (*term).encode(e))?;
-            }
-            Term::Case { constr, branches, .. } => {
-                encode_term_tag(9, e)?;
+                Term::Error { .. } => {
+                    encode_term_tag(6, e)?;
+                }
+                Term::Builtin { fun, .. } => {
+                    encode_term_tag(7, e)?;
 
-                constr.encode(e)?;
+                    fun.encode(e)?;
+                }
+                Term::Constr { tag, fields, .. } => {
+                    encode_term_tag(8, e)?;
 
-                e.encode_list_with(branches, |term, e| (*term).encode(e))?;
+                    tag.encode(e)?;
+
+                    steps.push(Step::List(ListStep::End));
+
+                    for field in fields.iter().rev() {
+                        steps.push(Step::Term(field));
+                        steps.push(Step::List(ListStep::Item));
+                    }
+                }
+                Term::Case { constr, branches, .. } => {
+                    encode_term_tag(9, e)?;
+
+                    steps.push(Step::List(ListStep::End));
+
+                    for branch in branches.iter().rev() {
+                        steps.push(Step::Term(branch));
+                        steps.push(Step::List(ListStep::Item));
+                    }
+
+                    steps.push(Step::Term(constr.as_ref()));
+                }
             }
         }
 
@@ -263,79 +335,248 @@ where
     }
 }
 
+/// Record one step of the path into the term, when the caller asked for one.
+///
+/// The step is only built inside the `if`, so the plain decoder pays nothing for the bookkeeping
+/// that only the error reporter needs.
+///
+/// Pass interpolated values as explicit arguments -- `note!(log, "{})", fun)`, not
+/// `note!(log, "{fun})")`. A format string that captures its values implicitly has no arguments,
+/// so it matches the first arm below and gets recorded with the braces still in it.
+macro_rules! note {
+    // A step with nothing interpolated into it.
+    ($log:expr, $step:literal) => {
+        if let Some(log) = $log.as_deref_mut() {
+            log.push(String::from($step));
+        }
+    };
+    // A step built from values.
+    ($log:expr, $fmt:literal, $($arg:tt)+) => {
+        if let Some(log) = $log.as_deref_mut() {
+            log.push(format!($fmt, $($arg)+));
+        }
+    };
+}
+
+/// A constructor the term walk has opened and not yet finished, while it reads the next child.
+/// The encoder's mirror of this is the `Step` enum in `Term::encode`.
+enum Frame<U> {
+    Delay,
+    Force,
+    Lambda { parameter_name: Rc<U> },
+    ApplyFn,
+    ApplyArg { function: Rc<Term<U>> },
+    /// Fields read so far for a `constr`; one more is on its way.
+    ConstrField { tag: usize, fields: Vec<Term<U>> },
+    /// The scrutinee of a `case` is being read.
+    CaseConstr,
+    /// Branches read so far for a `case`; one more is on its way.
+    CaseBranch { constr: Rc<Term<U>>, branches: Vec<Term<U>> },
+}
+
 impl<'b, T> Decode<'b> for Term<T>
 where
     T: Binder<'b>,
 {
     fn decode(d: &mut Decoder) -> Result<Self, de::Error> {
-        enum Frame<U> {
-            Delay,
-            Force,
-            Lambda { parameter_name: Rc<U> },
-            ApplyFn,
-            ApplyArg { function: Rc<Term<U>> },
+        Term::decode_with_log(d, None)
+    }
+}
+
+impl<'b, T> Term<T>
+where
+    T: Binder<'b>,
+{
+    /// Decode a term, recording the path into it for an error message.
+    fn decode_debug(d: &mut Decoder, state_log: &mut Vec<String>) -> Result<Term<T>, de::Error> {
+        Term::decode_with_log(d, Some(state_log))
+    }
+
+    /// The one term walk, shared by `Term::decode` and `Term::decode_debug`.
+    ///
+    /// It is iterative because the nesting depth of a term is attacker-controlled: the cheapest
+    /// level in flat is a 4-bit `delay` tag, half a byte, so a script inside the on-chain size
+    /// limit is tens of thousands of levels deep, and on `wasm32` the engine's call stack is about
+    /// a megabyte and cannot be grown from the page. `frames` holds what the walk has opened and
+    /// not yet finished, in place of the call stack a recursive descent would use. Do not fold
+    /// this back into a recursive walk.
+    ///
+    /// `state_log` is the only thing separating the two entry points: when it is `Some`, the walk
+    /// names each constructor it enters so a failure can be reported as a position inside the
+    /// term rather than just a reason. Sharing one body is what keeps the two from drifting: the
+    /// plain decoder cannot start accepting something the reporter would reject.
+    fn decode_with_log(
+        d: &mut Decoder,
+        mut state_log: Option<&mut Vec<String>>,
+    ) -> Result<Term<T>, de::Error> {
+        let mut frames: Vec<Frame<T>> = Vec::new();
+
+        let result = Term::decode_frames(d, state_log.as_deref_mut(), &mut frames);
+
+        // On the way out of a failure, close every constructor still open, innermost first. The
+        // recursive decoder used to do this as the error travelled back up through its callers;
+        // here the frames left standing are exactly those callers.
+        if result.is_err()
+            && let Some(log) = state_log
+        {
+            for frame in frames.iter().rev() {
+                match frame {
+                    Frame::Delay | Frame::Force | Frame::Lambda { .. } => {
+                        log.push(")".to_string())
+                    }
+                    Frame::ApplyFn => log.push(" not parsed]".to_string()),
+                    Frame::ApplyArg { .. } => log.push("]".to_string()),
+                    Frame::ConstrField { .. } | Frame::CaseConstr | Frame::CaseBranch { .. } => {}
+                }
+            }
         }
 
-        let mut frames: Vec<Frame<T>> = Vec::new();
+        result
+    }
+
+    /// Walk the term, leaving whatever is still open in `frames` if it fails.
+    fn decode_frames(
+        d: &mut Decoder,
+        mut state_log: Option<&mut Vec<String>>,
+        frames: &mut Vec<Frame<T>>,
+    ) -> Result<Term<T>, de::Error> {
         let mut current: Option<Term<T>> = None;
 
         loop {
             if current.is_none() {
+                // Read one constructor. The ones with children push a frame and go round again
+                // for the first of them; the rest are complete and start the fold below.
                 let parsed = match decode_term_tag(d)? {
-                    0 => Term::Var {
-                        name: T::decode(d)?.into(),
-                        uniq_id: next_uniq_id(),
-                    },
+                    0 => {
+                        note!(state_log, "(var ");
+
+                        match T::decode(d) {
+                            Ok(name) => {
+                                note!(state_log, "{})", name.text());
+
+                                Term::Var {
+                                    name: name.into(),
+                                    uniq_id: next_uniq_id(),
+                                }
+                            }
+                            Err(error) => {
+                                note!(state_log, "parse error)");
+
+                                return Err(error);
+                            }
+                        }
+                    }
                     1 => {
+                        note!(state_log, "(delay ");
                         frames.push(Frame::Delay);
                         continue;
                     }
                     2 => {
-                        let parameter_name: Rc<T> = T::binder_decode(d)?.into();
-                        frames.push(Frame::Lambda { parameter_name });
-                        continue;
+                        note!(state_log, "(lam ");
+
+                        match T::binder_decode(d) {
+                            Ok(parameter_name) => {
+                                note!(state_log, "{}", parameter_name.text());
+
+                                frames.push(Frame::Lambda {
+                                    parameter_name: parameter_name.into(),
+                                });
+
+                                continue;
+                            }
+                            Err(error) => {
+                                note!(state_log, ")");
+
+                                return Err(error);
+                            }
+                        }
                     }
                     3 => {
+                        note!(state_log, "[ ");
                         frames.push(Frame::ApplyFn);
                         continue;
                     }
                     // Need size limit for Constant
-                    4 => Term::Constant {
-                        value: Constant::decode(d)?.into(),
-                        uniq_id: next_uniq_id(),
-                    },
+                    4 => {
+                        note!(state_log, "(con ");
+
+                        match Constant::decode(d) {
+                            Ok(constant) => {
+                                note!(state_log, "{})", constant.to_pretty());
+
+                                Term::Constant {
+                                    value: constant.into(),
+                                    uniq_id: next_uniq_id(),
+                                }
+                            }
+                            Err(error) => {
+                                note!(state_log, "parse error)");
+
+                                return Err(error);
+                            }
+                        }
+                    }
                     5 => {
+                        note!(state_log, "(force ");
                         frames.push(Frame::Force);
                         continue;
                     }
-                    6 => Term::Error {
-                        uniq_id: next_uniq_id(),
-                    },
-                    7 => Term::Builtin {
-                        fun: DefaultFunction::decode(d)?,
-                        uniq_id: next_uniq_id(),
-                    },
+                    6 => {
+                        note!(state_log, "(error)");
+
+                        Term::Error {
+                            uniq_id: next_uniq_id(),
+                        }
+                    }
+                    7 => {
+                        note!(state_log, "(builtin ");
+
+                        match DefaultFunction::decode(d) {
+                            Ok(fun) => {
+                                note!(state_log, "{})", fun);
+
+                                Term::Builtin {
+                                    fun,
+                                    uniq_id: next_uniq_id(),
+                                }
+                            }
+                            Err(error) => {
+                                note!(state_log, "parse error)");
+
+                                return Err(error);
+                            }
+                        }
+                    }
                     8 => {
+                        note!(state_log, "(constr ");
+
                         let tag = usize::decode(d)?;
-                        let fields = d.decode_list_with(Term::<T>::decode)?;
-                        let uniq_id = next_uniq_id();
+
+                        // The fields are walked a frame at a time rather than with
+                        // `decode_list_with`, whose element decoder would be this function again.
+                        if decode_list_bit(d)? {
+                            frames.push(Frame::ConstrField {
+                                tag,
+                                fields: Vec::new(),
+                            });
+
+                            continue;
+                        }
+
                         Term::Constr {
                             tag,
-                            fields,
-                            uniq_id,
+                            fields: Vec::new(),
+                            uniq_id: next_uniq_id(),
                         }
                     }
                     9 => {
-                        let constr = Rc::new(Term::<T>::decode(d)?);
-                        let branches = d.decode_list_with(Term::<T>::decode)?;
-                        let uniq_id = next_uniq_id();
-                        Term::Case {
-                            constr,
-                            branches,
-                            uniq_id,
-                        }
+                        note!(state_log, "(case ");
+                        frames.push(Frame::CaseConstr);
+                        continue;
                     }
                     x => {
+                        note!(state_log, "parse error");
+
                         let buffer_slice: Vec<u8> = d
                             .buffer
                             .to_vec()
@@ -358,10 +599,15 @@ where
                 current = Some(parsed);
             }
 
+            // Fold the finished term into whatever was waiting for it, until something needs
+            // another child read first.
             while let Some(frame) = frames.pop() {
                 match frame {
                     Frame::Delay => {
                         let body = Rc::new(current.take().expect("term present"));
+
+                        note!(state_log, ")");
+
                         current = Some(Term::Delay {
                             body,
                             uniq_id: next_uniq_id(),
@@ -369,6 +615,9 @@ where
                     }
                     Frame::Force => {
                         let body = Rc::new(current.take().expect("term present"));
+
+                        note!(state_log, ")");
+
                         current = Some(Term::Force {
                             body,
                             uniq_id: next_uniq_id(),
@@ -376,6 +625,9 @@ where
                     }
                     Frame::Lambda { parameter_name } => {
                         let body = Rc::new(current.take().expect("term present"));
+
+                        note!(state_log, ")");
+
                         current = Some(Term::Lambda {
                             parameter_name,
                             body,
@@ -384,239 +636,82 @@ where
                     }
                     Frame::ApplyFn => {
                         let function = Rc::new(current.take().expect("term present"));
+
+                        note!(state_log, " ");
+
                         frames.push(Frame::ApplyArg { function });
                         current = None;
                         break;
                     }
                     Frame::ApplyArg { function } => {
                         let argument = Rc::new(current.take().expect("term present"));
+
+                        note!(state_log, "]");
+
                         current = Some(Term::Apply {
                             function,
                             argument,
                             uniq_id: next_uniq_id(),
                         });
                     }
-                }
-            }
+                    Frame::ConstrField { tag, mut fields } => {
+                        fields.push(current.take().expect("term present"));
 
-            if frames.is_empty() {
-                if let Some(done) = current.take() {
-                    return Ok(done);
-                }
-            }
-        }
-    }
-}
-
-impl<'b, T> Term<T>
-where
-    T: Binder<'b>,
-{
-    fn decode_debug(d: &mut Decoder, state_log: &mut Vec<String>) -> Result<Term<T>, de::Error> {
-        match decode_term_tag(d)? {
-            0 => {
-                state_log.push("(var ".to_string());
-                let var_option = T::decode(d);
-                match var_option {
-                    Ok(var) => {
-                        state_log.push(format!("{})", var.text()));
-                        Ok(Term::Var {
-                            name: var.into(),
-                            uniq_id: next_uniq_id(),
-                        })
-                    }
-                    Err(error) => {
-                        state_log.push("parse error)".to_string());
-                        Err(error)
-                    }
-                }
-            }
-
-            1 => {
-                state_log.push("(delay ".to_string());
-                let term_option = Term::decode_debug(d, state_log);
-                match term_option {
-                    Ok(term) => {
-                        state_log.push(")".to_string());
-                        Ok(Term::Delay {
-                            body: Rc::new(term),
-                            uniq_id: next_uniq_id(),
-                        })
-                    }
-                    Err(error) => {
-                        state_log.push(")".to_string());
-                        Err(error)
-                    }
-                }
-            }
-            2 => {
-                state_log.push("(lam ".to_string());
-
-                let var_option = T::binder_decode(d);
-                match var_option {
-                    Ok(var) => {
-                        state_log.push(var.text());
-                        let term_option = Term::decode_debug(d, state_log);
-                        match term_option {
-                            Ok(term) => {
-                                state_log.push(")".to_string());
-                                Ok(Term::Lambda {
-                                    parameter_name: var.into(),
-                                    body: Rc::new(term),
-                                    uniq_id: next_uniq_id(),
-                                })
-                            }
-                            Err(error) => {
-                                state_log.push(")".to_string());
-                                Err(error)
-                            }
+                        if decode_list_bit(d)? {
+                            frames.push(Frame::ConstrField { tag, fields });
+                            current = None;
+                            break;
                         }
-                    }
-                    Err(error) => {
-                        state_log.push(")".to_string());
-                        Err(error)
-                    }
-                }
-            }
-            3 => {
-                state_log.push("[ ".to_string());
 
-                let function_term_option = Term::decode_debug(d, state_log);
-                match function_term_option {
-                    Ok(function) => {
-                        state_log.push(" ".to_string());
-                        let arg_term_option = Term::decode_debug(d, state_log);
-                        match arg_term_option {
-                            Ok(argument) => {
-                                state_log.push("]".to_string());
-                                Ok(Term::Apply {
-                                    function: Rc::new(function),
-                                    argument: Rc::new(argument),
-                                    uniq_id: next_uniq_id(),
-                                })
-                            }
-                            Err(error) => {
-                                state_log.push("]".to_string());
-                                Err(error)
-                            }
+                        current = Some(Term::Constr {
+                            tag,
+                            fields,
+                            uniq_id: next_uniq_id(),
+                        });
+                    }
+                    Frame::CaseConstr => {
+                        let constr = Rc::new(current.take().expect("term present"));
+
+                        if decode_list_bit(d)? {
+                            frames.push(Frame::CaseBranch {
+                                constr,
+                                branches: Vec::new(),
+                            });
+                            current = None;
+                            break;
                         }
-                    }
-                    Err(error) => {
-                        state_log.push(" not parsed]".to_string());
-                        Err(error)
-                    }
-                }
-            }
-            // Need size limit for Constant
-            4 => {
-                state_log.push("(con ".to_string());
 
-                let con_option = Constant::decode(d);
-                match con_option {
-                    Ok(constant) => {
-                        state_log.push(format!("{})", constant.to_pretty()));
-                        Ok(Term::Constant {
-                            value: constant.into(),
+                        current = Some(Term::Case {
+                            constr,
+                            branches: Vec::new(),
                             uniq_id: next_uniq_id(),
-                        })
+                        });
                     }
-                    Err(error) => {
-                        state_log.push("parse error)".to_string());
-                        Err(error)
-                    }
-                }
-            }
-            5 => {
-                state_log.push("(force ".to_string());
-                let term_option = Term::decode_debug(d, state_log);
-                match term_option {
-                    Ok(term) => {
-                        state_log.push(")".to_string());
-                        Ok(Term::Force {
-                            body: Rc::new(term),
+                    Frame::CaseBranch {
+                        constr,
+                        mut branches,
+                    } => {
+                        branches.push(current.take().expect("term present"));
+
+                        if decode_list_bit(d)? {
+                            frames.push(Frame::CaseBranch { constr, branches });
+                            current = None;
+                            break;
+                        }
+
+                        current = Some(Term::Case {
+                            constr,
+                            branches,
                             uniq_id: next_uniq_id(),
-                        })
-                    }
-                    Err(error) => {
-                        state_log.push(")".to_string());
-                        Err(error)
+                        });
                     }
                 }
             }
-            6 => {
-                state_log.push("(error)".to_string());
-                Ok(Term::Error {
-                    uniq_id: next_uniq_id(),
-                })
-            }
-            7 => {
-                state_log.push("(builtin ".to_string());
 
-                let builtin_option = DefaultFunction::decode(d);
-                match builtin_option {
-                    Ok(builtin) => {
-                        state_log.push(format!("{builtin})"));
-                        Ok(Term::Builtin {
-                            fun: builtin,
-                            uniq_id: next_uniq_id(),
-                        })
-                    }
-                    Err(error) => {
-                        state_log.push("parse error)".to_string());
-                        Err(error)
-                    }
-                }
-            }
-            8 => {
-                state_log.push("(constr ".to_string());
-
-                let tag = usize::decode(d)?;
-
-                let fields = d.decode_list_with_debug(
-                    |d, state_log| Term::<T>::decode_debug(d, state_log),
-                    state_log,
-                )?;
-
-                Ok(Term::Constr {
-                    tag,
-                    fields,
-                    uniq_id: next_uniq_id(),
-                })
-            }
-            9 => {
-                state_log.push("(case ".to_string());
-                let constr = Term::<T>::decode_debug(d, state_log)?.into();
-
-                let branches = d.decode_list_with_debug(
-                    |d, state_log| Term::<T>::decode_debug(d, state_log),
-                    state_log,
-                )?;
-
-                Ok(Term::Case {
-                    constr,
-                    branches,
-                    uniq_id: next_uniq_id(),
-                })
-            }
-            x => {
-                state_log.push("parse error".to_string());
-
-                let buffer_slice: Vec<u8> = d
-                    .buffer
-                    .to_vec()
-                    .iter()
-                    .skip(d.pos.saturating_sub(5))
-                    .take(10)
-                    .cloned()
-                    .collect();
-
-                Err(de::Error::UnknownTermConstructor(
-                    x,
-                    if d.pos > 5 { 5 } else { d.pos },
-                    format!("{buffer_slice:02X?}"),
-                    d.pos,
-                    d.buffer.len(),
-                ))
+            if frames.is_empty()
+                && let Some(done) = current.take()
+            {
+                return Ok(done);
             }
         }
     }
@@ -705,61 +800,109 @@ impl Encode for Constant {
     }
 }
 
+/// Write a constant's payload, without the type tags that introduce it.
+///
+/// Iterative for the same reason the term coders are: `ProtoList` and `ProtoPair` nest, and the
+/// depth is attacker-controlled. `Step` is the same device `Term::encode` uses -- the stack holds
+/// what is left to emit, and because it is LIFO, children go on in reverse of the order they
+/// appear in the output.
 fn encode_constant_value(x: &Constant, e: &mut Encoder) -> Result<(), en::Error> {
-    match x {
-        Constant::Integer(x) => x.encode(e),
-        Constant::ByteString(b) => b.encode(e),
-        Constant::String(s) => s.encode(e),
-        Constant::Unit => Ok(()),
-        Constant::Bool(b) => b.encode(e),
-        Constant::ProtoList(_, list) => {
-            e.encode_list_with(list, encode_constant_value)?;
-            Ok(())
-        }
-        Constant::ProtoPair(_, _, a, b) => {
-            encode_constant_value(a, e)?;
-
-            encode_constant_value(b, e)
-        }
-        Constant::Data(data) => {
-            let cbor = data
-                .encode_fragment()
-                .map_err(|err| en::Error::Message(err.to_string()))?;
-
-            cbor.encode(e)
-        }
-        Constant::Bls12_381G1Element(_) => Err(en::Error::Message(
-            "BLS12-381 G1 points are not supported for flat encoding".to_string(),
-        )),
-        Constant::Bls12_381G2Element(_) => Err(en::Error::Message(
-            "BLS12-381 G2 points are not supported for flat encoding".to_string(),
-        )),
-        Constant::Bls12_381MlResult(_) => Err(en::Error::Message(
-            "BLS12-381 ML results are not supported for flat encoding".to_string(),
-        )),
+    enum Step<'a> {
+        Value(&'a Constant),
+        List(ListStep),
     }
+
+    let mut steps: Vec<Step<'_>> = vec![Step::Value(x)];
+
+    while let Some(step) = steps.pop() {
+        let constant = match step {
+            Step::List(ListStep::Item) => {
+                e.bool(true);
+                continue;
+            }
+            Step::List(ListStep::End) => {
+                e.bool(false);
+                continue;
+            }
+            Step::Value(constant) => constant,
+        };
+
+        match constant {
+            Constant::Integer(x) => x.encode(e)?,
+            Constant::ByteString(b) => b.encode(e)?,
+            Constant::String(s) => s.encode(e)?,
+            Constant::Unit => (),
+            Constant::Bool(b) => b.encode(e)?,
+            Constant::ProtoList(_, list) => {
+                steps.push(Step::List(ListStep::End));
+
+                for item in list.iter().rev() {
+                    steps.push(Step::Value(item));
+                    steps.push(Step::List(ListStep::Item));
+                }
+            }
+            Constant::ProtoPair(_, _, a, b) => {
+                steps.push(Step::Value(b.as_ref()));
+                steps.push(Step::Value(a.as_ref()));
+            }
+            Constant::Data(data) => {
+                let cbor = data
+                    .encode_fragment()
+                    .map_err(|err| en::Error::Message(err.to_string()))?;
+
+                cbor.encode(e)?
+            }
+            Constant::Bls12_381G1Element(_) => {
+                return Err(en::Error::Message(
+                    "BLS12-381 G1 points are not supported for flat encoding".to_string(),
+                ));
+            }
+            Constant::Bls12_381G2Element(_) => {
+                return Err(en::Error::Message(
+                    "BLS12-381 G2 points are not supported for flat encoding".to_string(),
+                ));
+            }
+            Constant::Bls12_381MlResult(_) => {
+                return Err(en::Error::Message(
+                    "BLS12-381 ML results are not supported for flat encoding".to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
+/// Flatten a type into its run of 4-bit constructor tags.
+///
+/// Iterative for the same reason the term coders are: a nested `list` costs ten bits of tag per
+/// level, so a script inside the on-chain size limit carries a type over ten thousand levels deep,
+/// and that depth is attacker-controlled. The stack is LIFO, so a pair's components go on in
+/// reverse of the order they are written.
 fn encode_type(typ: &Type, bytes: &mut Vec<u8>) {
-    match typ {
-        Type::Integer => bytes.push(0),
-        Type::ByteString => bytes.push(1),
-        Type::String => bytes.push(2),
-        Type::Unit => bytes.push(3),
-        Type::Bool => bytes.push(4),
-        Type::List(sub_typ) => {
-            bytes.extend(vec![7, 5]);
-            encode_type(sub_typ, bytes);
+    let mut pending: Vec<&Type> = vec![typ];
+
+    while let Some(typ) = pending.pop() {
+        match typ {
+            Type::Integer => bytes.push(0),
+            Type::ByteString => bytes.push(1),
+            Type::String => bytes.push(2),
+            Type::Unit => bytes.push(3),
+            Type::Bool => bytes.push(4),
+            Type::List(sub_typ) => {
+                bytes.extend(vec![7, 5]);
+                pending.push(sub_typ);
+            }
+            Type::Pair(type1, type2) => {
+                bytes.extend(vec![7, 7, 6]);
+                pending.push(type2);
+                pending.push(type1);
+            }
+            Type::Data => bytes.push(8),
+            Type::Bls12_381G1Element => bytes.push(9),
+            Type::Bls12_381G2Element => bytes.push(10),
+            Type::Bls12_381MlResult => bytes.push(11),
         }
-        Type::Pair(type1, type2) => {
-            bytes.extend(vec![7, 7, 6]);
-            encode_type(type1, bytes);
-            encode_type(type2, bytes);
-        }
-        Type::Data => bytes.push(8),
-        Type::Bls12_381G1Element => bytes.push(9),
-        Type::Bls12_381G2Element => bytes.push(10),
-        Type::Bls12_381MlResult => bytes.push(11),
     }
 }
 
@@ -831,99 +974,238 @@ impl Decode<'_> for Constant {
     }
 }
 
+/// Read a constant's payload, given the type that introduces it.
+///
+/// The mirror of `encode_constant_value`, and iterative for the same reason: `list` and `pair`
+/// nest as deep as the script says. `Frame` is the same device `Term::decode` uses -- it records
+/// what is still waiting for a value while the walk reads the next one.
 fn decode_constant_value(typ: Rc<Type>, d: &mut Decoder) -> Result<Constant, de::Error> {
-    match typ.as_ref() {
-        Type::Integer => Ok(Constant::Integer(BigInt::decode(d)?)),
-        Type::ByteString => Ok(Constant::ByteString(Vec::<u8>::decode(d)?)),
-        Type::String => Ok(Constant::String(String::decode(d)?)),
-        Type::Unit => Ok(Constant::Unit),
-        Type::Bool => Ok(Constant::Bool(bool::decode(d)?)),
-        Type::List(sub_type) => {
-            let list: Vec<Constant> =
-                d.decode_list_with(|d| decode_constant_value(sub_type.clone(), d))?;
+    enum Frame {
+        /// Elements of a `list` read so far; another one is on its way.
+        ListItem {
+            elem_type: Rc<Type>,
+            items: Vec<Constant>,
+        },
+        /// The first component of a `pair` is being read.
+        PairFst {
+            first_type: Rc<Type>,
+            second_type: Rc<Type>,
+        },
+        /// The second component of a `pair` is being read; the first is done.
+        PairSnd {
+            first_type: Rc<Type>,
+            second_type: Rc<Type>,
+            first: Rc<Constant>,
+        },
+    }
 
-            Ok(Constant::ProtoList(sub_type.as_ref().clone(), list))
+    let mut frames: Vec<Frame> = Vec::new();
+    let mut next = typ;
+
+    loop {
+        let typ = Rc::clone(&next);
+
+        // Read one value. `list` and `pair` push a frame and go round again for their first
+        // component; everything else is a leaf and starts the fold below.
+        let mut current = match typ.as_ref() {
+            Type::Integer => Constant::Integer(BigInt::decode(d)?),
+            Type::ByteString => Constant::ByteString(Vec::<u8>::decode(d)?),
+            Type::String => Constant::String(String::decode(d)?),
+            Type::Unit => Constant::Unit,
+            Type::Bool => Constant::Bool(bool::decode(d)?),
+            Type::List(sub_type) => {
+                // Walked a frame at a time rather than with `decode_list_with`, whose element
+                // decoder would be this function again.
+                if decode_list_bit(d)? {
+                    next = Rc::clone(sub_type);
+
+                    frames.push(Frame::ListItem {
+                        elem_type: Rc::clone(sub_type),
+                        items: Vec::new(),
+                    });
+
+                    continue;
+                }
+
+                Constant::ProtoList(sub_type.as_ref().clone(), Vec::new())
+            }
+            Type::Pair(type1, type2) => {
+                next = Rc::clone(type1);
+
+                frames.push(Frame::PairFst {
+                    first_type: Rc::clone(type1),
+                    second_type: Rc::clone(type2),
+                });
+
+                continue;
+            }
+            Type::Data => {
+                let cbor = Vec::<u8>::decode(d)?;
+
+                let data = PlutusData::decode_fragment(&cbor)
+                    .map_err(|err| de::Error::Message(err.to_string()))?;
+
+                Constant::Data(data)
+            }
+            Type::Bls12_381G1Element => {
+                let p1 = Vec::<u8>::decode(d)?;
+
+                let _p1 = blst::blst_p1::uncompress(&p1)
+                    .map_err(|err| de::Error::Message(format!("Failed to uncompress p1: {err}")))?;
+
+                return Err(de::Error::Message(
+                    "BLS12-381 G1 points are not supported for flat decoding.".to_string(),
+                ));
+            }
+            Type::Bls12_381G2Element => {
+                let p2 = Vec::<u8>::decode(d)?;
+
+                let _p2 = blst::blst_p2::uncompress(&p2)
+                    .map_err(|err| de::Error::Message(format!("Failed to uncompress p2: {err}")))?;
+
+                return Err(de::Error::Message(
+                    "BLS12-381 G2 points are not supported for flat decoding.".to_string(),
+                ));
+            }
+            Type::Bls12_381MlResult => {
+                return Err(de::Error::Message(
+                    "BLS12-381 ML results are not supported for flat decoding".to_string(),
+                ));
+            }
+        };
+
+        // Fold the finished value into whatever was waiting for it.
+        loop {
+            match frames.pop() {
+                None => return Ok(current),
+                Some(Frame::ListItem {
+                    elem_type,
+                    mut items,
+                }) => {
+                    items.push(current);
+
+                    if decode_list_bit(d)? {
+                        next = Rc::clone(&elem_type);
+                        frames.push(Frame::ListItem { elem_type, items });
+                        break;
+                    }
+
+                    current = Constant::ProtoList(elem_type.as_ref().clone(), items);
+                }
+                Some(Frame::PairFst {
+                    first_type,
+                    second_type,
+                }) => {
+                    next = Rc::clone(&second_type);
+
+                    frames.push(Frame::PairSnd {
+                        first_type,
+                        second_type,
+                        first: current.into(),
+                    });
+
+                    break;
+                }
+                Some(Frame::PairSnd {
+                    first_type,
+                    second_type,
+                    first,
+                }) => {
+                    current = Constant::ProtoPair(
+                        first_type.as_ref().clone(),
+                        second_type.as_ref().clone(),
+                        first,
+                        current.into(),
+                    );
+                }
+            }
         }
-        Type::Pair(type1, type2) => {
-            let a = decode_constant_value(type1.clone(), d)?;
-            let b = decode_constant_value(type2.clone(), d)?;
-
-            Ok(Constant::ProtoPair(
-                type1.as_ref().clone(),
-                type2.as_ref().clone(),
-                a.into(),
-                b.into(),
-            ))
-        }
-        Type::Data => {
-            let cbor = Vec::<u8>::decode(d)?;
-
-            let data = PlutusData::decode_fragment(&cbor)
-                .map_err(|err| de::Error::Message(err.to_string()))?;
-
-            Ok(Constant::Data(data))
-        }
-        Type::Bls12_381G1Element => {
-            let p1 = Vec::<u8>::decode(d)?;
-
-            let _p1 = blst::blst_p1::uncompress(&p1)
-                .map_err(|err| de::Error::Message(format!("Failed to uncompress p1: {err}")))?;
-
-            Err(de::Error::Message(
-                "BLS12-381 G1 points are not supported for flat decoding.".to_string(),
-            ))
-        }
-        Type::Bls12_381G2Element => {
-            let p2 = Vec::<u8>::decode(d)?;
-
-            let _p2 = blst::blst_p2::uncompress(&p2)
-                .map_err(|err| de::Error::Message(format!("Failed to uncompress p2: {err}")))?;
-
-            Err(de::Error::Message(
-                "BLS12-381 G2 points are not supported for flat decoding.".to_string(),
-            ))
-        }
-        Type::Bls12_381MlResult => Err(de::Error::Message(
-            "BLS12-381 ML results are not supported for flat decoding".to_string(),
-        )),
     }
 }
 
+/// Rebuild a type from its run of 4-bit constructor tags.
+///
+/// The mirror of `encode_type`, and iterative for the same reason: the depth of the type is
+/// attacker-controlled. `Frame` plays the same role here that it does in `Term::decode` -- it
+/// records what is still waiting for an operand while the walk reads the next one.
 fn decode_type(types: &mut VecDeque<u8>) -> Result<Type, de::Error> {
-    match types.pop_front() {
-        Some(4) => Ok(Type::Bool),
-        Some(0) => Ok(Type::Integer),
-        Some(2) => Ok(Type::String),
-        Some(1) => Ok(Type::ByteString),
-        Some(3) => Ok(Type::Unit),
-        Some(8) => Ok(Type::Data),
-        Some(9) => Ok(Type::Bls12_381G1Element),
-        Some(10) => Ok(Type::Bls12_381G2Element),
-        Some(11) => Ok(Type::Bls12_381MlResult),
-        Some(7) => match types.pop_front() {
-            Some(5) => Ok(Type::List(decode_type(types)?.into())),
+    enum Frame {
+        /// The element type of a `list` is being read.
+        List,
+        /// The first component of a `pair` is being read.
+        PairFst,
+        /// The second component of a `pair` is being read; the first is done.
+        PairSnd { first: Rc<Type> },
+    }
+
+    let mut frames: Vec<Frame> = Vec::new();
+
+    loop {
+        // Read one constructor. `list` and `pair` push a frame and go round again for their
+        // operand; everything else is a leaf and starts the fold below.
+        let mut current = match types.pop_front() {
+            Some(4) => Type::Bool,
+            Some(0) => Type::Integer,
+            Some(2) => Type::String,
+            Some(1) => Type::ByteString,
+            Some(3) => Type::Unit,
+            Some(8) => Type::Data,
+            Some(9) => Type::Bls12_381G1Element,
+            Some(10) => Type::Bls12_381G2Element,
+            Some(11) => Type::Bls12_381MlResult,
             Some(7) => match types.pop_front() {
-                Some(6) => {
-                    let type1 = decode_type(types)?;
-                    let type2 = decode_type(types)?;
-
-                    Ok(Type::Pair(type1.into(), type2.into()))
+                Some(5) => {
+                    frames.push(Frame::List);
+                    continue;
                 }
-                Some(x) => Err(de::Error::Message(format!(
-                    "Unknown constant type tag: {x}"
-                ))),
-                None => Err(de::Error::Message("Unexpected empty buffer".to_string())),
+                Some(7) => match types.pop_front() {
+                    Some(6) => {
+                        frames.push(Frame::PairFst);
+                        continue;
+                    }
+                    Some(x) => {
+                        return Err(de::Error::Message(format!(
+                            "Unknown constant type tag: {x}"
+                        )));
+                    }
+                    None => {
+                        return Err(de::Error::Message("Unexpected empty buffer".to_string()));
+                    }
+                },
+                Some(x) => {
+                    return Err(de::Error::Message(format!(
+                        "Unknown constant type tag: {x}"
+                    )));
+                }
+                None => {
+                    return Err(de::Error::Message("Unexpected empty buffer".to_string()));
+                }
             },
-            Some(x) => Err(de::Error::Message(format!(
-                "Unknown constant type tag: {x}"
-            ))),
-            None => Err(de::Error::Message("Unexpected empty buffer".to_string())),
-        },
 
-        Some(x) => Err(de::Error::Message(format!(
-            "Unknown constant type tag: {x}"
-        ))),
-        None => Err(de::Error::Message("Unexpected empty buffer".to_string())),
+            Some(x) => {
+                return Err(de::Error::Message(format!(
+                    "Unknown constant type tag: {x}"
+                )));
+            }
+            None => {
+                return Err(de::Error::Message("Unexpected empty buffer".to_string()));
+            }
+        };
+
+        // Fold the finished type into whatever was waiting for it.
+        loop {
+            match frames.pop() {
+                None => return Ok(current),
+                Some(Frame::List) => current = Type::List(current.into()),
+                Some(Frame::PairFst) => {
+                    frames.push(Frame::PairSnd {
+                        first: current.into(),
+                    });
+                    break;
+                }
+                Some(Frame::PairSnd { first }) => current = Type::Pair(first, current.into()),
+            }
+        }
     }
 }
 
