@@ -31,8 +31,11 @@ use std::{
     convert::AsRef,
     fmt::{self, Display},
     hash::{self, Hash},
+    mem,
     rc::Rc,
 };
+
+use crate::global_uniq::next_uniq_id;
 
 /// This represents a program in Untyped Plutus Core.
 /// A program contains a version tuple and a term.
@@ -54,6 +57,7 @@ where
         let applied_term = Term::Apply {
             function: Rc::new(self.term.clone()),
             argument: Rc::new(program.term.clone()),
+            uniq_id: next_uniq_id(),
         };
 
         Program {
@@ -67,7 +71,11 @@ where
     pub fn apply_data(&self, plutus_data: PlutusData) -> Self {
         let applied_term = Term::Apply {
             function: Rc::new(self.term.clone()),
-            argument: Rc::new(Term::Constant(Constant::Data(plutus_data).into())),
+            argument: Rc::new(Term::Constant {
+                value: Constant::Data(plutus_data).into(),
+                uniq_id: next_uniq_id(),
+            }),
+            uniq_id: next_uniq_id(),
         };
 
         Program {
@@ -85,6 +93,7 @@ impl Program<Name> {
         let applied_term = Term::Apply {
             function: Rc::new(self.term.clone()),
             argument: Rc::new(term.clone()),
+            uniq_id: next_uniq_id(),
         };
 
         let mut program = Program {
@@ -297,39 +306,60 @@ impl Program<DeBruijn> {
 /// Specifically, `Var` and `parameter_name` in `Lambda` can be a `Name`,
 /// `NamedDebruijn`, or `DeBruijn`. When encoded to flat for on chain usage
 /// we must encode using the `DeBruijn` form.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Term<T> {
     // tag: 0
-    Var(Rc<T>),
+    Var {
+        name: Rc<T>,
+        uniq_id: isize,
+    },
     // tag: 1
-    Delay(Rc<Term<T>>),
+    Delay {
+        body: Rc<Term<T>>,
+        uniq_id: isize,
+    },
     // tag: 2
     Lambda {
         parameter_name: Rc<T>,
         body: Rc<Term<T>>,
+        uniq_id: isize,
     },
     // tag: 3
     Apply {
         function: Rc<Term<T>>,
         argument: Rc<Term<T>>,
+        uniq_id: isize,
     },
     // tag: 4
-    Constant(Rc<Constant>),
+    Constant {
+        value: Rc<Constant>,
+        uniq_id: isize,
+    },
     // tag: 5
-    Force(Rc<Term<T>>),
+    Force {
+        body: Rc<Term<T>>,
+        uniq_id: isize,
+    },
     // tag: 6
-    Error,
+    Error {
+        uniq_id: isize,
+    },
     // tag: 7
-    Builtin(DefaultFunction),
+    Builtin {
+        fun: DefaultFunction,
+        uniq_id: isize,
+    },
     // tag: 8
     Constr {
         tag: usize,
         fields: Vec<Term<T>>,
+        uniq_id: isize,
     },
     // tag: 9
     Case {
         constr: Rc<Term<T>>,
         branches: Vec<Term<T>>,
+        uniq_id: isize,
     },
 }
 
@@ -341,66 +371,154 @@ impl<T: Clone> Term<T> {
     /// non-atomic counts would otherwise forbid.
     pub fn deep_clone(&self) -> Term<T> {
         match self {
-            Term::Var(name) => Term::Var(Rc::new(name.as_ref().clone())),
-            Term::Delay(term) => Term::Delay(Rc::new(term.deep_clone())),
+            Term::Var { name, uniq_id } => Term::Var {
+                name: Rc::new(name.as_ref().clone()),
+                uniq_id: *uniq_id,
+            },
+            Term::Delay { body, uniq_id } => Term::Delay {
+                body: Rc::new(body.deep_clone()),
+                uniq_id: *uniq_id,
+            },
             Term::Lambda {
                 parameter_name,
                 body,
+                uniq_id,
             } => Term::Lambda {
                 parameter_name: Rc::new(parameter_name.as_ref().clone()),
                 body: Rc::new(body.deep_clone()),
+                uniq_id: *uniq_id,
             },
-            Term::Apply { function, argument } => Term::Apply {
+            Term::Apply {
+                function,
+                argument,
+                uniq_id,
+            } => Term::Apply {
                 function: Rc::new(function.deep_clone()),
                 argument: Rc::new(argument.deep_clone()),
+                uniq_id: *uniq_id,
             },
-            Term::Constant(constant) => Term::Constant(Rc::new(constant.deep_clone())),
-            Term::Force(term) => Term::Force(Rc::new(term.deep_clone())),
-            Term::Error => Term::Error,
-            Term::Builtin(fun) => Term::Builtin(*fun),
-            Term::Constr { tag, fields } => Term::Constr {
+            Term::Constant { value, uniq_id } => Term::Constant {
+                value: Rc::new(value.deep_clone()),
+                uniq_id: *uniq_id,
+            },
+            Term::Force { body, uniq_id } => Term::Force {
+                body: Rc::new(body.deep_clone()),
+                uniq_id: *uniq_id,
+            },
+            Term::Error { uniq_id } => Term::Error { uniq_id: *uniq_id },
+            Term::Builtin { fun, uniq_id } => Term::Builtin {
+                fun: *fun,
+                uniq_id: *uniq_id,
+            },
+            Term::Constr {
+                tag,
+                fields,
+                uniq_id,
+            } => Term::Constr {
                 tag: *tag,
                 fields: fields.iter().map(|field| field.deep_clone()).collect(),
+                uniq_id: *uniq_id,
             },
-            Term::Case { constr, branches } => Term::Case {
+            Term::Case {
+                constr,
+                branches,
+                uniq_id,
+            } => Term::Case {
                 constr: Rc::new(constr.deep_clone()),
                 branches: branches.iter().map(|branch| branch.deep_clone()).collect(),
+                uniq_id: *uniq_id,
             },
         }
     }
 }
 
 impl<T> Term<T> {
+    /// The term's unique id (every variant carries one).
+    pub fn uniq_id(&self) -> isize {
+        match self {
+            Term::Var { uniq_id, .. }
+            | Term::Delay { uniq_id, .. }
+            | Term::Lambda { uniq_id, .. }
+            | Term::Apply { uniq_id, .. }
+            | Term::Constant { uniq_id, .. }
+            | Term::Force { uniq_id, .. }
+            | Term::Error { uniq_id, .. }
+            | Term::Builtin { uniq_id, .. }
+            | Term::Constr { uniq_id, .. }
+            | Term::Case { uniq_id, .. } => *uniq_id,
+        }
+    }
+
     pub fn is_constant(&self) -> bool {
-        matches!(self, Term::Constant(..))
-            || matches!(self, Term::Delay(term) | Term::Force(term) if term.is_constant())
+        matches!(self, Term::Constant { .. })
+            || matches!(self, Term::Delay { body: term, .. } | Term::Force { body: term, .. } if term.is_constant())
     }
 
     pub fn is_true(&self) -> bool {
-        matches!(self, Term::Constant(c) if c.as_ref() == &Constant::Bool(true))
+        matches!(self, Term::Constant { value: c, .. } if c.as_ref() == &Constant::Bool(true))
     }
 
     pub fn is_false(&self) -> bool {
-        matches!(self, Term::Constant(c) if c.as_ref() == &Constant::Bool(false))
+        matches!(self, Term::Constant { value: c, .. } if c.as_ref() == &Constant::Bool(false))
     }
 
     pub fn is_unit(&self) -> bool {
-        matches!(self, Term::Constant(c) if c.as_ref() == &Constant::Unit)
+        matches!(self, Term::Constant { value: c, .. } if c.as_ref() == &Constant::Unit)
     }
 
     pub fn is_int(&self) -> bool {
-        matches!(self, Term::Constant(c) if matches!(c.as_ref(), &Constant::Integer(_)))
+        matches!(self, Term::Constant { value: c, .. } if matches!(c.as_ref(), &Constant::Integer(_)))
     }
+}
 
+impl<T> PartialEq for Term<T> 
+where
+    T: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Term::Var { name: n1, .. }, Term::Var { name: n2, .. }) => n1 == n2,
+            (Term::Delay { body: b1, .. }, Term::Delay { body: b2, .. }) => b1 == b2,
+            (Term::Lambda { parameter_name: p1, body: b1, .. }, Term::Lambda { parameter_name: p2, body: b2, .. }) => {
+                p1 == p2 && b1 == b2
+            }
+            (Term::Apply { function: f1, argument: a1, .. }, Term::Apply { function: f2, argument: a2, .. }) => {
+                f1 == f2 && a1 == a2
+            }
+            (Term::Constant { value: v1, .. }, Term::Constant { value: v2, .. }) => v1 == v2,
+            (Term::Force { body: b1, .. }, Term::Force { body: b2, .. }) => b1 == b2,
+            (Term::Error { .. }, Term::Error { .. }) => true,
+            (Term::Builtin { fun: f1, .. }, Term::Builtin { fun: f2, .. }) => f1 == f2,
+            (Term::Constr { tag: t1, fields: f1, .. }, Term::Constr { tag: t2, fields: f2, .. }) => {
+                t1 == t2 && f1 == f2
+            }
+            (Term::Case { constr: c1, branches: b1, .. }, Term::Case { constr: c2, branches: b2, .. }) => {
+                c1 == c2 && b1 == b2
+            }
+            _ => false,
+        }
+    }
+}
+
+impl<T> Term<T> {
     /// Change a constant integer to its opposite.
     pub fn try_negate(&self) -> Option<Self> {
         match self {
-            Self::Constant(cst) => match cst.as_ref() {
-                Constant::Integer(i) => Some(Self::Constant(Rc::new(Constant::Integer(-1 * i)))),
+            Self::Constant { value: cst, .. } => match cst.as_ref() {
+                Constant::Integer(i) => Some(Self::Constant {
+                    value: Rc::new(Constant::Integer(-1 * i)),
+                    uniq_id: next_uniq_id(),
+                }),
                 _ => None,
             },
-            Self::Delay(rc) => rc.try_negate().map(Rc::new).map(Self::Delay),
-            Self::Force(rc) => rc.try_negate().map(Rc::new).map(Self::Force),
+            Self::Delay { body: rc, .. } => rc.try_negate().map(Rc::new).map(|body| Self::Delay {
+                body,
+                uniq_id: next_uniq_id(),
+            }),
+            Self::Force { body: rc, .. } => rc.try_negate().map(Rc::new).map(|body| Self::Force {
+                body,
+                uniq_id: next_uniq_id(),
+            }),
             _ => None,
         }
     }
@@ -410,8 +528,10 @@ impl<T> TryInto<PlutusData> for Term<T> {
     type Error = String;
 
     fn try_into(self) -> Result<PlutusData, String> {
-        match self {
-            Term::Constant(rc) => match &*rc {
+        // `Term` has a manual `Drop` (see below), so its fields cannot be moved out by pattern.
+        // Nothing is moved out here anyway: the data is copied out of the borrowed constant.
+        match &self {
+            Term::Constant { value: rc, .. } => match rc.as_ref() {
                 Constant::Data(data) => Ok(data.to_owned()),
                 _ => Err("not a data".to_string()),
             },
@@ -426,6 +546,100 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.to_pretty())
+    }
+}
+
+/// The compiler-derived destructor for `Term` is recursive: dropping a node drops its `Rc`
+/// children, which drop theirs, one stack frame per level of nesting. The nesting depth of a
+/// term is attacker-controlled — the cheapest flat encoding of one level is a single 4-bit
+/// `delay` (or `force`) tag, so a script that fits inside the on-chain size limit is already
+/// tens of thousands of levels deep — and on `wasm32` the engine's call stack is about a
+/// megabyte and cannot be grown from the page. `Term::decode` is iterative for exactly that
+/// reason; without this impl, a term that decodes fine still blows the stack when it is
+/// released. Do not remove this as redundant.
+///
+/// The teardown moves every child out of the node it is dismantling and onto an explicit
+/// worklist, so the stack stays O(1) no matter how deep the tree is.
+impl<T> Drop for Term<T> {
+    fn drop(&mut self) {
+        let mut pending: Vec<Term<T>> = Vec::new();
+        let mut filler: Option<Rc<Term<T>>> = None;
+
+        detach_term_children(self, &mut pending, &mut filler);
+
+        while let Some(mut term) = pending.pop() {
+            detach_term_children(&mut term, &mut pending, &mut filler);
+
+            // Every child `term` owned has been moved onto `pending`, so the `Drop` that runs
+            // here is shallow: it re-enters this impl once, finds nothing left to detach, and
+            // returns without recursing any further.
+        }
+    }
+}
+
+/// Move the children `term` solely owns onto `pending`, leaving `term` childless.
+fn detach_term_children<T>(
+    term: &mut Term<T>,
+    pending: &mut Vec<Term<T>>,
+    filler: &mut Option<Rc<Term<T>>>,
+) {
+    match term {
+        Term::Var { .. }
+        | Term::Constant { .. }
+        | Term::Error { .. }
+        | Term::Builtin { .. } => {}
+
+        Term::Delay { body, .. } | Term::Lambda { body, .. } | Term::Force { body, .. } => {
+            detach_term_child(body, pending, filler);
+        }
+
+        Term::Apply {
+            function, argument, ..
+        } => {
+            detach_term_child(function, pending, filler);
+            detach_term_child(argument, pending, filler);
+        }
+
+        Term::Constr { fields, .. } => {
+            // Fields are owned outright, so they always come along.
+            pending.append(fields);
+        }
+
+        Term::Case {
+            constr, branches, ..
+        } => {
+            detach_term_child(constr, pending, filler);
+            pending.append(branches);
+        }
+    }
+}
+
+/// Take the subtree behind `slot`, but only when we are its sole owner.
+///
+/// `Rc` children may be shared, and a shared subtree is not ours to dismantle: unwrapping it
+/// would strip it out from under the other holders. So we look at the strong count first — the
+/// exact condition under which `Rc::try_unwrap` hands the value back — and when the handle is
+/// shared we leave it where it is. Dropping a shared `Rc` along with its node is O(1) and never
+/// touches the pointee, so nothing recurses.
+///
+/// When we *are* the sole owner we swap in a leaf before unwrapping, so the node we are
+/// dismantling is left holding something harmless. That stand-in is a clone of a single `Error`
+/// leaf shared by the whole teardown, which means the shallow `Drop` that later visits those
+/// slots sees a strong count above one and skips them — no allocation, no extra work per node.
+fn detach_term_child<T>(
+    slot: &mut Rc<Term<T>>,
+    pending: &mut Vec<Term<T>>,
+    filler: &mut Option<Rc<Term<T>>>,
+) {
+    if Rc::strong_count(slot) != 1 {
+        return;
+    }
+
+    // The leaf never escapes this teardown, so its id is never observed.
+    let filler = filler.get_or_insert_with(|| Rc::new(Term::Error { uniq_id: 0 }));
+
+    if let Ok(term) = Rc::try_unwrap(mem::replace(slot, Rc::clone(filler))) {
+        pending.push(term);
     }
 }
 
@@ -979,6 +1193,79 @@ fn pallas_bigint_to_i128(quantity: &conway::BigInt) -> Result<i128, ValueError> 
         .map_err(|_| ValueError::DataQuantityOutOfBounds)
 }
 
+/// `Constant` nests through `ProtoList` and `ProtoPair`, and its depth is attacker-controlled
+/// the same way `Term`'s is: the element type is a run of 4-bit tags, so `list (list (list …))`
+/// costs a couple of bytes per level and an in-limit script reaches thousands of levels. See the
+/// `Drop` impl on `Term` for the full rationale; the teardown here works the same way.
+impl Drop for Constant {
+    fn drop(&mut self) {
+        let mut pending: Vec<Constant> = Vec::new();
+        let mut filler: Option<Rc<Constant>> = None;
+
+        detach_constant_children(self, &mut pending, &mut filler);
+
+        while let Some(mut constant) = pending.pop() {
+            detach_constant_children(&mut constant, &mut pending, &mut filler);
+        }
+    }
+}
+
+/// Move the constants `constant` solely owns onto `pending`, leaving it childless.
+///
+/// The `Type` fields are left in place on purpose: they carry their own iterative `Drop`, so the
+/// shallow drop of this node releases them without recursing.
+fn detach_constant_children(
+    constant: &mut Constant,
+    pending: &mut Vec<Constant>,
+    filler: &mut Option<Rc<Constant>>,
+) {
+    match constant {
+        Constant::Integer(..)
+        | Constant::ByteString(..)
+        | Constant::String(..)
+        | Constant::Unit
+        | Constant::Bool(..)
+        | Constant::Data(..)
+        | Constant::Bls12_381G1Element(..)
+        | Constant::Bls12_381G2Element(..)
+        | Constant::Bls12_381MlResult(..)
+        | Constant::Value(..) => {}
+
+        Constant::ProtoList(_, items) => {
+            // Elements are shared `Rc`s: only the ones we solely own are taken apart, the rest are
+            // released in O(1) without touching the pointee.
+            for item in mem::take(items) {
+                if let Ok(item) = Rc::try_unwrap(item) {
+                    pending.push(item);
+                }
+            }
+        }
+
+        Constant::ProtoPair(_, _, fst, snd) => {
+            detach_constant_child(fst, pending, filler);
+            detach_constant_child(snd, pending, filler);
+        }
+    }
+}
+
+/// Take the constant behind `slot`, but only when we are its sole owner — same `Rc` reasoning as
+/// [`detach_term_child`].
+fn detach_constant_child(
+    slot: &mut Rc<Constant>,
+    pending: &mut Vec<Constant>,
+    filler: &mut Option<Rc<Constant>>,
+) {
+    if Rc::strong_count(slot) != 1 {
+        return;
+    }
+
+    let filler = filler.get_or_insert_with(|| Rc::new(Constant::Unit));
+
+    if let Ok(constant) = Rc::try_unwrap(mem::replace(slot, Rc::clone(filler))) {
+        pending.push(constant);
+    }
+}
+
 pub struct Data;
 
 // TODO: See about moving these builders upstream to Pallas?
@@ -1041,7 +1328,7 @@ impl Data {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum Type {
     Bool,
     Integer,
@@ -1108,6 +1395,87 @@ impl Type {
             }
             other => other.clone(),
         }
+    }
+}
+
+/// The derived `Clone` copies a whole type tree, one stack frame per level, and the flat decoder
+/// clones the element type at every level of a nested `list` -- so a deep constant would overflow
+/// on the way in. Cloning the top node and sharing its `Rc` children instead is O(1) and
+/// unobservable: a `Type` is immutable once built (nothing in the crate reaches through an
+/// `Rc<Type>` with `make_mut` or `get_mut`, and there is no interior mutability), and `PartialEq`
+/// and `Debug` on `Rc` both read straight through to the pointee. Do not put this back on the
+/// derive.
+impl Clone for Type {
+    fn clone(&self) -> Self {
+        match self {
+            Type::Bool => Type::Bool,
+            Type::Integer => Type::Integer,
+            Type::String => Type::String,
+            Type::ByteString => Type::ByteString,
+            Type::Unit => Type::Unit,
+            Type::Data => Type::Data,
+            Type::Bls12_381G1Element => Type::Bls12_381G1Element,
+            Type::Bls12_381G2Element => Type::Bls12_381G2Element,
+            Type::Bls12_381MlResult => Type::Bls12_381MlResult,
+            Type::Value => Type::Value,
+            Type::List(inner) => Type::List(Rc::clone(inner)),
+            Type::Pair(fst, snd) => Type::Pair(Rc::clone(fst), Rc::clone(snd)),
+        }
+    }
+}
+
+/// `Type` nests through `List` and `Pair`, and a deep constant carries an equally deep element
+/// type along with it, so the derived destructor would recurse just as far. See the `Drop` impl
+/// on `Term` for the full rationale.
+impl Drop for Type {
+    fn drop(&mut self) {
+        let mut pending: Vec<Type> = Vec::new();
+        let mut filler: Option<Rc<Type>> = None;
+
+        detach_type_children(self, &mut pending, &mut filler);
+
+        while let Some(mut typ) = pending.pop() {
+            detach_type_children(&mut typ, &mut pending, &mut filler);
+        }
+    }
+}
+
+/// Move the types `typ` solely owns onto `pending`, leaving it childless.
+fn detach_type_children(typ: &mut Type, pending: &mut Vec<Type>, filler: &mut Option<Rc<Type>>) {
+    match typ {
+        Type::Bool
+        | Type::Integer
+        | Type::String
+        | Type::ByteString
+        | Type::Unit
+        | Type::Data
+        | Type::Bls12_381G1Element
+        | Type::Bls12_381G2Element
+        | Type::Bls12_381MlResult
+        | Type::Value => {}
+
+        Type::List(inner) => {
+            detach_type_child(inner, pending, filler);
+        }
+
+        Type::Pair(fst, snd) => {
+            detach_type_child(fst, pending, filler);
+            detach_type_child(snd, pending, filler);
+        }
+    }
+}
+
+/// Take the type behind `slot`, but only when we are its sole owner — same `Rc` reasoning as
+/// [`detach_term_child`].
+fn detach_type_child(slot: &mut Rc<Type>, pending: &mut Vec<Type>, filler: &mut Option<Rc<Type>>) {
+    if Rc::strong_count(slot) != 1 {
+        return;
+    }
+
+    let filler = filler.get_or_insert_with(|| Rc::new(Type::Unit));
+
+    if let Ok(typ) = Rc::try_unwrap(mem::replace(slot, Rc::clone(filler))) {
+        pending.push(typ);
     }
 }
 
@@ -1644,18 +2012,25 @@ impl Program<DeBruijn> {
 
 impl Term<NamedDeBruijn> {
     pub fn is_valid_script_result(&self) -> bool {
-        !matches!(self, Term::Error)
+        !matches!(self, Term::Error { .. })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::ast::{Data, Value, ValueEntries, ValueError};
+    use crate::ast::{Constant, Data, Name, Term, Type, Value, ValueEntries, ValueError};
+    use crate::builtins::DefaultFunction;
     use num_bigint::{BigInt, Sign};
     use pallas_codec::minicbor;
     use pallas_primitives::{alonzo::PlutusData, conway};
     use proptest::prelude::*;
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, rc::Rc};
+
+    /// Deep enough that a destructor taking one stack frame per level cannot survive the test
+    /// harness's ~2 MiB thread stack, let alone the ~1 MiB a `wasm32` engine gives us. A script
+    /// inside the on-chain size limit can nest far deeper than this: the cheapest level in flat is
+    /// a 4-bit `delay` tag, half a byte.
+    const DEEP: usize = 100_000;
 
     // Data's negative integers are encoded with an offset of 1, as an unsigned payload. This is unlike
     // num_bigint's BigInt; so both types representations aren't quite compatible with one another.
@@ -1671,6 +2046,169 @@ mod tests {
         let large_negative_num_decoded = BigInt::from_bytes_be(Sign::Plus, &buf[2..]);
 
         assert_eq!(large_negative_num_decoded, -1 - large_negative_num);
+    }
+
+    /// Every spine below is built with a loop, never a recursive helper: a recursive builder would
+    /// overflow while setting the test up and hide the thing we are actually testing.
+    fn deep_delay_spine(depth: usize) -> Term<Name> {
+        let mut term = Term::Error { uniq_id: 0 };
+
+        for level in 0..depth {
+            term = Term::Delay {
+                body: Rc::new(term),
+                uniq_id: level as isize,
+            };
+        }
+
+        term
+    }
+
+    #[test]
+    fn deep_term_drops_without_overflowing_the_stack() {
+        drop(deep_delay_spine(DEEP));
+    }
+
+    #[test]
+    fn deep_apply_spine_drops_without_overflowing_the_stack() {
+        // `Apply` nests through two children at once, so this also covers a node being dismantled
+        // in more than one direction.
+        let mut term: Term<Name> = Term::Error { uniq_id: 0 };
+
+        for level in 0..DEEP {
+            term = Term::Apply {
+                function: Rc::new(term),
+                argument: Rc::new(Term::Error { uniq_id: 0 }),
+                uniq_id: level as isize,
+            };
+        }
+
+        drop(term);
+    }
+
+    #[test]
+    fn deep_constr_and_case_spine_drops_without_overflowing_the_stack() {
+        // `Constr` and `Case` nest through owned vectors rather than `Rc`s.
+        let mut term: Term<Name> = Term::Error { uniq_id: 0 };
+
+        for level in 0..DEEP {
+            term = if level % 2 == 0 {
+                Term::Constr {
+                    tag: 0,
+                    fields: vec![term],
+                    uniq_id: level as isize,
+                }
+            } else {
+                Term::Case {
+                    constr: Rc::new(Term::Error { uniq_id: 0 }),
+                    branches: vec![term],
+                    uniq_id: level as isize,
+                }
+            };
+        }
+
+        drop(term);
+    }
+
+    #[test]
+    fn dropping_a_term_leaves_shared_subterms_alone() {
+        let shared = Rc::new(Term::Builtin {
+            fun: DefaultFunction::AddInteger,
+            uniq_id: 7,
+        });
+
+        let term: Term<Name> = Term::Apply {
+            function: Rc::new(Term::Delay {
+                body: Rc::clone(&shared),
+                uniq_id: 1,
+            }),
+            argument: Rc::clone(&shared),
+            uniq_id: 2,
+        };
+
+        assert_eq!(Rc::strong_count(&shared), 3);
+
+        drop(term);
+
+        // The teardown released both handles and left the pointee alone.
+        assert_eq!(Rc::strong_count(&shared), 1);
+        assert!(matches!(
+            shared.as_ref(),
+            Term::Builtin {
+                fun: DefaultFunction::AddInteger,
+                uniq_id: 7,
+            }
+        ));
+    }
+
+    #[test]
+    fn dropping_a_term_leaves_a_shared_deep_subterm_intact() {
+        let spine = Rc::new(deep_delay_spine(DEEP));
+
+        let first = Term::Force {
+            body: Rc::clone(&spine),
+            uniq_id: -1,
+        };
+
+        let second = Term::Force {
+            body: Rc::clone(&spine),
+            uniq_id: -2,
+        };
+
+        drop(first);
+
+        // Walking (iteratively, again) still finds every level: the shared spine was not
+        // dismantled out from under the other holders.
+        let mut depth = 0;
+        let mut cursor = spine.as_ref();
+
+        while let Term::Delay { body, .. } = cursor {
+            depth += 1;
+            cursor = body.as_ref();
+        }
+
+        assert_eq!(depth, DEEP);
+        assert_eq!(Rc::strong_count(&spine), 2);
+
+        drop(second);
+        drop(spine);
+    }
+
+    #[test]
+    fn deep_constant_drops_without_overflowing_the_stack() {
+        // The element type is deliberately left flat here: `Type` derives `Clone`, which is itself
+        // recursive, so a matching nested type would overflow while the test was still setting up.
+        // Deep types get their own test below.
+        let mut constant = Constant::Integer(BigInt::from(1));
+
+        for _ in 0..DEEP {
+            constant = Constant::ProtoList(Type::Integer, vec![Rc::new(constant)]);
+        }
+
+        drop(constant);
+
+        let mut constant = Constant::Unit;
+
+        for _ in 0..DEEP {
+            constant = Constant::ProtoPair(
+                Type::Unit,
+                Type::Unit,
+                Rc::new(constant),
+                Rc::new(Constant::Unit),
+            );
+        }
+
+        drop(constant);
+    }
+
+    #[test]
+    fn deep_type_drops_without_overflowing_the_stack() {
+        let mut typ = Type::Integer;
+
+        for _ in 0..DEEP {
+            typ = Type::List(Rc::new(typ));
+        }
+
+        drop(typ);
     }
 
     fn data_value_with_quantity(quantity: conway::BigInt) -> PlutusData {

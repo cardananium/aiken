@@ -70,7 +70,7 @@ impl std::ops::Sub for ExBudget {
     }
 }
 
-#[derive(Default, Debug, PartialEq)]
+#[derive(Clone, Default, Debug, PartialEq)]
 pub struct CostModel {
     pub machine_costs: MachineCosts,
     pub builtin_costs: BuiltinCosts,
@@ -118,7 +118,7 @@ impl CostModel {
 
 /// There's no entry for Error since we'll be exiting anyway; also, what would
 /// happen if calling 'Error' caused the budget to be exceeded?
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MachineCosts {
     startup: ExBudget,
     var: ExBudget,
@@ -1595,7 +1595,7 @@ impl ParamName {
     ];
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BuiltinCosts {
     pub add_integer: CostingFun<TwoArguments>,
     pub subtract_integer: CostingFun<TwoArguments>,
@@ -3835,13 +3835,13 @@ fn initialize_cost_model_with_semantics(
     }
 }
 
-#[derive(Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct CostingFun<T> {
     pub mem: T,
     pub cpu: T,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum OneArgument {
     ConstantCost(i64),
     LinearCost(LinearSize),
@@ -3987,7 +3987,7 @@ impl TwoArguments {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ThreeArguments {
     ConstantCost(i64),
     AddedSizes(AddedSizes),
@@ -4041,7 +4041,7 @@ impl ThreeArguments {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum FourArguments {
     ConstantCost(i64),
     LinearInU(LinearSize),
@@ -4062,7 +4062,7 @@ impl FourArguments {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum SixArguments {
     ConstantCost(i64),
 }

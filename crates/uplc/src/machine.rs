@@ -1,10 +1,10 @@
-use std::{fmt::Display, rc::Rc};
+use std::{fmt::Display, mem, rc::Rc};
 
 use crate::ast::{Constant, NamedDeBruijn, Term, Type};
 use num_traits::ToPrimitive;
 
 pub mod cost_model;
-mod discharge;
+pub mod discharge;
 mod error;
 pub mod eval_result;
 pub mod runtime;
@@ -20,14 +20,15 @@ use self::{
     value::{Env, Value},
 };
 
-enum MachineState {
+#[derive(Clone, Debug)]
+pub enum MachineState {
     Return(Context, Value),
     Compute(Context, Env, Term<NamedDeBruijn>),
     Done(Term<NamedDeBruijn>),
 }
 
-#[derive(Clone)]
-enum Context {
+#[derive(Clone, Debug)]
+pub enum Context {
     FrameAwaitArg(Value, Box<Context>),
     FrameAwaitFunTerm(Env, Term<NamedDeBruijn>, Box<Context>),
     FrameAwaitFunValue(Value, Box<Context>),
@@ -38,9 +39,59 @@ enum Context {
         Vec<Term<NamedDeBruijn>>,
         Vec<Value>,
         Box<Context>,
+        isize,
     ),
     FrameCases(Env, Vec<Term<NamedDeBruijn>>, Box<Context>),
     NoFrame,
+}
+
+/// The machine's control stack is a linked list of frames, one per pending application, force or
+/// case — so its length tracks the nesting depth of the term being evaluated, which is
+/// attacker-controlled just as the term itself is (see the `Drop` impl on `Term` in `ast.rs` for
+/// the full rationale). The derived destructor would unwind it one stack frame per machine frame,
+/// which is not survivable on `wasm32`. Do not remove this as redundant.
+impl Drop for Context {
+    fn drop(&mut self) {
+        let mut pending: Vec<Context> = Vec::new();
+
+        detach_context_child(self, &mut pending);
+
+        while let Some(mut context) = pending.pop() {
+            detach_context_child(&mut context, &mut pending);
+        }
+    }
+}
+
+/// Move the frame below `context` onto `pending`, leaving `context` at the bottom of the stack.
+///
+/// Unlike the `Rc` children of a term, a frame's tail is a `Box` and is therefore owned outright:
+/// there is never another holder to consider, so it is always ours to take. The `NoFrame` left
+/// behind is what makes the shallow `Drop` of the husk terminate immediately.
+fn detach_context_child(context: &mut Context, pending: &mut Vec<Context>) {
+    let tail = match context {
+        Context::NoFrame => return,
+        Context::FrameAwaitArg(_, tail)
+        | Context::FrameAwaitFunTerm(_, _, tail)
+        | Context::FrameAwaitFunValue(_, tail)
+        | Context::FrameForce(tail)
+        | Context::FrameConstr(_, _, _, _, tail, _)
+        | Context::FrameCases(_, _, tail) => tail,
+    };
+
+    let tail = take_context_tail(tail);
+
+    if !matches!(tail, Context::NoFrame) {
+        pending.push(tail);
+    }
+}
+
+/// Unlink a frame's tail, leaving `NoFrame` behind.
+///
+/// `Context` carries a manual `Drop` (see above), so the machine cannot move a tail out of a frame
+/// by pattern any more. Taking it this way is the same cost — no allocation, and the husk left
+/// behind drops for free.
+pub(crate) fn take_context_tail(tail: &mut Box<Context>) -> Context {
+    mem::replace(tail.as_mut(), Context::NoFrame)
 }
 
 pub const TERM_COUNT: usize = 9;
@@ -78,6 +129,7 @@ impl Trace {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct Machine {
     costs: CostModel,
     pub ex_budget: ExBudget,
@@ -169,18 +221,15 @@ impl Machine {
         }
     }
 
+    /// The builtin semantics variant this machine evaluates with.
+    pub fn semantics(&self) -> BuiltinSemantics {
+        self.semantics
+    }
+
     pub fn run(&mut self, term: Term<NamedDeBruijn>) -> Result<Term<NamedDeBruijn>, Error> {
         use MachineState::*;
 
-        if !self.semantics.supports_values() {
-            Self::assert_no_values(&term)?;
-        }
-
-        let startup_budget = self.costs.machine_costs.get(StepKind::StartUp);
-
-        self.spend_budget(startup_budget)?;
-
-        let mut state = Compute(Context::NoFrame, Rc::new(vec![]), term);
+        let mut state = self.start(term)?;
 
         loop {
             state = match state {
@@ -193,29 +242,62 @@ impl Machine {
         }
     }
 
+    /// Validate the program for this machine's semantics, charge the startup cost and hand back the
+    /// initial state. Shared by `run` and the step-by-step `ManualMachine`.
+    pub(crate) fn start(&mut self, term: Term<NamedDeBruijn>) -> Result<MachineState, Error> {
+        if !self.semantics.supports_values() {
+            Self::assert_no_values(&term)?;
+        }
+
+        let startup_budget = self.costs.machine_costs.get(StepKind::StartUp);
+
+        self.spend_budget(startup_budget)?;
+
+        Ok(MachineState::Compute(Context::NoFrame, Rc::new(vec![]), term))
+    }
+
+    /// Forget everything a previous run left behind (pending unbudgeted steps, traces, debug
+    /// counters), keeping the remaining budget.
+    pub(crate) fn clear_run_state(&mut self) {
+        self.unbudgeted_steps = [0; 10];
+        self.traces.clear();
+
+        if let Some(counter) = &mut self.spend_counter {
+            counter.fill(0);
+        }
+    }
+
+    pub(crate) fn startup_budget(&self) -> ExBudget {
+        self.costs.machine_costs.get(StepKind::StartUp)
+    }
+
     /// The CIP-0153 value builtins and native `Value` constants only exist for
     /// Plutus V3 from protocol version 11 (Van Rossem) onwards. Availability is
     /// a whole-program well-formedness rule: occurrences in latent code (under
     /// lambdas, delays or untaken branches) are rejected too, so the entire
     /// term is validated up-front before evaluation starts.
-    fn assert_no_values(term: &Term<NamedDeBruijn>) -> Result<(), Error> {
+    pub(crate) fn assert_no_values(term: &Term<NamedDeBruijn>) -> Result<(), Error> {
         let mut stack = vec![term];
 
         while let Some(term) = stack.pop() {
             match term {
-                Term::Delay(body) | Term::Lambda { body, .. } | Term::Force(body) => {
+                Term::Delay { body, .. } | Term::Lambda { body, .. } | Term::Force { body, .. } => {
                     stack.push(body.as_ref());
                 }
-                Term::Apply { function, argument } => {
+                Term::Apply {
+                    function, argument, ..
+                } => {
                     stack.push(function.as_ref());
                     stack.push(argument.as_ref());
                 }
-                Term::Constant(constant) => {
+                Term::Constant {
+                    value: constant, ..
+                } => {
                     if Constant::contains_value(constant) {
                         return Err(Error::ValueConstantNotAvailable);
                     }
                 }
-                Term::Builtin(fun) => {
+                Term::Builtin { fun, .. } => {
                     if fun.is_value_builtin() {
                         return Err(Error::BuiltinNotAvailable(*fun));
                     }
@@ -223,52 +305,64 @@ impl Machine {
                 Term::Constr { fields, .. } => {
                     stack.extend(fields.iter());
                 }
-                Term::Case { constr, branches } => {
+                Term::Case {
+                    constr, branches, ..
+                } => {
                     stack.push(constr.as_ref());
                     stack.extend(branches.iter());
                 }
-                Term::Var(_) | Term::Error => {}
+                Term::Var { .. } | Term::Error { .. } => {}
             }
         }
 
         Ok(())
     }
 
-    fn compute(
+    pub(crate) fn compute(
         &mut self,
         context: Context,
         env: Env,
-        term: Term<NamedDeBruijn>,
+        mut term: Term<NamedDeBruijn>,
     ) -> Result<MachineState, Error> {
-        match term {
-            Term::Var(name) => {
+        // `Term` carries a manual, iterative `Drop` (see `ast.rs`), which makes the compiler
+        // reject moving fields out of it by pattern. Matching on `&mut` instead costs nothing:
+        // every field taken here is either `Copy`, a cheap `Rc` handle, or a vector we can take
+        // outright.
+        match &mut term {
+            Term::Var { name, uniq_id } => {
                 self.step_and_maybe_spend(StepKind::Var)?;
 
-                let val = self.lookup_var(name.as_ref(), &env)?;
+                let val = self.lookup_var(name.as_ref(), &env, *uniq_id)?;
 
                 Ok(MachineState::Return(context, val))
             }
-            Term::Delay(body) => {
+            Term::Delay { body, uniq_id } => {
                 self.step_and_maybe_spend(StepKind::Delay)?;
 
-                Ok(MachineState::Return(context, Value::Delay(body, env)))
+                Ok(MachineState::Return(context, Value::Delay {
+                    body: Rc::clone(body),
+                    env,
+                    term_id: *uniq_id,
+                }))
             }
             Term::Lambda {
                 parameter_name,
                 body,
+                uniq_id,
             } => {
                 self.step_and_maybe_spend(StepKind::Lambda)?;
 
                 Ok(MachineState::Return(
                     context,
                     Value::Lambda {
-                        parameter_name,
-                        body,
+                        parameter_name: Rc::clone(parameter_name),
+                        body: Rc::clone(body),
                         env,
+                        term_id: *uniq_id,
                     },
                 ))
             }
-            Term::Apply { function, argument } => {
+            Term::Apply { function, argument, .. } => {
                 self.step_and_maybe_spend(StepKind::Apply)?;
 
                 Ok(MachineState::Compute(
@@ -281,12 +375,12 @@ impl Machine {
                     function.as_ref().clone(),
                 ))
             }
-            Term::Constant(x) => {
+            Term::Constant { value, .. } => {
                 self.step_and_maybe_spend(StepKind::Constant)?;
 
-                Ok(MachineState::Return(context, Value::Con(x)))
+                Ok(MachineState::Return(context, Value::Con(Rc::clone(value))))
             }
-            Term::Force(body) => {
+            Term::Force { body, .. } => {
                 self.step_and_maybe_spend(StepKind::Force)?;
 
                 Ok(MachineState::Compute(
@@ -295,19 +389,24 @@ impl Machine {
                     body.as_ref().clone(),
                 ))
             }
-            Term::Error => Err(Error::EvaluationFailure),
-            Term::Builtin(fun) => {
+            Term::Error { .. } => Err(Error::EvaluationFailure),
+            Term::Builtin { fun, uniq_id } => {
                 self.step_and_maybe_spend(StepKind::Builtin)?;
+
+                let fun = *fun;
 
                 let runtime: BuiltinRuntime = fun.into();
 
                 Ok(MachineState::Return(
                     context,
-                    Value::Builtin { fun, runtime },
+                    Value::Builtin { fun, runtime, term_id: *uniq_id },
                 ))
             }
-            Term::Constr { tag, mut fields } => {
+            Term::Constr { tag, fields, uniq_id } => {
                 self.step_and_maybe_spend(StepKind::Constr)?;
+
+                let (tag, uniq_id) = (*tag, *uniq_id);
+                let mut fields = mem::take(fields);
 
                 fields.reverse();
 
@@ -315,7 +414,7 @@ impl Machine {
                     let popped_field = fields.pop().unwrap();
 
                     Ok(MachineState::Compute(
-                        Context::FrameConstr(env.clone(), tag, fields, vec![], context.into()),
+                        Context::FrameConstr(env.clone(), tag, fields, vec![], context.into(), uniq_id),
                         env,
                         popped_field,
                     ))
@@ -325,15 +424,16 @@ impl Machine {
                         Value::Constr {
                             tag,
                             fields: vec![],
+                            term_id: uniq_id,
                         },
                     ))
                 }
             }
-            Term::Case { constr, branches } => {
+            Term::Case { constr, branches, .. } => {
                 self.step_and_maybe_spend(StepKind::Case)?;
 
                 Ok(MachineState::Compute(
-                    Context::FrameCases(env.clone(), branches, context.into()),
+                    Context::FrameCases(env.clone(), mem::take(branches), context.into()),
                     env,
                     constr.as_ref().clone(),
                 ))
@@ -341,8 +441,16 @@ impl Machine {
         }
     }
 
-    fn return_compute(&mut self, context: Context, value: Value) -> Result<MachineState, Error> {
-        match context {
+    pub(crate) fn return_compute(
+        &mut self,
+        mut context: Context,
+        mut value: Value,
+    ) -> Result<MachineState, Error> {
+        // `Context` and `Value` both carry a manual, iterative `Drop` (see above and
+        // `machine/value.rs`), which makes the compiler reject moving their fields out by pattern.
+        // Every arm below takes only what it needs and leaves a free-to-drop husk in its place:
+        // `NoFrame` for a tail, an empty `Constr` for a value, `Error` for a term.
+        match &mut context {
             Context::NoFrame => {
                 if self.unbudgeted_steps[9] > 0 {
                     self.spend_unbudgeted_steps()?;
@@ -352,134 +460,192 @@ impl Machine {
 
                 Ok(MachineState::Done(term))
             }
-            Context::FrameForce(ctx) => self.force_evaluate(*ctx, value),
-            Context::FrameAwaitFunTerm(arg_env, arg, ctx) => Ok(MachineState::Compute(
-                Context::FrameAwaitArg(value, ctx),
-                arg_env,
-                arg,
-            )),
-            Context::FrameAwaitArg(fun, ctx) => self.apply_evaluate(*ctx, fun, value),
-            Context::FrameAwaitFunValue(arg, ctx) => self.apply_evaluate(*ctx, value, arg),
-            Context::FrameConstr(env, tag, mut fields, mut resolved_fields, ctx) => {
+            Context::FrameForce(ctx) => {
+                let ctx = take_context_tail(ctx);
+
+                self.force_evaluate(ctx, value)
+            }
+            Context::FrameAwaitFunTerm(arg_env, arg, ctx) => {
+                let arg_env = Rc::clone(arg_env);
+                let arg = mem::replace(arg, Term::Error { uniq_id: 0 });
+                // This is one of the two places the tail has to stay boxed, so it is re-boxed
+                // rather than unlinked in place.
+                let ctx = mem::replace(ctx, Box::new(Context::NoFrame));
+
+                Ok(MachineState::Compute(
+                    Context::FrameAwaitArg(value, ctx),
+                    arg_env,
+                    arg,
+                ))
+            }
+            Context::FrameAwaitArg(fun, ctx) => {
+                let fun = mem::replace(fun, Value::husk());
+                let ctx = take_context_tail(ctx);
+
+                self.apply_evaluate(ctx, fun, value)
+            }
+            Context::FrameAwaitFunValue(arg, ctx) => {
+                let arg = mem::replace(arg, Value::husk());
+                let ctx = take_context_tail(ctx);
+
+                self.apply_evaluate(ctx, value, arg)
+            }
+            Context::FrameConstr(env, tag, fields, resolved_fields, ctx, term_id) => {
+                let (env, tag, term_id) = (Rc::clone(env), *tag, *term_id);
+                let mut fields = mem::take(fields);
+                let mut resolved_fields = mem::take(resolved_fields);
+
                 resolved_fields.push(value);
 
                 if !fields.is_empty() {
                     let popped_field = fields.pop().unwrap();
+                    let ctx = mem::replace(ctx, Box::new(Context::NoFrame));
 
                     Ok(MachineState::Compute(
-                        Context::FrameConstr(env.clone(), tag, fields, resolved_fields, ctx),
+                        Context::FrameConstr(env.clone(), tag, fields, resolved_fields, ctx, term_id),
                         env,
                         popped_field,
                     ))
                 } else {
                     Ok(MachineState::Return(
-                        *ctx,
+                        take_context_tail(ctx),
                         Value::Constr {
                             tag,
                             fields: resolved_fields,
+                            term_id,
                         },
                     ))
                 }
             }
-            Context::FrameCases(env, branches, ctx) => match value {
-                Value::Constr { tag, fields } => match branches.get(tag) {
-                    Some(t) => Ok(MachineState::Compute(
-                        transfer_arg_stack(fields, *ctx),
-                        env,
-                        t.clone(),
-                    )),
-                    None => Err(Error::MissingCaseBranch(
-                        branches,
-                        Value::Constr { tag, fields },
-                    )),
-                },
-                Value::Con(constant) => {
-                    if !matches!(self.semantics, BuiltinSemantics::E) {
-                        return Err(Error::NonConstrScrutinized(Value::Con(constant)));
-                    }
+            Context::FrameCases(env, branches, ctx) => {
+                let env = Rc::clone(env);
+                let branches = mem::take(branches);
+                let ctx = take_context_tail(ctx);
 
-                    let (tag, fields, max_branches) = match constant.as_ref() {
-                        Constant::Unit => (0, vec![], 1),
-                        Constant::Bool(false) => (0, vec![], 2),
-                        Constant::Bool(true) => (1, vec![], 2),
-                        Constant::Integer(integer) => {
-                            let Some(tag) = integer.to_usize() else {
-                                return Err(Error::MissingCaseBranch(
-                                    branches,
-                                    Value::Con(constant),
-                                ));
-                            };
+                // The scrutinee's fields are only taken on the branch that consumes them; the
+                // error branches hand the value on untouched.
+                match &mut value {
+                    Value::Constr { tag, fields, .. } => match branches.get(*tag) {
+                        Some(t) => {
+                            let t = t.clone();
 
-                            (tag, vec![], usize::MAX)
+                            Ok(MachineState::Compute(
+                                transfer_arg_stack(mem::take(fields), ctx),
+                                env,
+                                t,
+                            ))
                         }
-                        Constant::ProtoList(_, items) if items.is_empty() => (1, vec![], 2),
-                        Constant::ProtoList(item_type, items) => {
-                            let head = items[0].clone();
-                            let tail = Constant::ProtoList(item_type.clone(), items[1..].to_vec());
+                        None => Err(Error::MissingCaseBranch(branches, value)),
+                    },
+                    Value::Con(constant) => {
+                        let constant = Rc::clone(constant);
 
-                            (0, vec![Value::Con(head), Value::Con(tail.into())], 2)
+                        if !matches!(self.semantics, BuiltinSemantics::E) {
+                            return Err(Error::NonConstrScrutinized(value));
                         }
-                        Constant::ProtoPair(_, _, first, second) => (
-                            0,
-                            vec![Value::Con(first.clone()), Value::Con(second.clone())],
-                            1,
-                        ),
-                        _ => return Err(Error::NonConstrScrutinized(Value::Con(constant))),
-                    };
 
-                    if branches.len() > max_branches {
-                        return Err(Error::MissingCaseBranch(branches, Value::Con(constant)));
-                    }
+                        let (tag, fields, max_branches) = match constant.as_ref() {
+                            Constant::Unit => (0, vec![], 1),
+                            Constant::Bool(false) => (0, vec![], 2),
+                            Constant::Bool(true) => (1, vec![], 2),
+                            Constant::Integer(integer) => {
+                                let Some(tag) = integer.to_usize() else {
+                                    return Err(Error::MissingCaseBranch(branches, value));
+                                };
 
-                    match branches.get(tag) {
-                        Some(t) => Ok(MachineState::Compute(
-                            transfer_arg_stack(fields, *ctx),
-                            env,
-                            t.clone(),
-                        )),
-                        None => Err(Error::MissingCaseBranch(branches, Value::Con(constant))),
+                                (tag, vec![], usize::MAX)
+                            }
+                            Constant::ProtoList(_, items) if items.is_empty() => (1, vec![], 2),
+                            Constant::ProtoList(item_type, items) => {
+                                let head = items[0].clone();
+                                let tail =
+                                    Constant::ProtoList(item_type.clone(), items[1..].to_vec());
+
+                                (0, vec![Value::Con(head), Value::Con(tail.into())], 2)
+                            }
+                            Constant::ProtoPair(_, _, first, second) => (
+                                0,
+                                vec![Value::Con(first.clone()), Value::Con(second.clone())],
+                                1,
+                            ),
+                            _ => return Err(Error::NonConstrScrutinized(value)),
+                        };
+
+                        if branches.len() > max_branches {
+                            return Err(Error::MissingCaseBranch(branches, value));
+                        }
+
+                        match branches.get(tag) {
+                            Some(t) => {
+                                let t = t.clone();
+
+                                Ok(MachineState::Compute(
+                                    transfer_arg_stack(fields, ctx),
+                                    env,
+                                    t,
+                                ))
+                            }
+                            None => Err(Error::MissingCaseBranch(branches, value)),
+                        }
                     }
+                    _ => Err(Error::NonConstrScrutinized(value)),
                 }
-                v => Err(Error::NonConstrScrutinized(v)),
-            },
+            }
         }
     }
 
-    fn force_evaluate(&mut self, context: Context, value: Value) -> Result<MachineState, Error> {
-        match value {
-            Value::Delay(body, env) => {
-                Ok(MachineState::Compute(context, env, body.as_ref().clone()))
-            }
-            Value::Builtin { fun, mut runtime } => {
+    fn force_evaluate(&mut self, context: Context, mut value: Value) -> Result<MachineState, Error> {
+        // `Value` carries a manual, iterative `Drop` (see `machine/value.rs`), which makes the
+        // compiler reject moving fields out of it by pattern. The runtime is swapped out for a
+        // fresh, empty one instead — same cost, and the husk left behind drops for free.
+        match &mut value {
+            Value::Delay { body, env, .. } => Ok(MachineState::Compute(
+                context,
+                Rc::clone(env),
+                body.as_ref().clone(),
+            )),
+            Value::Builtin { fun, runtime, term_id } => {
+                let (fun, term_id) = (*fun, *term_id);
+                let mut runtime = mem::replace(runtime, BuiltinRuntime::new(fun));
+
                 if runtime.needs_force() {
                     runtime.consume_force();
 
                     let res = if runtime.is_ready() {
                         self.eval_builtin_app(runtime)?
                     } else {
-                        Value::Builtin { fun, runtime }
+                        Value::Builtin { fun, runtime, term_id }
                     };
 
                     Ok(MachineState::Return(context, res))
                 } else {
-                    let term = discharge::value_as_term(Value::Builtin { fun, runtime });
+                    let term = discharge::value_as_term(Value::Builtin {
+                        fun,
+                        runtime,
+                        term_id,
+                    });
 
                     Err(Error::BuiltinTermArgumentExpected(term))
                 }
             }
-            rest => Err(Error::NonPolymorphicInstantiation(rest)),
+            _ => Err(Error::NonPolymorphicInstantiation(value)),
         }
     }
 
     fn apply_evaluate(
         &mut self,
         context: Context,
-        function: Value,
+        mut function: Value,
         argument: Value,
     ) -> Result<MachineState, Error> {
-        match function {
-            Value::Lambda { body, mut env, .. } => {
-                let e = Rc::make_mut(&mut env);
+        // `Value` carries a manual, iterative `Drop` (see `machine/value.rs`), which makes the
+        // compiler reject moving fields out of it by pattern; the payloads are taken out
+        // explicitly instead.
+        match &mut function {
+            Value::Lambda { body, env, .. } => {
+                let body = Rc::clone(body);
+
+                let e = Rc::make_mut(env);
 
                 e.push(argument);
 
@@ -489,7 +655,10 @@ impl Machine {
                     body.as_ref().clone(),
                 ))
             }
-            Value::Builtin { fun, runtime } => {
+            Value::Builtin { fun, runtime, term_id } => {
+                let (fun, term_id) = (*fun, *term_id);
+                let runtime = mem::replace(runtime, BuiltinRuntime::new(fun));
+
                 if runtime.is_arrow() && !runtime.needs_force() {
                     let mut runtime = runtime;
 
@@ -498,17 +667,21 @@ impl Machine {
                     let res = if runtime.is_ready() {
                         self.eval_builtin_app(runtime)?
                     } else {
-                        Value::Builtin { fun, runtime }
+                        Value::Builtin { fun, runtime, term_id }
                     };
 
                     Ok(MachineState::Return(context, res))
                 } else {
-                    let term = discharge::value_as_term(Value::Builtin { fun, runtime });
+                    let term = discharge::value_as_term(Value::Builtin {
+                        fun,
+                        runtime,
+                        term_id,
+                    });
 
                     Err(Error::UnexpectedBuiltinTermArgument(term))
                 }
             }
-            rest => Err(Error::NonFunctionalApplication(rest, argument)),
+            _ => Err(Error::NonFunctionalApplication(function, argument)),
         }
     }
 
@@ -527,10 +700,15 @@ impl Machine {
         runtime.call(self.semantics, &mut self.traces)
     }
 
-    fn lookup_var(&mut self, name: &NamedDeBruijn, env: &[Value]) -> Result<Value, Error> {
+    fn lookup_var(&mut self, name: &NamedDeBruijn, env: &[Value], term_id: isize) -> Result<Value, Error> {
         env.get::<usize>(env.len() - usize::from(name.index))
             .cloned()
-            .ok_or_else(|| Error::OpenTermEvaluated(Term::Var(name.clone().into())))
+            .ok_or_else(|| {
+                Error::OpenTermEvaluated(Term::Var {
+                    name: name.clone().into(),
+                    uniq_id: term_id,
+                })
+            })
     }
 
     fn step_and_maybe_spend(&mut self, step: StepKind) -> Result<(), Error> {
@@ -615,7 +793,7 @@ mod tests {
     use num_bigint::BigInt;
     use std::rc::Rc;
 
-    use super::{Error, cost_model::ExBudget, runtime::Compressable};
+    use super::{Context, Error, cost_model::ExBudget, runtime::Compressable};
     use crate::{
         ast::{Constant, NamedDeBruijn, Program, Term},
         builtins::DefaultFunction,
@@ -629,9 +807,14 @@ mod tests {
             term,
         };
 
-        let builtin = Term::Builtin(DefaultFunction::LookupCoin);
-        let constant: Term<NamedDeBruijn> =
-            Term::Constant(Constant::Value(crate::ast::Value::empty()).into());
+        let builtin = Term::Builtin {
+            fun: DefaultFunction::LookupCoin,
+            uniq_id: 0,
+        };
+        let constant: Term<NamedDeBruijn> = Term::Constant {
+            value: Constant::Value(crate::ast::Value::empty()).into(),
+            uniq_id: 1,
+        };
         // Availability is a whole-program rule: latent occurrences that
         // evaluation never reaches must be rejected too.
         let latent: Term<NamedDeBruijn> = Term::Lambda {
@@ -640,18 +823,24 @@ mod tests {
                 index: 0.into(),
             }
             .into(),
-            body: Term::Builtin(DefaultFunction::ScaleValue).into(),
+            body: Term::Builtin {
+                fun: DefaultFunction::ScaleValue,
+                uniq_id: 2,
+            }
+            .into(),
+            uniq_id: 3,
         };
         // Public AST callers can construct type-inconsistent constants even
         // though Flat decoding cannot. Inspect both declared types and actual
         // elements so this cannot bypass protocol availability checks.
-        let inconsistent: Term<NamedDeBruijn> = Term::Constant(
-            Constant::ProtoList(
+        let inconsistent: Term<NamedDeBruijn> = Term::Constant {
+            value: Constant::ProtoList(
                 crate::ast::Type::Integer,
                 vec![Rc::new(Constant::Value(crate::ast::Value::empty()))],
             )
             .into(),
-        );
+            uniq_id: 4,
+        };
 
         for (language, protocol) in [
             (Language::PlutusV3, 10),
@@ -715,17 +904,49 @@ mod tests {
         }
     }
 
+    /// Deep enough that a destructor taking one stack frame per level cannot survive the test
+    /// harness's ~2 MiB thread stack, let alone the ~1 MiB a `wasm32` engine gives us.
+    const DEEP: usize = 100_000;
+
+    /// The control stack grows one frame per pending force/apply, so its depth follows the nesting
+    /// depth of the term being evaluated, which is attacker-controlled. Built with a loop on
+    /// purpose: a recursive builder would overflow before the drop ever ran.
+    #[test]
+    fn deep_context_drops_without_overflowing_the_stack() {
+        let mut context = Context::NoFrame;
+
+        for _ in 0..DEEP {
+            context = Context::FrameForce(Box::new(context));
+        }
+
+        drop(context);
+    }
+
     #[test]
     fn add_big_ints() {
         let program: Program<NamedDeBruijn> = Program {
             version: (0, 0, 0),
             term: Term::Apply {
+                uniq_id: 0,
                 function: Term::Apply {
-                    function: Term::Builtin(DefaultFunction::AddInteger).into(),
-                    argument: Term::Constant(Constant::Integer(i128::MAX.into()).into()).into(),
+                    uniq_id: 1,
+                    function: Term::Builtin {
+                        fun: DefaultFunction::AddInteger,
+                        uniq_id: 2,
+                    }
+                    .into(),
+                    argument: Term::Constant {
+                        value: Constant::Integer(i128::MAX.into()).into(),
+                        uniq_id: 3,
+                    }
+                    .into(),
                 }
                 .into(),
-                argument: Term::Constant(Constant::Integer(i128::MAX.into()).into()).into(),
+                argument: Term::Constant {
+                    value: Constant::Integer(i128::MAX.into()).into(),
+                    uniq_id: 4,
+                }
+                .into(),
             },
         };
 
@@ -735,12 +956,13 @@ mod tests {
 
         assert_eq!(
             term,
-            Term::Constant(
-                Constant::Integer(
+            Term::Constant {
+                value: Constant::Integer(
                     Into::<BigInt>::into(i128::MAX) + Into::<BigInt>::into(i128::MAX)
                 )
-                .into()
-            )
+                .into(),
+                uniq_id: 0,
+            }
         );
     }
 
@@ -749,12 +971,26 @@ mod tests {
         let make_program = |fun: DefaultFunction, n: i32, m: i32| Program::<NamedDeBruijn> {
             version: (0, 0, 0),
             term: Term::Apply {
+                uniq_id: 0,
                 function: Term::Apply {
-                    function: Term::Builtin(fun).into(),
-                    argument: Term::Constant(Constant::Integer(n.into()).into()).into(),
+                    uniq_id: 1,
+                    function: Term::Builtin {
+                        fun,
+                        uniq_id: 2,
+                    }
+                    .into(),
+                    argument: Term::Constant {
+                        value: Constant::Integer(n.into()).into(),
+                        uniq_id: 3,
+                    }
+                    .into(),
                 }
                 .into(),
-                argument: Term::Constant(Constant::Integer(m.into()).into()).into(),
+                argument: Term::Constant {
+                    value: Constant::Integer(m.into()).into(),
+                    uniq_id: 4,
+                }
+                .into(),
             },
         };
 
@@ -782,7 +1018,10 @@ mod tests {
 
             assert_eq!(
                 eval_result.result().unwrap(),
-                Term::Constant(Constant::Integer(result.into()).into())
+                Term::Constant {
+                    value: Constant::Integer(result.into()).into(),
+                    uniq_id: 0,
+                }
             );
         }
     }
@@ -796,12 +1035,26 @@ mod tests {
                     constr: Term::Constr {
                         tag,
                         fields: vec![
-                            Term::Constant(Constant::Integer(n.into()).into()),
-                            Term::Constant(Constant::Integer(m.into()).into()),
+                            Term::Constant {
+                                value: Constant::Integer(n.into()).into(),
+                                uniq_id: 0,
+                            },
+                            Term::Constant {
+                                value: Constant::Integer(m.into()).into(),
+                                uniq_id: 1,
+                            },
                         ],
+                        uniq_id: 2,
                     }
                     .into(),
-                    branches: vec![Term::Builtin(fun), Term::subtract_integer()],
+                    branches: vec![
+                        Term::Builtin {
+                            fun,
+                            uniq_id: 3,
+                        },
+                        Term::subtract_integer(),
+                    ],
+                    uniq_id: 4,
                 },
             };
 
@@ -815,7 +1068,10 @@ mod tests {
 
             assert_eq!(
                 eval_result.result().unwrap(),
-                Term::Constant(Constant::Integer(result.into()).into())
+                Term::Constant {
+                    value: Constant::Integer(result.into()).into(),
+                    uniq_id: 0,
+                }
             );
         }
     }
@@ -828,6 +1084,7 @@ mod tests {
                 constr: Term::Constr {
                     tag,
                     fields: vec![],
+                    uniq_id: 0,
                 }
                 .into(),
                 branches: vec![
@@ -835,6 +1092,7 @@ mod tests {
                     Term::integer(10.into()),
                     Term::integer(15.into()),
                 ],
+                uniq_id: 1,
             },
         };
 
@@ -845,7 +1103,10 @@ mod tests {
 
             assert_eq!(
                 eval_result.result().unwrap(),
-                Term::Constant(Constant::Integer(result.into()).into())
+                Term::Constant {
+                    value: Constant::Integer(result.into()).into(),
+                    uniq_id: 0,
+                }
             );
         }
     }

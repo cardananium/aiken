@@ -49,14 +49,15 @@ impl CodeGenInterner {
 
     pub fn term(&mut self, term: &mut Term<Name>) {
         match term {
-            Term::Var(name) => {
+            Term::Var { name, .. } => {
                 let name = Rc::make_mut(name);
                 name.unique = self.lookup(name.text.clone(), name.unique);
             }
-            Term::Delay(term) => self.term(Rc::make_mut(term)),
+            Term::Delay { body, .. } => self.term(Rc::make_mut(body)),
             Term::Lambda {
                 parameter_name,
                 body,
+                ..
             } => {
                 let parameter_name = Rc::make_mut(parameter_name);
                 let text = parameter_name.text.clone();
@@ -66,20 +67,31 @@ impl CodeGenInterner {
                 self.term(Rc::make_mut(body));
                 self.unbind(text, previous_unique);
             }
-            Term::Apply { function, argument } => {
+            Term::Apply {
+                function,
+                argument,
+                ..
+            } => {
                 self.term(Rc::make_mut(function));
                 self.term(Rc::make_mut(argument));
             }
-            Term::Constant(_) => (),
-            Term::Force(term) => self.term(Rc::make_mut(term)),
-            Term::Error => (),
-            Term::Builtin(_) => (),
-            Term::Constr { fields, .. } => {
+            Term::Constant { .. } => (),
+            Term::Force { body, .. } => self.term(Rc::make_mut(body)),
+            Term::Error { .. } => (),
+            Term::Builtin { .. } => (),
+            Term::Constr {
+                fields,
+                ..
+            } => {
                 for field in fields {
                     self.term(field);
                 }
             }
-            Term::Case { constr, branches } => {
+            Term::Case {
+                constr,
+                branches,
+                ..
+            } => {
                 self.term(Rc::make_mut(constr));
                 for branch in branches {
                     self.term(branch);
@@ -180,28 +192,33 @@ mod tests {
         let Term::Lambda {
             parameter_name: outer,
             body,
+            ..
         } = &program.term
         else {
             panic!("expected outer lambda");
         };
 
-        let Term::Apply { function, argument } = body.as_ref() else {
+        let Term::Apply {
+            function, argument, ..
+        } = body.as_ref()
+        else {
             panic!("expected application in outer body");
         };
 
         let Term::Lambda {
             parameter_name: inner,
             body,
+            ..
         } = function.as_ref()
         else {
             panic!("expected inner lambda");
         };
 
-        let Term::Var(inner_var) = body.as_ref() else {
+        let Term::Var { name: inner_var, .. } = body.as_ref() else {
             panic!("expected inner variable");
         };
 
-        let Term::Var(outer_var) = argument.as_ref() else {
+        let Term::Var { name: outer_var, .. } = argument.as_ref() else {
             panic!("expected outer variable");
         };
 

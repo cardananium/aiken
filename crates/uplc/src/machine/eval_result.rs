@@ -65,7 +65,7 @@ impl EvalResult {
     /// - **PlutusV3**: A script succeeds only if it returns `Bool(true)` or
     ///   `Unit` (the strict check, same as `failed(false)`).
     pub fn failed(&self, allow_bool_in_v3: bool, language: &Language) -> bool {
-        let errored = self.result.is_err() || matches!(self.result, Ok(Term::Error));
+        let errored = self.result.is_err() || matches!(self.result, Ok(Term::Error { .. }));
 
         let expected_return = match language {
             // PlutusV1/V2: success = execution didn't error; any non-error result is acceptable
@@ -73,7 +73,7 @@ impl EvalResult {
             // PlutusV3: strict check — must return Bool(true) or Unit.
             Language::PlutusV3 => matches!(
                 self.result,
-                  Ok(Term::Constant(ref con))
+                  Ok(Term::Constant { value: ref con, .. })
                   if matches!(con.as_ref(), Constant::Unit) || (allow_bool_in_v3 && matches!(con.as_ref(), Constant::Bool(true)))
             ),
         };
@@ -87,8 +87,10 @@ impl EvalResult {
 
     #[allow(clippy::result_unit_err)]
     pub fn unwrap_constant(self) -> Result<Constant, ()> {
-        match self.result {
-            Ok(Term::Constant(cst)) => Ok(cst.as_ref().to_owned()),
+        // `Term` has a manual `Drop` (see `ast.rs`), so its fields cannot be moved out by
+        // pattern; the constant is cloned out of the borrow instead, exactly as before.
+        match &self.result {
+            Ok(Term::Constant { value, .. }) => Ok(value.as_ref().to_owned()),
             _ => Err(()),
         }
     }
@@ -118,9 +120,9 @@ mod tests {
     #[test_case(Ok(Term::unit()),             PlutusV1, false => false)]
     #[test_case(Ok(Term::unit()),             PlutusV2, false => false)]
     #[test_case(Ok(Term::unit()),             PlutusV3, false => false)]
-    #[test_case(Ok(Term::Error),              PlutusV1, false => true)]
-    #[test_case(Ok(Term::Error),              PlutusV2, false => true)]
-    #[test_case(Ok(Term::Error),              PlutusV3, false => true)]
+    #[test_case(Ok(Term::error()),              PlutusV1, false => true)]
+    #[test_case(Ok(Term::error()),              PlutusV2, false => true)]
+    #[test_case(Ok(Term::error()),              PlutusV3, false => true)]
     #[test_case(Ok(Term::var("x").lambda("x").try_into().unwrap()), PlutusV1, false => false)]
     #[test_case(Ok(Term::var("x").lambda("x").try_into().unwrap()), PlutusV2, false => false)]
     #[test_case(Ok(Term::var("x").lambda("x").try_into().unwrap()), PlutusV3, false => true)]

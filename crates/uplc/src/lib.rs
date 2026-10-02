@@ -4,12 +4,16 @@ pub mod builtins;
 mod debruijn;
 pub mod flat;
 pub mod machine;
+pub mod manual_machine;
 pub mod optimize;
 pub mod parser;
 mod pretty;
 pub mod tx;
 
+pub(crate) mod global_uniq;
+
 use pallas_codec::minicbor;
+pub use pallas_crypto::hash::Hash;
 pub use pallas_primitives::{
     BigInt, BoundedBytes, Constr, Error, Fragment, KeyValuePairs, MaybeIndefArray, PlutusData,
     conway::{Language, PostAlonzoTransactionOutput, TransactionInput, TransactionOutput, Value},

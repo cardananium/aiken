@@ -17,8 +17,9 @@ fn round_trip(old_term: Term<Name>, pp: &str) {
 #[test]
 fn constant_list_integer() {
     round_trip(
-        Term::<Name>::Constant(
-            Constant::ProtoList(
+        Term::<Name>::Constant {
+            uniq_id: 0,
+            value: Constant::ProtoList(
                 Type::Integer,
                 vec![
                     Constant::Integer(0.to_bigint().unwrap()).into(),
@@ -27,7 +28,7 @@ fn constant_list_integer() {
                 ],
             )
             .into(),
-        ),
+        },
         "(con (list integer) [0, 1, 2])",
     );
 }
@@ -35,15 +36,16 @@ fn constant_list_integer() {
 #[test]
 fn constant_pair_bool_bytestring() {
     round_trip(
-        Term::<Name>::Constant(
-            Constant::ProtoPair(
+        Term::<Name>::Constant {
+            uniq_id: 0,
+            value: Constant::ProtoPair(
                 Type::Bool,
                 Type::ByteString,
                 Constant::Bool(true).into(),
                 Constant::ByteString(vec![0x01, 0x23, 0x45]).into(),
             )
             .into(),
-        ),
+        },
         "(con (pair bool bytestring) (True, #012345))",
     );
 }
@@ -51,15 +53,16 @@ fn constant_pair_bool_bytestring() {
 #[test]
 fn constant_pair_unit_string() {
     round_trip(
-        Term::<Name>::Constant(
-            Constant::ProtoPair(
+        Term::<Name>::Constant {
+            uniq_id: 0,
+            value: Constant::ProtoPair(
                 Type::Unit,
                 Type::String,
                 Constant::Unit.into(),
                 Constant::String("hello universe\0".into()).into(),
             )
             .into(),
-        ),
+        },
         "(con (pair unit string) ((), \"hello universe\\x00\"))",
     )
 }
@@ -70,8 +73,9 @@ fn constant_deeply_nested_list() {
     let t1 = Type::List(t0.clone().into());
     let t2 = Type::List(t1.clone().into());
     round_trip(
-        Term::<Name>::Constant(
-            Constant::ProtoList(
+        Term::<Name>::Constant {
+            uniq_id: 0,
+            value: Constant::ProtoList(
                 t2,
                 vec![
                     Constant::ProtoList(
@@ -104,7 +108,7 @@ fn constant_deeply_nested_list() {
                 ],
             )
             .into(),
-        ),
+        },
         "(con (list (list (list integer))) [[[-1], []], [[], [2, 3]]])",
     );
 }
@@ -112,8 +116,9 @@ fn constant_deeply_nested_list() {
 #[test]
 fn constant_data_constr() {
     round_trip(
-        Term::<Name>::Constant(
-            Constant::Data(PlutusData::Constr(Constr::<PlutusData> {
+        Term::<Name>::Constant {
+            uniq_id: 0,
+            value: Constant::Data(PlutusData::Constr(Constr::<PlutusData> {
                 tag: 122,
                 any_constructor: None,
                 fields: MaybeIndefArray::Indef(vec![PlutusData::BigInt(
@@ -121,7 +126,7 @@ fn constant_data_constr() {
                 )]),
             }))
             .into(),
-        ),
+        },
         "(con data (Constr 1 [I 2]))",
     );
 }
@@ -129,8 +134,9 @@ fn constant_data_constr() {
 #[test]
 fn constant_data_map() {
     round_trip(
-        Term::<Name>::Constant(
-            Constant::Data(PlutusData::Map(uplc::KeyValuePairs::Def(vec![
+        Term::<Name>::Constant {
+            uniq_id: 0,
+            value: Constant::Data(PlutusData::Map(uplc::KeyValuePairs::Def(vec![
                 (
                     PlutusData::BigInt(pallas_primitives::alonzo::BigInt::Int(0.into())),
                     PlutusData::BoundedBytes(vec![0x00].into()),
@@ -141,7 +147,7 @@ fn constant_data_map() {
                 ),
             ])))
             .into(),
-        ),
+        },
         "(con data (Map [(I 0, B #00), (I 1, B #0f)]))",
     );
 }
@@ -149,13 +155,14 @@ fn constant_data_map() {
 #[test]
 fn constant_data_list() {
     round_trip(
-        Term::<Name>::Constant(
-            Constant::Data(PlutusData::Array(MaybeIndefArray::Indef(vec![
+        Term::<Name>::Constant {
+            uniq_id: 0,
+            value: Constant::Data(PlutusData::Array(MaybeIndefArray::Indef(vec![
                 PlutusData::BigInt(pallas_primitives::alonzo::BigInt::Int(0.into())),
                 PlutusData::BigInt(pallas_primitives::alonzo::BigInt::Int(1.into())),
             ])))
             .into(),
-        ),
+        },
         "(con data (List [I 0, I 1]))",
     );
 }
@@ -163,37 +170,41 @@ fn constant_data_list() {
 #[test]
 fn constant_data_int() {
     round_trip(
-        Term::<Name>::Constant(
-            Constant::Data(PlutusData::BigInt(pallas_primitives::alonzo::BigInt::Int(
+        Term::<Name>::Constant {
+            uniq_id: 0,
+            value: Constant::Data(PlutusData::BigInt(pallas_primitives::alonzo::BigInt::Int(
                 2.into(),
             )))
             .into(),
-        ),
+        },
         "(con data (I 2))",
     );
 
-    let term = Term::<Name>::Constant(
-        Constant::Data(PlutusData::BigInt(
+    let term = Term::<Name>::Constant {
+        uniq_id: 0,
+        value: Constant::Data(PlutusData::BigInt(
             pallas_primitives::alonzo::BigInt::BigUInt(vec![2, 3, 4].into()),
         ))
         .into(),
-    );
+    };
     assert_eq!(term.to_pretty(), "(con data (I 131844))");
-    let term = Term::<Name>::Constant(
-        Constant::Data(PlutusData::BigInt(
+    let term = Term::<Name>::Constant {
+        uniq_id: 0,
+        value: Constant::Data(PlutusData::BigInt(
             pallas_primitives::alonzo::BigInt::BigNInt(vec![2, 3, 3].into()),
         ))
         .into(),
-    );
+    };
     assert_eq!(term.to_pretty(), "(con data (I -131844))");
 }
 
 #[test]
 fn constant_data_bytes() {
     round_trip(
-        Term::<Name>::Constant(
-            Constant::Data(PlutusData::BoundedBytes(vec![0x00, 0x1A].into())).into(),
-        ),
+        Term::<Name>::Constant {
+            uniq_id: 0,
+            value: Constant::Data(PlutusData::BoundedBytes(vec![0x00, 0x1A].into())).into(),
+        },
         "(con data (B #001a))",
     );
 }

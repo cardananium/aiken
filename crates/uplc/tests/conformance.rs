@@ -5,8 +5,12 @@ use std::{
     path::{Path, PathBuf},
 };
 use uplc::{
-    ast::{Name, NamedDeBruijn, Program},
-    machine::{cost_model::ExBudget, runtime::VAN_ROSSEM_PROTOCOL_VERSION},
+    ast::{Name, NamedDeBruijn, Program, Term},
+    machine::{
+        cost_model::{ExBudget, initialize_cost_model_with_protocol},
+        runtime::{CHANG_PROTOCOL_VERSION, VAN_ROSSEM_PROTOCOL_VERSION},
+    },
+    manual_machine::{ExecutionStatus, ManualMachine},
     parser,
 };
 use walkdir::WalkDir;
@@ -43,6 +47,29 @@ const V3_PV11_COSTS: &[i64] = &[
     0, 1, 180194, 159, 1, 1, 158519, 8942, 0, 1, 159378, 8813, 0, 1, 107490, 3298, 1, 106057, 655,
     1, 1964219, 24520, 3, 607153, 231697, 53144, 0, 1, 116711, 1957, 4, 231883, 10, 1000, 24838, 7,
     1, 232010, 32, 321837444, 25087669, 18, 617887431, 67302824, 36, 356924, 18413, 45, 21, 219951,
+    9444, 1, 1000, 172116, 183150, 6, 24, 21, 213283, 618401, 1998, 28258, 1, 1000, 38159, 2, 22,
+    1000, 95933, 1, 1, 11, 1000, 277577, 12, 21,
+];
+
+const V2_PV11_COSTS: &[i64] = &[
+    100788, 420, 1, 1, 1000, 173, 0, 1, 1000, 59957, 4, 1, 11183, 32, 201305, 8356, 4, 16000, 100,
+    16000, 100, 16000, 100, 16000, 100, 16000, 100, 16000, 100, 100, 100, 16000, 100, 94375, 32,
+    132994, 32, 61462, 4, 72010, 178, 0, 1, 22151, 32, 91189, 769, 4, 2, 85848, 228465, 122, 0, 1,
+    1, 1000, 42921, 4, 2, 30623, 28755, 75, 1, 898148, 27279, 1, 51775, 558, 1, 39184, 1000, 60594,
+    1, 141895, 32, 83150, 32, 15299, 32, 76049, 1, 13169, 4, 22100, 10, 28999, 74, 1, 28999, 74, 1,
+    43285, 552, 1, 44749, 541, 1, 33852, 32, 68246, 32, 72362, 32, 7243, 32, 7391, 32, 11546, 32,
+    85848, 228465, 122, 0, 1, 1, 90434, 519, 0, 1, 74433, 32, 85848, 228465, 122, 0, 1, 1, 85848,
+    228465, 122, 0, 1, 1, 955506, 213312, 0, 2, 270652, 22588, 4, 1457325, 64566, 4, 20467, 1, 4,
+    0, 141992, 32, 100788, 420, 1, 1, 81663, 32, 59498, 32, 20142, 32, 24588, 32, 20744, 32, 25933,
+    32, 24623, 32, 43053543, 10, 53384111, 14333, 10, 43574283, 26308, 10, 1293828, 28716, 63, 0,
+    1, 1006041, 43623, 251, 0, 1, 16000, 100, 16000, 100, 962335, 18, 2780678, 6, 442008, 1,
+    52538055, 3756, 18, 267929, 18, 76433006, 8868, 18, 52948122, 18, 1995836, 36, 3227919, 12,
+    901022, 1, 166917843, 4307, 36, 284546, 36, 158221314, 26549, 36, 74698472, 36, 333849714, 1,
+    254006273, 72, 2174038, 72, 2261318, 64571, 4, 207616, 8310, 4, 100181, 726, 719, 0, 1, 100181,
+    726, 719, 0, 1, 100181, 726, 719, 0, 1, 107878, 680, 0, 1, 95336, 1, 281145, 18848, 0, 1,
+    180194, 159, 1, 1, 158519, 8942, 0, 1, 159378, 8813, 0, 1, 107490, 3298, 1, 106057, 655, 1,
+    1964219, 24520, 3, 607153, 231697, 53144, 0, 1, 116711, 1957, 4, 231883, 10, 1000, 24838, 7, 1,
+    232010, 32, 321837444, 25087669, 18, 617887431, 67302824, 36, 356924, 18413, 45, 21, 219951,
     9444, 1, 1000, 172116, 183150, 6, 24, 21, 213283, 618401, 1998, 28258, 1, 1000, 38159, 2, 22,
     1000, 95933, 1, 1, 11, 1000, 277577, 12, 21,
 ];
@@ -193,30 +220,7 @@ fn plutus_conformance_tests_v2() {
         "test_data/conformance/v2",
         Language::PlutusV2,
         11,
-        &[
-            100788, 420, 1, 1, 1000, 173, 0, 1, 1000, 59957, 4, 1, 11183, 32, 201305, 8356, 4,
-            16000, 100, 16000, 100, 16000, 100, 16000, 100, 16000, 100, 16000, 100, 100, 100,
-            16000, 100, 94375, 32, 132994, 32, 61462, 4, 72010, 178, 0, 1, 22151, 32, 91189, 769,
-            4, 2, 85848, 228465, 122, 0, 1, 1, 1000, 42921, 4, 2, 30623, 28755, 75, 1, 898148,
-            27279, 1, 51775, 558, 1, 39184, 1000, 60594, 1, 141895, 32, 83150, 32, 15299, 32,
-            76049, 1, 13169, 4, 22100, 10, 28999, 74, 1, 28999, 74, 1, 43285, 552, 1, 44749, 541,
-            1, 33852, 32, 68246, 32, 72362, 32, 7243, 32, 7391, 32, 11546, 32, 85848, 228465, 122,
-            0, 1, 1, 90434, 519, 0, 1, 74433, 32, 85848, 228465, 122, 0, 1, 1, 85848, 228465, 122,
-            0, 1, 1, 955506, 213312, 0, 2, 270652, 22588, 4, 1457325, 64566, 4, 20467, 1, 4, 0,
-            141992, 32, 100788, 420, 1, 1, 81663, 32, 59498, 32, 20142, 32, 24588, 32, 20744, 32,
-            25933, 32, 24623, 32, 43053543, 10, 53384111, 14333, 10, 43574283, 26308, 10, 1293828,
-            28716, 63, 0, 1, 1006041, 43623, 251, 0, 1, 16000, 100, 16000, 100, 962335, 18,
-            2780678, 6, 442008, 1, 52538055, 3756, 18, 267929, 18, 76433006, 8868, 18, 52948122,
-            18, 1995836, 36, 3227919, 12, 901022, 1, 166917843, 4307, 36, 284546, 36, 158221314,
-            26549, 36, 74698472, 36, 333849714, 1, 254006273, 72, 2174038, 72, 2261318, 64571, 4,
-            207616, 8310, 4, 100181, 726, 719, 0, 1, 100181, 726, 719, 0, 1, 100181, 726, 719, 0,
-            1, 107878, 680, 0, 1, 95336, 1, 281145, 18848, 0, 1, 180194, 159, 1, 1, 158519, 8942,
-            0, 1, 159378, 8813, 0, 1, 107490, 3298, 1, 106057, 655, 1, 1964219, 24520, 3, 607153,
-            231697, 53144, 0, 1, 116711, 1957, 4, 231883, 10, 1000, 24838, 7, 1, 232010, 32,
-            321837444, 25087669, 18, 617887431, 67302824, 36, 356924, 18413, 45, 21, 219951, 9444,
-            1, 1000, 172116, 183150, 6, 24, 21, 213283, 618401, 1998, 28258, 1, 1000, 38159, 2, 22,
-            1000, 95933, 1, 1, 11, 1000, 277577, 12, 21,
-        ],
+        V2_PV11_COSTS,
         // This root combines budget fixtures from incompatible upstream cost-model revisions
         // (legacy BLS fixtures and newer CEK/builtin fixtures). Result conformance remains valid;
         // budget conformance is enabled for the homogeneous V3 PV11 root below.
@@ -233,4 +237,182 @@ fn plutus_conformance_tests_v3() {
         V3_PV11_COSTS,
         true,
     )
+}
+
+/// Term ids are handed out by a process-wide counter, so the synthetic terms an error message
+/// carries (a discharged value, say) get different ids on every evaluation. Blank them out.
+fn without_term_ids(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+
+    while let Some(at) = rest.find("uniq_id: ") {
+        let (head, tail) = rest.split_at(at + "uniq_id: ".len());
+        out.push_str(head);
+        rest = tail.trim_start_matches(|c: char| c == '-' || c.is_ascii_digit());
+    }
+
+    out.push_str(rest);
+    out
+}
+
+/// What one evaluation left behind, in a form both machines can be compared on.
+#[derive(Debug, PartialEq)]
+struct Outcome {
+    result: Result<Term<NamedDeBruijn>, String>,
+    remaining: ExBudget,
+    traces: Vec<String>,
+}
+
+fn regular_outcome(
+    program: Program<NamedDeBruijn>,
+    language: &Language,
+    protocol_major_version: u16,
+    costs: &[i64],
+) -> Outcome {
+    let budget = ExBudget::default();
+    let eval =
+        program.eval_as_with_protocol(language, protocol_major_version, costs, Some(&budget));
+    let remaining = budget - eval.cost();
+    let traces = eval
+        .traces()
+        .iter()
+        .map(|trace| format!("{trace:?}"))
+        .collect();
+
+    Outcome {
+        result: eval
+            .result()
+            .map_err(|error| without_term_ids(&format!("{error}"))),
+        remaining,
+        traces,
+    }
+}
+
+fn manual_outcome(
+    program: Program<NamedDeBruijn>,
+    language: &Language,
+    protocol_major_version: u16,
+    costs: &[i64],
+) -> (Outcome, bool) {
+    let budget = ExBudget::default();
+    let cost_model = initialize_cost_model_with_protocol(language, protocol_major_version, costs);
+
+    let mut machine = match ManualMachine::new_debug_with_protocol(
+        language.clone(),
+        protocol_major_version,
+        cost_model,
+        budget,
+        200,
+        program.term,
+    ) {
+        Ok(machine) => machine,
+        Err(error) => {
+            // Refused before the first step, as `Machine::run` would be; only the error is
+            // comparable then.
+            let outcome = Outcome {
+                result: Err(without_term_ids(&format!("{error}"))),
+                remaining: budget,
+                traces: vec![],
+            };
+
+            return (outcome, true);
+        }
+    };
+
+    let result = match machine.run_to_completion() {
+        ExecutionStatus::Done(term) => Ok(term.clone()),
+        ExecutionStatus::Error(error) => Err(without_term_ids(&format!("{error}"))),
+        ExecutionStatus::Ready => unreachable!("run_to_completion returned while ready"),
+    };
+
+    let outcome = Outcome {
+        result,
+        remaining: machine.ex_budget,
+        traces: machine
+            .traces
+            .iter()
+            .map(|trace| format!("{trace:?}"))
+            .collect(),
+    };
+
+    (outcome, false)
+}
+
+/// Steps every conformance program through `ManualMachine` and checks it lands exactly where
+/// `Program::eval_as_with_protocol` does: same result (or same error), same remaining budget, same
+/// traces.
+fn manual_machine_parity(
+    root: &str,
+    language: Language,
+    protocol_major_version: u16,
+    costs: &[i64],
+) -> usize {
+    let mut checked = 0;
+
+    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        let path = entry.path();
+
+        if path.extension().and_then(OsStr::to_str) != Some("uplc") {
+            continue;
+        }
+
+        let code = fs::read_to_string(path).expect("Failed to read .uplc file");
+
+        let Ok(program) = parser::program(&code) else {
+            continue;
+        };
+
+        let Ok(program): Result<Program<NamedDeBruijn>, _> = program.try_into() else {
+            continue;
+        };
+
+        let regular = regular_outcome(program.clone(), &language, protocol_major_version, costs);
+        let (manual, refused) = manual_outcome(program, &language, protocol_major_version, costs);
+
+        if refused {
+            pretty_assertions::assert_eq!(
+                regular.result,
+                manual.result,
+                "manual machine refused {} differently ({language:?}, protocol {protocol_major_version})",
+                path.display()
+            );
+        } else {
+            pretty_assertions::assert_eq!(
+                regular,
+                manual,
+                "manual machine diverged on {} ({language:?}, protocol {protocol_major_version})",
+                path.display()
+            );
+        }
+
+        checked += 1;
+    }
+
+    assert!(checked > 0, "no conformance programs found under {root}");
+
+    checked
+}
+
+#[test]
+fn manual_machine_matches_machine_on_conformance_v2() {
+    for protocol_major_version in [CHANG_PROTOCOL_VERSION - 1, CHANG_PROTOCOL_VERSION, 10, 11] {
+        manual_machine_parity(
+            "test_data/conformance/v2",
+            Language::PlutusV2,
+            protocol_major_version,
+            V2_PV11_COSTS,
+        );
+    }
+}
+
+#[test]
+fn manual_machine_matches_machine_on_conformance_v3() {
+    for protocol_major_version in [10, VAN_ROSSEM_PROTOCOL_VERSION] {
+        manual_machine_parity(
+            "test_data/conformance/v3",
+            Language::PlutusV3,
+            protocol_major_version,
+            V3_PV11_COSTS,
+        );
+    }
 }
