@@ -794,6 +794,16 @@ impl Encode for Constant {
                     "BLS12-381 ML results are not supported for flat encoding".to_string(),
                 ));
             }
+            Constant::ProtoArray(typ, array) => {
+                let mut type_encode = vec![7, 12];
+
+                encode_type(typ, &mut type_encode);
+
+                encode_constant(&type_encode, e)?;
+
+                // An array's elements are laid out exactly like a list's.
+                e.encode_list_with(array, |item, e| encode_constant_value(item, e))?;
+            }
             Constant::Value(value) => {
                 encode_constant(&[13], e)?;
                 encode_value(value, e)?;
@@ -854,7 +864,7 @@ fn encode_constant_value(x: &Constant, e: &mut Encoder) -> Result<(), en::Error>
             Constant::String(s) => s.encode(e)?,
             Constant::Unit => (),
             Constant::Bool(b) => b.encode(e)?,
-            Constant::ProtoList(_, list) => {
+            Constant::ProtoList(_, list) | Constant::ProtoArray(_, list) => {
                 steps.push(Step::List(ListStep::End));
 
                 for item in list.iter().rev() {
@@ -915,6 +925,10 @@ fn encode_type(typ: &Type, bytes: &mut Vec<u8>) {
                 bytes.extend(vec![7, 5]);
                 pending.push(sub_typ);
             }
+            Type::Array(sub_typ) => {
+                bytes.extend(vec![7, 12]);
+                pending.push(sub_typ);
+            }
             Type::Pair(type1, type2) => {
                 bytes.extend(vec![7, 7, 6]);
                 pending.push(type2);
@@ -947,6 +961,17 @@ impl Decode<'_> for Constant {
                 })?;
 
                 Ok(Constant::ProtoList(typ, list))
+            }
+            [7, 12, rest @ ..] => {
+                let mut rest = VecDeque::from(rest.to_vec());
+
+                let typ = decode_type(&mut rest)?;
+
+                let array: Vec<Rc<Constant>> = d.decode_list_with(|d| {
+                    decode_constant_value(typ.clone().into(), d).map(Rc::new)
+                })?;
+
+                Ok(Constant::ProtoArray(typ, array))
             }
             [7, 7, 6, rest @ ..] => {
                 let mut rest = VecDeque::from(rest.to_vec());
@@ -1026,6 +1051,11 @@ fn decode_constant_value(typ: Rc<Type>, d: &mut Decoder) -> Result<Constant, de:
             elem_type: Rc<Type>,
             items: Vec<Rc<Constant>>,
         },
+        /// Elements of an `array` read so far; another one is on its way.
+        ArrayItem {
+            elem_type: Rc<Type>,
+            items: Vec<Rc<Constant>>,
+        },
         /// The first component of a `pair` is being read.
         PairFst {
             first_type: Rc<Type>,
@@ -1068,6 +1098,20 @@ fn decode_constant_value(typ: Rc<Type>, d: &mut Decoder) -> Result<Constant, de:
                 }
 
                 Constant::ProtoList(sub_type.as_ref().clone(), Vec::new())
+            }
+            Type::Array(sub_type) => {
+                if decode_list_bit(d)? {
+                    next = Rc::clone(sub_type);
+
+                    frames.push(Frame::ArrayItem {
+                        elem_type: Rc::clone(sub_type),
+                        items: Vec::new(),
+                    });
+
+                    continue;
+                }
+
+                Constant::ProtoArray(sub_type.as_ref().clone(), Vec::new())
             }
             Type::Pair(type1, type2) => {
                 next = Rc::clone(type1);
@@ -1133,6 +1177,20 @@ fn decode_constant_value(typ: Rc<Type>, d: &mut Decoder) -> Result<Constant, de:
 
                     current = Constant::ProtoList(elem_type.as_ref().clone(), items);
                 }
+                Some(Frame::ArrayItem {
+                    elem_type,
+                    mut items,
+                }) => {
+                    items.push(Rc::new(current));
+
+                    if decode_list_bit(d)? {
+                        next = Rc::clone(&elem_type);
+                        frames.push(Frame::ArrayItem { elem_type, items });
+                        break;
+                    }
+
+                    current = Constant::ProtoArray(elem_type.as_ref().clone(), items);
+                }
                 Some(Frame::PairFst {
                     first_type,
                     second_type,
@@ -1173,6 +1231,8 @@ fn decode_type(types: &mut VecDeque<u8>) -> Result<Type, de::Error> {
     enum Frame {
         /// The element type of a `list` is being read.
         List,
+        /// The element type of an `array` is being read.
+        Array,
         /// The first component of a `pair` is being read.
         PairFst,
         /// The second component of a `pair` is being read; the first is done.
@@ -1198,6 +1258,10 @@ fn decode_type(types: &mut VecDeque<u8>) -> Result<Type, de::Error> {
             Some(7) => match types.pop_front() {
                 Some(5) => {
                     frames.push(Frame::List);
+                    continue;
+                }
+                Some(12) => {
+                    frames.push(Frame::Array);
                     continue;
                 }
                 Some(7) => match types.pop_front() {
@@ -1239,6 +1303,7 @@ fn decode_type(types: &mut VecDeque<u8>) -> Result<Type, de::Error> {
             match frames.pop() {
                 None => return Ok(current),
                 Some(Frame::List) => current = Type::List(current.into()),
+                Some(Frame::Array) => current = Type::Array(current.into()),
                 Some(Frame::PairFst) => {
                     frames.push(Frame::PairSnd {
                         first: current.into(),
@@ -1618,6 +1683,120 @@ mod tests {
         let actual_program: Program<Name> = Program::unflat(&bytes).unwrap();
 
         assert_eq!(actual_program, expected_program)
+    }
+
+    #[test]
+    fn flat_encode_array_array_integer() {
+        let program = Program::<Name> {
+            version: (1, 0, 0),
+            term: Term::Constant {
+                value: Constant::ProtoArray(
+                    Type::Array(Type::Integer.into()),
+                    vec![
+                        Constant::ProtoArray(
+                            Type::Integer,
+                            vec![Constant::Integer(7.into()).into()],
+                        )
+                        .into(),
+                        Constant::ProtoArray(
+                            Type::Integer,
+                            vec![Constant::Integer(5.into()).into()],
+                        )
+                        .into(),
+                    ],
+                )
+                .into(),
+                uniq_id: next_uniq_id(),
+            },
+        };
+
+        // The payload is laid out exactly as in `flat_encode_list_list_integer`; only the type
+        // tags differ, 12 for `array` where that test has 5 for `list`.
+        let expected_bytes = vec![
+            0b00000001, 0b00000000, 0b00000000, 0b01001011, 0b11110010, 0b11111100, 0b10000011,
+            0b00001110, 0b01100001, 0b01000001,
+        ];
+
+        assert_eq!(program.to_flat().unwrap(), expected_bytes);
+
+        let actual_program: Program<Name> = Program::unflat(&expected_bytes).unwrap();
+
+        assert_eq!(actual_program, program);
+    }
+
+    #[test]
+    fn flat_decode_list_of_arrays() {
+        let bytes = vec![
+            0b00000001, 0b00000000, 0b00000000, 0b01001011, 0b11010110, 0b11111100, 0b10100011,
+            0b10100001,
+        ];
+
+        let expected_program = Program::<Name> {
+            version: (1, 0, 0),
+            term: Term::Constant {
+                value: Constant::ProtoList(
+                    Type::Array(Type::Bool.into()),
+                    vec![
+                        Constant::ProtoArray(Type::Bool, vec![Constant::Bool(true).into()]).into(),
+                        Constant::ProtoArray(Type::Bool, vec![]).into(),
+                    ],
+                )
+                .into(),
+                uniq_id: next_uniq_id(),
+            },
+        };
+
+        let actual_program: Program<Name> = Program::unflat(&bytes).unwrap();
+
+        assert_eq!(actual_program, expected_program);
+        assert_eq!(expected_program.to_flat().unwrap(), bytes);
+    }
+
+    #[test]
+    fn flat_round_trips_arrays_nested_in_other_constants() {
+        let array_of_pairs = Constant::ProtoArray(
+            Type::Pair(
+                Type::Integer.into(),
+                Type::Array(Type::ByteString.into()).into(),
+            ),
+            vec![
+                Constant::ProtoPair(
+                    Type::Integer,
+                    Type::Array(Type::ByteString.into()),
+                    Constant::Integer((-42).into()).into(),
+                    Constant::ProtoArray(
+                        Type::ByteString,
+                        vec![
+                            Constant::ByteString(vec![]).into(),
+                            Constant::ByteString(vec![0xde, 0xad]).into(),
+                        ],
+                    )
+                    .into(),
+                )
+                .into(),
+            ],
+        );
+
+        for constant in [
+            Constant::ProtoArray(Type::Integer, vec![]),
+            Constant::ProtoArray(Type::Unit, vec![Constant::Unit.into(); 300]),
+            array_of_pairs,
+        ] {
+            let program = Program::<DeBruijn> {
+                version: (1, 1, 0),
+                term: Term::Constant {
+                    value: constant.into(),
+                    uniq_id: next_uniq_id(),
+                },
+            };
+
+            let bytes = program.to_flat().unwrap();
+
+            let actual_program: Program<DeBruijn> = Program::unflat(&bytes).unwrap();
+
+            assert_eq!(actual_program, program);
+            assert_eq!(actual_program.to_flat().unwrap(), bytes);
+        }
     }
 
     #[test]

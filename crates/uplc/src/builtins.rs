@@ -137,6 +137,10 @@ pub enum DefaultFunction {
     Ripemd_160 = 86,
     ExpModInteger = 87,
     DropList = 88,
+    // Arrays
+    LengthOfArray = 89,
+    ListToArray = 90,
+    IndexArray = 91,
     // Match
     // CaseList = xx,
     // CaseData = xx,
@@ -346,6 +350,9 @@ impl TryFrom<u8> for DefaultFunction {
             v if v == DefaultFunction::Ripemd_160 as u8 => Ok(DefaultFunction::Ripemd_160),
             v if v == DefaultFunction::ExpModInteger as u8 => Ok(DefaultFunction::ExpModInteger),
             v if v == DefaultFunction::DropList as u8 => Ok(DefaultFunction::DropList),
+            v if v == DefaultFunction::LengthOfArray as u8 => Ok(DefaultFunction::LengthOfArray),
+            v if v == DefaultFunction::ListToArray as u8 => Ok(DefaultFunction::ListToArray),
+            v if v == DefaultFunction::IndexArray as u8 => Ok(DefaultFunction::IndexArray),
             v if v == DefaultFunction::Bls12_381_G1_MultiScalarMul as u8 => {
                 Ok(DefaultFunction::Bls12_381_G1_MultiScalarMul)
             }
@@ -459,6 +466,9 @@ impl FromStr for DefaultFunction {
             "findFirstSetBit" => Ok(FindFirstSetBit),
             "ripemd_160" => Ok(Ripemd_160),
             "dropList" => Ok(DropList),
+            "lengthOfArray" => Ok(LengthOfArray),
+            "listToArray" => Ok(ListToArray),
+            "indexArray" => Ok(IndexArray),
             "bls12_381_G1_multiScalarMul" => Ok(Bls12_381_G1_MultiScalarMul),
             "expModInteger" => Ok(ExpModInteger),
             "insertCoin" => Ok(InsertCoin),
@@ -569,6 +579,9 @@ impl Display for DefaultFunction {
             FindFirstSetBit => write!(f, "findFirstSetBit"),
             Ripemd_160 => write!(f, "ripemd_160"),
             DropList => write!(f, "dropList"),
+            LengthOfArray => write!(f, "lengthOfArray"),
+            ListToArray => write!(f, "listToArray"),
+            IndexArray => write!(f, "indexArray"),
             Bls12_381_G1_MultiScalarMul => write!(f, "bls12_381_G1_multiScalarMul"),
             ExpModInteger => write!(f, "expModInteger"),
             InsertCoin => write!(f, "insertCoin"),
@@ -690,6 +703,9 @@ impl DefaultFunction {
 
             ExpModInteger
             | DropList
+            | LengthOfArray
+            | ListToArray
+            | IndexArray
             | Bls12_381_G1_MultiScalarMul
             | Bls12_381_G2_MultiScalarMul
             | InsertCoin
@@ -732,8 +748,8 @@ impl DefaultFunction {
     }
 
     /// Whether this builtin was opened to every Plutus version at once, at protocol version 11
-    /// (Van Rossem): `expModInteger`, `dropList`, the BLS12-381 multi-scalar multiplications and
-    /// the CIP-0153 value builtins.
+    /// (Van Rossem): `expModInteger`, `dropList`, the CIP-0138 array builtins, the BLS12-381
+    /// multi-scalar multiplications and the CIP-0153 value builtins.
     pub(crate) fn is_van_rossem_builtin(&self) -> bool {
         self.batch() == Batch::Six
     }
@@ -845,6 +861,9 @@ impl DefaultFunction {
             FindFirstSetBit => "find_first_set_bit",
             Ripemd_160 => "ripemd_160",
             DropList => "drop_list",
+            LengthOfArray => "length_of_array",
+            ListToArray => "list_to_array",
+            IndexArray => "index_array",
             Bls12_381_G1_MultiScalarMul => "bls12_381_g1_multi_scalar_mul",
             ExpModInteger => "exp_mod_integer",
             InsertCoin => "insert_value",

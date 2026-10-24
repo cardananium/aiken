@@ -2723,6 +2723,31 @@ impl BuiltinCosts {
                     cpu: self.drop_list.cpu.cost(arg0, arg1),
                 }
             }
+            DefaultFunction::LengthOfArray => ExBudget {
+                mem: self.length_of_array.mem.cost(args[0].to_ex_mem()),
+                cpu: self.length_of_array.cpu.cost(args[0].to_ex_mem()),
+            },
+            DefaultFunction::ListToArray => {
+                // The list is measured by its length, like the array it becomes. For malformed
+                // inputs, fall back to the value's generic memory usage rather than charging as
+                // if the list were empty.
+                let list_len = list_len_or_value_ex_mem(&args[0]);
+
+                ExBudget {
+                    mem: self.list_to_array.mem.cost(list_len),
+                    cpu: self.list_to_array.cpu.cost(list_len),
+                }
+            }
+            DefaultFunction::IndexArray => ExBudget {
+                mem: self
+                    .index_array
+                    .mem
+                    .cost(args[0].to_ex_mem(), args[1].to_ex_mem()),
+                cpu: self
+                    .index_array
+                    .cpu
+                    .cost(args[0].to_ex_mem(), args[1].to_ex_mem()),
+            },
             DefaultFunction::ExpModInteger => {
                 let modulus = args[2].unwrap_integer()?;
                 if modulus <= &0.into() || integer_log2(modulus.clone()) >= 8191 {

@@ -671,6 +671,10 @@ pub enum Constant {
     Bls12_381G1Element(Box<blst::blst_p1>),
     Bls12_381G2Element(Box<blst::blst_p2>),
     Bls12_381MlResult(Box<blst::blst_fp12>),
+    // tag: 12
+    // Elements are `Rc`-shared for the same reason as `ProtoList`'s: `listToArray` and
+    // `indexArray` hand them over without deep-cloning them.
+    ProtoArray(Type, Vec<Rc<Constant>>),
     // tag: 13
     Value(Value),
 }
@@ -681,7 +685,7 @@ impl Constant {
     pub fn contains_value(constant: impl AsRef<Constant>) -> bool {
         match constant.as_ref() {
             Constant::Value(_) => true,
-            Constant::ProtoList(r#type, elements) => {
+            Constant::ProtoList(r#type, elements) | Constant::ProtoArray(r#type, elements) => {
                 r#type.contains_value() || elements.iter().any(Constant::contains_value)
             }
             Constant::ProtoPair(fst, snd, left, right) => {
@@ -689,6 +693,24 @@ impl Constant {
                     || snd.contains_value()
                     || Constant::contains_value(left)
                     || Constant::contains_value(right)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether this constant contains an array, which is only available from
+    /// protocol version 11 (Van Rossem) onwards.
+    pub fn contains_array(constant: impl AsRef<Constant>) -> bool {
+        match constant.as_ref() {
+            Constant::ProtoArray(..) => true,
+            Constant::ProtoList(r#type, elements) => {
+                r#type.contains_array() || elements.iter().any(Constant::contains_array)
+            }
+            Constant::ProtoPair(fst, snd, left, right) => {
+                fst.contains_array()
+                    || snd.contains_array()
+                    || Constant::contains_array(left)
+                    || Constant::contains_array(right)
             }
             _ => false,
         }
@@ -1231,7 +1253,7 @@ fn detach_constant_children(
         | Constant::Bls12_381MlResult(..)
         | Constant::Value(..) => {}
 
-        Constant::ProtoList(_, items) => {
+        Constant::ProtoList(_, items) | Constant::ProtoArray(_, items) => {
             // Elements are shared `Rc`s: only the ones we solely own are taken apart, the rest are
             // released in O(1) without touching the pointee.
             for item in mem::take(items) {
@@ -1342,6 +1364,7 @@ pub enum Type {
     Bls12_381G2Element,
     Bls12_381MlResult,
     Value,
+    Array(Rc<Type>),
 }
 
 impl Type {
@@ -1350,8 +1373,19 @@ impl Type {
     pub fn contains_value(&self) -> bool {
         match self {
             Type::Value => true,
-            Type::List(r#type) => r#type.contains_value(),
+            Type::List(r#type) | Type::Array(r#type) => r#type.contains_value(),
             Type::Pair(fst, snd) => fst.contains_value() || snd.contains_value(),
+            _ => false,
+        }
+    }
+
+    /// Whether this type mentions the `array` type, which is only available
+    /// from protocol version 11 (Van Rossem) onwards.
+    pub fn contains_array(&self) -> bool {
+        match self {
+            Type::Array(_) => true,
+            Type::List(r#type) => r#type.contains_array(),
+            Type::Pair(fst, snd) => fst.contains_array() || snd.contains_array(),
             _ => false,
         }
     }
@@ -1366,6 +1400,13 @@ impl Constant {
     pub fn deep_clone(&self) -> Constant {
         match self {
             Constant::ProtoList(tipo, items) => Constant::ProtoList(
+                tipo.deep_clone(),
+                items
+                    .iter()
+                    .map(|item| Rc::new(item.deep_clone()))
+                    .collect(),
+            ),
+            Constant::ProtoArray(tipo, items) => Constant::ProtoArray(
                 tipo.deep_clone(),
                 items
                     .iter()
@@ -1390,6 +1431,7 @@ impl Type {
     pub fn deep_clone(&self) -> Type {
         match self {
             Type::List(inner) => Type::List(Rc::new(inner.deep_clone())),
+            Type::Array(inner) => Type::Array(Rc::new(inner.deep_clone())),
             Type::Pair(fst, snd) => {
                 Type::Pair(Rc::new(fst.deep_clone()), Rc::new(snd.deep_clone()))
             }
@@ -1419,6 +1461,7 @@ impl Clone for Type {
             Type::Bls12_381MlResult => Type::Bls12_381MlResult,
             Type::Value => Type::Value,
             Type::List(inner) => Type::List(Rc::clone(inner)),
+            Type::Array(inner) => Type::Array(Rc::clone(inner)),
             Type::Pair(fst, snd) => Type::Pair(Rc::clone(fst), Rc::clone(snd)),
         }
     }
@@ -1454,7 +1497,7 @@ fn detach_type_children(typ: &mut Type, pending: &mut Vec<Type>, filler: &mut Op
         | Type::Bls12_381MlResult
         | Type::Value => {}
 
-        Type::List(inner) => {
+        Type::List(inner) | Type::Array(inner) => {
             detach_type_child(inner, pending, filler);
         }
 
@@ -1494,6 +1537,7 @@ impl Display for Type {
             Type::Bls12_381G2Element => write!(f, "bls12_381_G2_element"),
             Type::Bls12_381MlResult => write!(f, "bls12_381_mlresult"),
             Type::Value => write!(f, "value"),
+            Type::Array(t) => write!(f, "array {t}"),
         }
     }
 }

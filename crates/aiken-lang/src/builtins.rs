@@ -591,6 +591,11 @@ pub fn plutus(id_gen: &IdGenerator) -> TypeInfo {
     };
 
     for builtin in DefaultFunction::iter() {
+        // Arrays have no Aiken type, so the builtins that consume or produce them are left out.
+        if is_array_builtin(builtin) {
+            continue;
+        }
+
         let value = from_default_function(builtin, id_gen);
         plutus.values.insert(builtin.aiken_name(), value);
     }
@@ -628,6 +633,13 @@ pub fn plutus(id_gen: &IdGenerator) -> TypeInfo {
     );
 
     plutus
+}
+
+fn is_array_builtin(builtin: DefaultFunction) -> bool {
+    matches!(
+        builtin,
+        DefaultFunction::LengthOfArray | DefaultFunction::ListToArray | DefaultFunction::IndexArray
+    )
 }
 
 pub fn from_default_function(builtin: DefaultFunction, id_gen: &IdGenerator) -> ValueConstructor {
@@ -1163,6 +1175,11 @@ pub fn from_default_function(builtin: DefaultFunction, id_gen: &IdGenerator) -> 
             let tipo = Type::function(vec![Type::int(), Type::int(), Type::int()], Type::int());
 
             (tipo, 3)
+        }
+        DefaultFunction::LengthOfArray
+        | DefaultFunction::ListToArray
+        | DefaultFunction::IndexArray => {
+            unreachable!("{builtin} has no Aiken type: arrays are not part of the language")
         }
     };
 

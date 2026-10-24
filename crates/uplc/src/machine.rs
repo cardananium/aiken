@@ -297,15 +297,16 @@ impl Machine {
 
     /// Each builtin becomes available to each Plutus version at a protocol
     /// version of its own (see `DefaultFunction::introduced_in`), and native
-    /// `Value` constants exist for every Plutus version from protocol version
-    /// 11 (Van Rossem) onwards. Availability is a whole-program well-formedness
-    /// rule: occurrences in latent code (under lambdas, delays or untaken
-    /// branches) are rejected too, so the entire term is validated up-front
-    /// before evaluation starts.
+    /// `Value` and `array` constants exist for every Plutus version from
+    /// protocol version 11 (Van Rossem) onwards. Availability is a
+    /// whole-program well-formedness rule: occurrences in latent code (under
+    /// lambdas, delays or untaken branches) are rejected too, so the entire
+    /// term is validated up-front before evaluation starts.
     pub(crate) fn assert_available(&self, term: &Term<NamedDeBruijn>) -> Result<(), Error> {
         let semantics = self.semantics;
 
         if semantics.supports_values()
+            && semantics.supports_arrays()
             && DefaultFunction::iter().all(|fun| self.is_builtin_available(fun))
         {
             return Ok(());
@@ -329,6 +330,10 @@ impl Machine {
                 } => {
                     if !semantics.supports_values() && Constant::contains_value(constant) {
                         return Err(Error::ValueConstantNotAvailable);
+                    }
+
+                    if !semantics.supports_arrays() && Constant::contains_array(constant) {
+                        return Err(Error::ArrayConstantNotAvailable);
                     }
                 }
                 Term::Builtin { fun, .. } => {
@@ -810,6 +815,7 @@ impl From<&Constant> for Type {
             Constant::Unit => Type::Unit,
             Constant::Bool(_) => Type::Bool,
             Constant::ProtoList(t, _) => Type::List(Rc::new(t.clone())),
+            Constant::ProtoArray(t, _) => Type::Array(Rc::new(t.clone())),
             Constant::ProtoPair(t1, t2, _, _) => {
                 Type::Pair(Rc::new(t1.clone()), Rc::new(t2.clone()))
             }
@@ -830,10 +836,12 @@ mod tests {
     use super::{
         Context, Error,
         cost_model::ExBudget,
-        runtime::{Compressable, VAN_ROSSEM_PROTOCOL_VERSION},
+        runtime::{
+            BuiltinSemantics, CHANG_PROTOCOL_VERSION, Compressable, VAN_ROSSEM_PROTOCOL_VERSION,
+        },
     };
     use crate::{
-        ast::{Constant, NamedDeBruijn, Program, Term},
+        ast::{Constant, NamedDeBruijn, Program, Term, Type},
         builtins::DefaultFunction,
     };
     use pallas_primitives::conway::Language;
@@ -972,6 +980,7 @@ mod tests {
             (IntegerToByteString, Language::PlutusV3, 9),
             (CountSetBits, Language::PlutusV3, 10),
             (Bls12_381_G2_MultiScalarMul, Language::PlutusV3, 11),
+            (ListToArray, Language::PlutusV3, 11),
             (ScaleValue, Language::PlutusV3, 11),
         ];
 
@@ -1019,6 +1028,185 @@ mod tests {
                 "{fun} in {language:?} at {protocol}: {result:?}"
             );
         }
+    }
+
+    #[test]
+    fn array_builtins_and_constants_unavailable_before_van_rossem() {
+        let program = |term: Term<NamedDeBruijn>| Program {
+            version: (1, 1, 0),
+            term,
+        };
+
+        let builtin = Term::Builtin {
+            fun: DefaultFunction::LengthOfArray,
+            uniq_id: 0,
+        };
+        let constant: Term<NamedDeBruijn> = Term::Constant {
+            value: Constant::ProtoArray(Type::Integer, vec![]).into(),
+            uniq_id: 1,
+        };
+        // Availability is a whole-program rule: latent occurrences that
+        // evaluation never reaches must be rejected too.
+        let latent: Term<NamedDeBruijn> = Term::Lambda {
+            parameter_name: NamedDeBruijn {
+                text: "x".to_string(),
+                index: 0.into(),
+            }
+            .into(),
+            body: Term::Builtin {
+                fun: DefaultFunction::IndexArray,
+                uniq_id: 2,
+            }
+            .into(),
+            uniq_id: 3,
+        };
+        // An empty list of arrays mentions the array type only in its element type.
+        let in_type: Term<NamedDeBruijn> = Term::Constant {
+            value: Constant::ProtoList(Type::Array(Type::Integer.into()), vec![]).into(),
+            uniq_id: 4,
+        };
+        // Public AST callers can construct type-inconsistent constants even
+        // though Flat decoding cannot; the elements are inspected as well.
+        let in_element: Term<NamedDeBruijn> = Term::Constant {
+            value: Constant::ProtoList(
+                Type::Integer,
+                vec![Rc::new(Constant::ProtoArray(Type::Integer, vec![]))],
+            )
+            .into(),
+            uniq_id: 5,
+        };
+
+        for (language, protocol) in [
+            (Language::PlutusV1, 10),
+            (Language::PlutusV2, CHANG_PROTOCOL_VERSION),
+            (Language::PlutusV2, 10),
+            (Language::PlutusV3, CHANG_PROTOCOL_VERSION),
+            (Language::PlutusV3, 10),
+        ] {
+            for term in [builtin.clone(), latent.clone()] {
+                let result = program(term)
+                    .eval_version_with_protocol(ExBudget::default(), &language, protocol)
+                    .result();
+                assert!(
+                    matches!(result, Err(Error::BuiltinNotAvailable(_))),
+                    "expected an array builtin to be unavailable for {language:?} at protocol {protocol}, got {result:?}"
+                );
+            }
+
+            for term in [constant.clone(), in_type.clone(), in_element.clone()] {
+                let result = program(term)
+                    .eval_version_with_protocol(ExBudget::default(), &language, protocol)
+                    .result();
+                assert!(
+                    matches!(result, Err(Error::ArrayConstantNotAvailable)),
+                    "expected an array constant to be unavailable for {language:?} at protocol {protocol}, got {result:?}"
+                );
+            }
+
+            // Direct calls through the public runtime API are gated too.
+            let semantics = BuiltinSemantics::for_language_and_protocol(&language, protocol);
+            let result = DefaultFunction::LengthOfArray.call(
+                semantics,
+                &[super::value::Value::array(Type::Integer, vec![])],
+                &mut vec![],
+            );
+            assert!(
+                matches!(result, Err(Error::BuiltinNotAvailable(_))),
+                "expected direct lengthOfArray call to be unavailable for {language:?} at protocol {protocol}, got {result:?}"
+            );
+        }
+
+        for language in [Language::PlutusV1, Language::PlutusV2, Language::PlutusV3] {
+            for term in [
+                builtin.clone(),
+                constant.clone(),
+                latent.clone(),
+                in_type.clone(),
+                in_element.clone(),
+            ] {
+                let result = program(term)
+                    .eval_version_with_protocol(
+                        ExBudget::default(),
+                        &language,
+                        VAN_ROSSEM_PROTOCOL_VERSION,
+                    )
+                    .result();
+                assert!(result.is_ok(), "{language:?}: {result:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn array_builtins_evaluate_in_every_plutus_version_from_van_rossem() {
+        let eval = |source: &str, language: &Language| {
+            let program: Program<NamedDeBruijn> =
+                crate::parser::program(source).unwrap().try_into().unwrap();
+
+            program
+                .eval_version_with_protocol(
+                    ExBudget::default(),
+                    language,
+                    VAN_ROSSEM_PROTOCOL_VERSION,
+                )
+                .result()
+        };
+
+        let integer = |n: i64| Term::<NamedDeBruijn>::Constant {
+            value: Constant::Integer(n.into()).into(),
+            uniq_id: 0,
+        };
+
+        for language in [Language::PlutusV1, Language::PlutusV2, Language::PlutusV3] {
+            let index = |i: i64| {
+                eval(
+                    &format!(
+                        "(program 1.1.0 [(force (builtin indexArray)) [(force (builtin listToArray)) (con (list integer) [11, 22, 33])] (con integer {i})])"
+                    ),
+                    &language,
+                )
+            };
+
+            assert_eq!(index(0).unwrap(), integer(11));
+            assert_eq!(index(2).unwrap(), integer(33));
+
+            for out_of_bounds in [3, -1] {
+                assert!(
+                    matches!(
+                        index(out_of_bounds),
+                        Err(Error::ArrayIndexOutOfBounds(_, 3))
+                    ),
+                    "{language:?}: index {out_of_bounds}"
+                );
+            }
+
+            let length = eval(
+                "(program 1.1.0 [(force (builtin lengthOfArray)) (con (array bool) [True, False])])",
+                &language,
+            );
+
+            assert_eq!(length.unwrap(), integer(2));
+
+            let mismatch = eval(
+                "(program 1.1.0 [(force (builtin lengthOfArray)) (con (list bool) [True])])",
+                &language,
+            );
+
+            assert!(
+                matches!(mismatch, Err(Error::ArrayTypeMismatch(_))),
+                "{language:?}: {mismatch:?}"
+            );
+        }
+
+        // An index too large for any machine integer is out of bounds, not a crash.
+        let huge = eval(
+            "(program 1.1.0 [(force (builtin indexArray)) (con (array unit) [()]) (con integer 340282366920938463463374607431768211456)])",
+            &Language::PlutusV3,
+        );
+
+        assert!(
+            matches!(huge, Err(Error::ArrayIndexOutOfBounds(_, 1))),
+            "{huge:?}"
+        );
     }
 
     /// Deep enough that a destructor taking one stack frame per level cannot survive the test

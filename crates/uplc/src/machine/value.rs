@@ -155,6 +155,12 @@ impl Value {
         Value::Con(constant.into())
     }
 
+    pub fn array(typ: Type, n: Vec<Rc<Constant>>) -> Self {
+        let constant = Constant::ProtoArray(typ, n);
+
+        Value::Con(constant.into())
+    }
+
     pub fn data(d: PlutusData) -> Self {
         let constant = Constant::Data(d);
 
@@ -225,6 +231,16 @@ impl Value {
         };
 
         Ok((t, list))
+    }
+
+    pub(super) fn unwrap_array(&self) -> Result<(&Type, &Vec<Rc<Constant>>), Error> {
+        let inner = self.unwrap_constant()?;
+
+        let Constant::ProtoArray(t, array) = inner else {
+            return Err(Error::ArrayTypeMismatch(inner.into()));
+        };
+
+        Ok((t, array))
     }
 
     pub(super) fn unwrap_data(&self) -> Result<&PlutusData, Error> {
@@ -407,6 +423,8 @@ impl Value {
                 Constant::ProtoList(_, items) => {
                     stack.extend(items.iter().map(|item| item.as_ref()))
                 }
+                // An array is measured by its length, not by the size of its elements.
+                Constant::ProtoArray(_, items) => total += items.len() as i64,
                 Constant::ProtoPair(_, _, l, r) => {
                     stack.push(l.as_ref());
                     stack.push(r.as_ref());

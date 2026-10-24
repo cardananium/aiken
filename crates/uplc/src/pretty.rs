@@ -276,6 +276,18 @@ impl Constant {
                 .append(RcDoc::text("0x"))
                 .append(RcDoc::text(hex::encode(p2.compress()))),
             Constant::Bls12_381MlResult(_) => panic!("cannot represent Bls12_381MlResult as text"),
+            Constant::ProtoArray(r#type, items) => RcDoc::text("(")
+                .append("array")
+                .append(RcDoc::space())
+                .append(r#type.to_doc())
+                .append(")")
+                .append(RcDoc::line())
+                .append(RcDoc::text("["))
+                .append(RcDoc::intersperse(
+                    items.iter().map(|c| c.to_doc_list()),
+                    RcDoc::text(", "),
+                ))
+                .append(RcDoc::text("]")),
             Constant::Value(value) => RcDoc::text("value")
                 .append(RcDoc::line())
                 .append(Self::to_doc_value(value)),
@@ -319,6 +331,12 @@ impl Constant {
                 RcDoc::text("0x").append(RcDoc::text(hex::encode(p2.compress())))
             }
             Constant::Bls12_381MlResult(_) => panic!("cannot represent Bls12_381MlResult as text"),
+            Constant::ProtoArray(_, items) => RcDoc::text("[")
+                .append(RcDoc::intersperse(
+                    items.iter().map(|c| c.to_doc_list()),
+                    RcDoc::text(", "),
+                ))
+                .append(RcDoc::text("]")),
             Constant::Value(value) => Self::to_doc_value(value),
         }
     }
@@ -424,9 +442,14 @@ impl Type {
                 .append(")"),
             Type::Data => RcDoc::text("data"),
             Type::Bls12_381G1Element => RcDoc::text("bls12_381_G1_element"),
-            Type::Bls12_381G2Element => RcDoc::text("bls12_381_G1_element"),
+            Type::Bls12_381G2Element => RcDoc::text("bls12_381_G2_element"),
             Type::Bls12_381MlResult => RcDoc::text("bls12_381_mlresult"),
             Type::Value => RcDoc::text("value"),
+            Type::Array(r#type) => RcDoc::text("(array")
+                .append(RcDoc::line())
+                .append(r#type.to_doc())
+                .append(RcDoc::line_())
+                .append(")"),
         }
     }
 }
@@ -435,6 +458,41 @@ impl Type {
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn format_arrays() {
+        let uplc = "(program 1.1.0 (con (list (array (pair bool bls12_381_G2_element))) [[], []]))";
+
+        assert_eq!(
+            crate::parser::program(uplc).unwrap().to_pretty(),
+            indoc! {
+                r#"
+                (program
+                  1.1.0
+                  (con (list (array (pair bool bls12_381_G2_element))) [[], []])
+                )"#
+            }
+        );
+
+        let uplc = "(program 1.1.0 (con (array (list integer)) [[1, 2], []]))";
+        let pretty = crate::parser::program(uplc).unwrap().to_pretty();
+
+        assert_eq!(
+            pretty,
+            indoc! {
+                r#"
+                (program
+                  1.1.0
+                  (con (array (list integer)) [[1, 2], []])
+                )"#
+            }
+        );
+
+        assert_eq!(
+            crate::parser::program(&pretty).unwrap(),
+            crate::parser::program(uplc).unwrap()
+        );
+    }
 
     #[test]
     fn format_pair_bool_pair_integer_bytestring() {

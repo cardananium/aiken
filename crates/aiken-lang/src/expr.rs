@@ -1084,6 +1084,10 @@ impl UntypedExpr {
                 })
             }
 
+            uplc::ast::Constant::ProtoArray(..) => {
+                Err("cannot reify a UPLC 'Array' constant: no Aiken syntax for it".to_string())
+            }
+
             uplc::ast::Constant::Value(value) => {
                 let value = Arc::new(value.into_entries());
                 let spans = ValueLiteralSpans::empty(value.as_ref());

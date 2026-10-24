@@ -2118,7 +2118,9 @@ impl<'a> CodeGenerator<'a> {
                 | UplcType::Bls12_381G2Element
                 | UplcType::Bls12_381MlResult
                 | UplcType::Value
-                | UplcType::Data,
+                | UplcType::Data
+                // Aiken types never lower to a UPLC array; this only keeps the match exhaustive.
+                | UplcType::Array(_),
             ) => then,
 
             // Map type
@@ -4589,6 +4591,9 @@ impl<'a> CodeGenerator<'a> {
                             Some(UplcType::Bls12_381MlResult) => {
                                 panic!("ML Result equality is not supported")
                             }
+                            Some(UplcType::Array(_)) => {
+                                panic!("Array equality is not supported")
+                            }
                         };
 
                         let binop_eq = match uplc_type {
@@ -4890,7 +4895,8 @@ impl<'a> CodeGenerator<'a> {
                         | UplcType::Bls12_381G1Element
                         | UplcType::Bls12_381G2Element
                         | UplcType::Bls12_381MlResult
-                        | UplcType::Value,
+                        | UplcType::Value
+                        | UplcType::Array(_),
                     ) => subject,
 
                     Some(UplcType::Data) => subject,
@@ -4957,7 +4963,8 @@ impl<'a> CodeGenerator<'a> {
                             | UplcType::List(_)
                             | UplcType::Pair(_, _)
                             | UplcType::Bls12_381MlResult
-                            | UplcType::Value,
+                            | UplcType::Value
+                            | UplcType::Array(_),
                         ) => unreachable!("{:#?}", tipo),
                         Some(UplcType::Data) => unimplemented!(),
                         Some(UplcType::Integer) => Term::equals_integer()

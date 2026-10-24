@@ -46,6 +46,8 @@ pub enum Error {
     TypeMismatch(Type, Type),
     #[error("type mismatch\n{:>13} (list a)\n{:>13} {0}", "Expected", "Got")]
     ListTypeMismatch(Type),
+    #[error("type mismatch\n{:>13} (array a)\n{:>13} {0}", "Expected", "Got")]
+    ArrayTypeMismatch(Type),
     #[error("type mismatch\n{:>13}(pair a b)\n{:>13} {0}", "Expected", "Got")]
     PairTypeMismatch(Type),
     #[error(
@@ -112,6 +114,8 @@ pub enum Error {
         .1.len() - 1
     )]
     ByteStringOutOfBounds(BigInt, Vec<u8>),
+    #[error("array index out of bounds\n{:>13} {0}\n{:>13} {1}", "Index", "Length")]
+    ArrayIndexOutOfBounds(BigInt, usize),
     #[error(
         "attempt to consByteString something than isn't a byte between [0-255]\n{:>13} {0}",
         "Found"
@@ -139,6 +143,8 @@ pub enum Error {
     BuiltinNotAvailable(DefaultFunction),
     #[error("Value constants are not available in this plutus / protocol version")]
     ValueConstantNotAvailable,
+    #[error("array constants are not available in this plutus / protocol version")]
+    ArrayConstantNotAvailable,
     #[error("{0} is not within the bounds of a Natural")]
     OutsideNaturalBounds(BigInt),
     #[error("{0} is not within the bounds of a Byte")]

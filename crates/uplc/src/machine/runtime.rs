@@ -105,6 +105,12 @@ impl BuiltinSemantics {
         matches!(self, BuiltinSemantics::D | BuiltinSemantics::E)
     }
 
+    /// `array` constants (CIP-0138) exist for every Plutus version from
+    /// protocol version 11 (Van Rossem) onwards.
+    pub fn supports_arrays(self) -> bool {
+        matches!(self, BuiltinSemantics::D | BuiltinSemantics::E)
+    }
+
     /// Whether `fun` may be called under these semantics, as far as they can tell.
     ///
     /// The builtins introduced at protocol version 11 (Van Rossem) arrived in every Plutus
@@ -275,6 +281,9 @@ impl DefaultFunction {
             | DefaultFunction::FindFirstSetBit
             | DefaultFunction::Ripemd_160
             | DefaultFunction::DropList
+            | DefaultFunction::LengthOfArray
+            | DefaultFunction::ListToArray
+            | DefaultFunction::IndexArray
             | DefaultFunction::Bls12_381_G1_MultiScalarMul
             | DefaultFunction::ExpModInteger
             | DefaultFunction::InsertCoin
@@ -382,6 +391,9 @@ impl DefaultFunction {
             DefaultFunction::Bls12_381_G1_MultiScalarMul => 2,
             DefaultFunction::ExpModInteger => 3,
             DefaultFunction::DropList => 2,
+            DefaultFunction::LengthOfArray => 1,
+            DefaultFunction::ListToArray => 1,
+            DefaultFunction::IndexArray => 2,
             DefaultFunction::InsertCoin => 4,
             DefaultFunction::LookupCoin => 3,
             DefaultFunction::UnionValue => 2,
@@ -485,6 +497,9 @@ impl DefaultFunction {
             DefaultFunction::Bls12_381_G1_MultiScalarMul => 0,
             DefaultFunction::ExpModInteger => 0,
             DefaultFunction::DropList => 1,
+            DefaultFunction::LengthOfArray => 1,
+            DefaultFunction::ListToArray => 1,
+            DefaultFunction::IndexArray => 1,
             DefaultFunction::InsertCoin
             | DefaultFunction::LookupCoin
             | DefaultFunction::UnionValue
@@ -2094,6 +2109,32 @@ impl DefaultFunction {
                 let value = Value::list(r#type.clone(), dropped);
 
                 Ok(value)
+            }
+            DefaultFunction::LengthOfArray => {
+                let (_, array) = args[0].unwrap_array()?;
+
+                let value = Value::integer(array.len().into());
+
+                Ok(value)
+            }
+            DefaultFunction::ListToArray => {
+                let (r#type, list) = args[0].unwrap_list()?;
+
+                // The elements are shared with the list, not copied.
+                let value = Value::array(r#type.clone(), list.clone());
+
+                Ok(value)
+            }
+            DefaultFunction::IndexArray => {
+                let (_, array) = args[0].unwrap_array()?;
+                let index = args[1].unwrap_integer()?;
+
+                // A negative index, or one too large for a `usize`, is out of bounds like any
+                // other index past the end.
+                match usize::try_from(index).ok().and_then(|i| array.get(i)) {
+                    Some(element) => Ok(Value::Con(Rc::clone(element))),
+                    None => Err(Error::ArrayIndexOutOfBounds(index.clone(), array.len())),
+                }
             }
             DefaultFunction::InsertCoin => {
                 let currency = args[0].unwrap_byte_string()?;
