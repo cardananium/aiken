@@ -82,26 +82,25 @@ pub fn scripts_needed(tx: &MintedTx, utxos: &[ResolvedInput]) -> Result<ScriptsN
         }
     }
 
-    let mut reward = txb
+    // Every withdrawal key is a stake address, or the node would not have decoded the
+    // transaction; the redeemer lookup below relies on it.
+    let mut reward = ScriptsNeeded::new();
+
+    for (acnt, _) in txb
         .withdrawals
         .as_deref()
-        .map(|w| {
-            w.iter()
-                .filter_map(|(acnt, _)| {
-                    let address = Address::from_bytes(acnt).unwrap();
+        .map(|w| &w[..])
+        .unwrap_or_default()
+    {
+        let Address::Stake(a) = Address::from_bytes(acnt)? else {
+            return Err(Error::BadWithdrawalAddress);
+        };
 
-                    if let Address::Stake(a) = address
-                        && let StakePayload::Script(h) = a.payload()
-                    {
-                        let cred = StakeCredential::ScriptHash(*h);
-                        return Some((ScriptPurpose::Rewarding(cred), *h));
-                    }
-
-                    None
-                })
-                .collect::<ScriptsNeeded>()
-        })
-        .unwrap_or_default();
+        if let StakePayload::Script(h) = a.payload() {
+            let cred = StakeCredential::ScriptHash(*h);
+            reward.push((ScriptPurpose::Rewarding(cred), *h));
+        }
+    }
 
     let mut cert = txb
         .certificates
@@ -333,7 +332,7 @@ fn build_redeemer_key(
             let mut redeemer_key = None;
 
             for (idx, x) in reward_accounts.iter().enumerate() {
-                let cred = match Address::from_bytes(x).unwrap() {
+                let cred = match Address::from_bytes(x)? {
                     Address::Stake(a) => match a.payload() {
                         StakePayload::Script(sh) => Some(StakeCredential::ScriptHash(*sh)),
                         StakePayload::Stake(_) => None,

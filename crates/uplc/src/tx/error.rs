@@ -102,4 +102,34 @@ pub enum Error {
     ApplyParamsError,
     #[error("validity start or end too far in the past")]
     SlotTooFarInThePast { oldest_allowed: u64 },
+    #[error(
+        "a PlutusV1/V2 script context cannot show certificate #{index}, a {kind} certificate (CertificateNotSupported)"
+    )]
+    CertificateNotSupported { index: usize, kind: &'static str },
+    #[error(
+        "a PlutusV1/V2 script context cannot show voting procedures (VotingProceduresFieldNotSupported)"
+    )]
+    VotingProceduresFieldNotSupported,
+    #[error(
+        "a PlutusV1/V2 script context cannot show proposal procedures (ProposalProceduresFieldNotSupported)"
+    )]
+    ProposalProceduresFieldNotSupported,
+    #[error(
+        "a PlutusV1/V2 script context cannot show the current treasury value (CurrentTreasuryFieldNotSupported)"
+    )]
+    CurrentTreasuryFieldNotSupported,
+    #[error(
+        "a PlutusV1/V2 script context cannot show a treasury donation (TreasuryDonationFieldNotSupported)"
+    )]
+    TreasuryDonationFieldNotSupported,
+    #[error(
+        "a script context cannot show output #{0}: it has a Byron address (ByronTxOutInContext)"
+    )]
+    ByronTxOutInContext(usize),
+    #[error("an output value cannot be read\n{:>13} {0}", "Reason")]
+    BadOutputValue(String),
+    #[error("only stake addresses can be reward accounts\n{:>13} {0}", "Field")]
+    BadRewardAccount(String),
+    #[error("a rational number has denominator 0\n{:>13} {0}", "Field")]
+    BadRationalNumber(String),
 }

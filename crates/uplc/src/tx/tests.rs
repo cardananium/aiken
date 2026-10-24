@@ -1809,3 +1809,598 @@ fn apply_params_to_script_rejects_invalid_params_without_panicking() {
         Err(super::error::Error::ApplyParamsError)
     ));
 }
+
+/// What the script context builders refuse, instead of panicking or translating what the ledger
+/// would not.
+mod context_refusals {
+    use crate::{
+        ast::{DeBruijn, Program, Term},
+        tx::{
+            ResolvedInput, SlotConfig,
+            error::Error,
+            eval_phase_one, eval_phase_two,
+            script_context::{DataLookupTable, TxInfo, TxInfoV1, TxInfoV2, TxInfoV3, find_script},
+        },
+    };
+    use pallas_codec::{
+        minicbor,
+        utils::{Bytes, KeyValuePairs, NonEmptyKeyValuePairs, NonEmptySet, Nullable, PositiveCoin},
+    };
+    use pallas_crypto::hash::Hash;
+    use pallas_primitives::{
+        alonzo,
+        conway::{
+            Anchor, Certificate, DRep, ExUnits, GovAction, GovActionId, Language, MintedTx,
+            PlutusScript, PostAlonzoTransactionOutput, ProposalProcedure, ProtocolParamUpdate,
+            PseudoDatumOption, PseudoTransactionOutput, RationalNumber, Redeemer, RedeemerTag,
+            Redeemers, StakeCredential, TransactionBody, TransactionInput, TransactionOutput, Tx,
+            Value, Vote, Voter, VotingProcedure, WitnessSet,
+        },
+    };
+    use pallas_traverse::ComputeHash;
+
+    const LANGUAGES: [Language; 3] = [Language::PlutusV1, Language::PlutusV2, Language::PlutusV3];
+
+    fn input(index: u64) -> TransactionInput {
+        TransactionInput {
+            transaction_id: Hash::from([7; 32]),
+            index,
+        }
+    }
+
+    /// An enterprise address locked by key hash `byte`.
+    fn key_address(byte: u8) -> Bytes {
+        [vec![0x60], vec![byte; 28]].concat().into()
+    }
+
+    /// A reward account of key hash `byte`; a script one when `script`.
+    fn stake_address(byte: u8, script: bool) -> Bytes {
+        [vec![if script { 0xf0 } else { 0xe0 }], vec![byte; 28]]
+            .concat()
+            .into()
+    }
+
+    fn byron_address() -> Bytes {
+        pallas_addresses::ByronAddress::from_base58(
+            "Ae2tdPwUPEZFRbyhz3cpfC2CumGzNkFBN2L42rcUc2yjQpEkxDbkPodpMAi",
+        )
+        .unwrap()
+        .to_vec()
+        .into()
+    }
+
+    fn output(address: Bytes) -> TransactionOutput {
+        PseudoTransactionOutput::PostAlonzo(PostAlonzoTransactionOutput {
+            address,
+            value: Value::Coin(2_000_000),
+            datum_option: None,
+            script_ref: None,
+        })
+    }
+
+    fn with_inline_datum(address: Bytes) -> TransactionOutput {
+        PseudoTransactionOutput::PostAlonzo(PostAlonzoTransactionOutput {
+            address,
+            value: Value::Coin(2_000_000),
+            datum_option: Some(PseudoDatumOption::Data(pallas_codec::utils::CborWrap(
+                crate::ast::Data::integer(1.into()),
+            ))),
+            script_ref: None,
+        })
+    }
+
+    fn legacy_output(amount: alonzo::Value) -> TransactionOutput {
+        PseudoTransactionOutput::Legacy(alonzo::TransactionOutput {
+            address: key_address(1),
+            amount,
+            datum_hash: None,
+        })
+    }
+
+    /// The outputs inputs 0 and 1 spend: a plain one each.
+    fn utxos() -> Vec<ResolvedInput> {
+        vec![
+            ResolvedInput {
+                input: input(0),
+                output: output(key_address(1)),
+            },
+            ResolvedInput {
+                input: input(1),
+                output: output(key_address(2)),
+            },
+        ]
+    }
+
+    /// A transaction spending input 0 into one plain output, edited by `edit`, as CBOR.
+    fn transaction(
+        edit: impl FnOnce(&mut TransactionBody),
+        witness_set: impl FnOnce(&mut WitnessSet),
+    ) -> Vec<u8> {
+        let mut transaction_body = TransactionBody {
+            inputs: vec![input(0)].into(),
+            outputs: vec![output(key_address(3))],
+            fee: 200_000,
+            ttl: None,
+            certificates: None,
+            withdrawals: None,
+            auxiliary_data_hash: None,
+            validity_interval_start: None,
+            mint: None,
+            script_data_hash: None,
+            collateral: None,
+            required_signers: None,
+            network_id: None,
+            collateral_return: None,
+            total_collateral: None,
+            reference_inputs: None,
+            voting_procedures: None,
+            proposal_procedures: None,
+            treasury_value: None,
+            donation: None,
+        };
+        edit(&mut transaction_body);
+
+        let mut transaction_witness_set = WitnessSet {
+            vkeywitness: None,
+            native_script: None,
+            bootstrap_witness: None,
+            plutus_v1_script: None,
+            plutus_data: None,
+            redeemer: None,
+            plutus_v2_script: None,
+            plutus_v3_script: None,
+        };
+        witness_set(&mut transaction_witness_set);
+
+        minicbor::to_vec(Tx {
+            transaction_body,
+            transaction_witness_set,
+            success: true,
+            auxiliary_data: Nullable::Null,
+        })
+        .unwrap()
+    }
+
+    fn body(edit: impl FnOnce(&mut TransactionBody)) -> Vec<u8> {
+        transaction(edit, |_| {})
+    }
+
+    fn context(language: &Language, tx: &[u8], utxos: &[ResolvedInput]) -> Result<TxInfo, Error> {
+        let tx: MintedTx = minicbor::decode(tx).unwrap();
+        let slot_config = SlotConfig::default();
+
+        match language {
+            Language::PlutusV1 => TxInfoV1::from_transaction(&tx, utxos, &slot_config),
+            Language::PlutusV2 => TxInfoV2::from_transaction(&tx, utxos, &slot_config),
+            Language::PlutusV3 => TxInfoV3::from_transaction(&tx, utxos, &slot_config),
+        }
+    }
+
+    fn credential() -> StakeCredential {
+        StakeCredential::AddrKeyhash(Hash::from([9; 28]))
+    }
+
+    fn anchor() -> Anchor {
+        Anchor {
+            url: "https://example.com".to_string(),
+            content_hash: Hash::from([5; 32]),
+        }
+    }
+
+    fn proposal(gov_action: GovAction) -> ProposalProcedure {
+        ProposalProcedure {
+            deposit: 100_000_000_000,
+            reward_account: stake_address(4, false),
+            gov_action,
+            anchor: anchor(),
+        }
+    }
+
+    #[test]
+    fn plutus_v1_v2_refuse_conway_certificates() {
+        let pool = Hash::from([8; 28]);
+
+        let refused = [
+            (
+                Certificate::VoteDeleg(credential(), DRep::Abstain),
+                "VoteDeleg",
+            ),
+            (
+                Certificate::StakeVoteDeleg(credential(), pool, DRep::NoConfidence),
+                "StakeVoteDeleg",
+            ),
+            (
+                Certificate::StakeRegDeleg(credential(), pool, 2_000_000),
+                "StakeRegDeleg",
+            ),
+            (
+                Certificate::VoteRegDeleg(credential(), DRep::Abstain, 2_000_000),
+                "VoteRegDeleg",
+            ),
+            (
+                Certificate::StakeVoteRegDeleg(credential(), pool, DRep::Abstain, 2_000_000),
+                "StakeVoteRegDeleg",
+            ),
+            (
+                Certificate::AuthCommitteeHot(credential(), credential()),
+                "AuthCommitteeHot",
+            ),
+            (
+                Certificate::ResignCommitteeCold(credential(), Nullable::Null),
+                "ResignCommitteeCold",
+            ),
+            (
+                Certificate::RegDRepCert(credential(), 500_000_000, Nullable::Null),
+                "RegDRepCert",
+            ),
+            (
+                Certificate::UnRegDRepCert(credential(), 500_000_000),
+                "UnRegDRepCert",
+            ),
+            (
+                Certificate::UpdateDRepCert(credential(), Nullable::Null),
+                "UpdateDRepCert",
+            ),
+        ];
+
+        for (certificate, name) in refused {
+            // Behind a certificate every language can show, so the index counts.
+            let tx = body(|body| {
+                body.certificates = NonEmptySet::try_from(vec![
+                    Certificate::StakeRegistration(credential()),
+                    certificate,
+                ])
+                .ok()
+            });
+
+            for language in [Language::PlutusV1, Language::PlutusV2] {
+                let result = context(&language, &tx, &utxos());
+                assert!(
+                    matches!(
+                        result,
+                        Err(Error::CertificateNotSupported { index: 1, kind }) if kind == name
+                    ),
+                    "{name} for {language:?}: {result:?}"
+                );
+            }
+
+            assert!(
+                context(&Language::PlutusV3, &tx, &utxos()).is_ok(),
+                "{name}"
+            );
+        }
+
+        // The deposit-carrying registration and deregistration show as their older forms.
+        let tx = body(|body| {
+            body.certificates = NonEmptySet::try_from(vec![
+                Certificate::Reg(credential(), 2_000_000),
+                Certificate::UnReg(credential(), 2_000_000),
+            ])
+            .ok()
+        });
+
+        for language in LANGUAGES {
+            assert!(context(&language, &tx, &utxos()).is_ok(), "{language:?}");
+        }
+    }
+
+    #[test]
+    fn plutus_v1_v2_refuse_conway_fields() {
+        let voting = body(|body| {
+            body.voting_procedures = Some(NonEmptyKeyValuePairs::Def(vec![(
+                Voter::DRepKey(Hash::from([6; 28])),
+                NonEmptyKeyValuePairs::Def(vec![(
+                    GovActionId {
+                        transaction_id: Hash::from([3; 32]),
+                        action_index: 0,
+                    },
+                    VotingProcedure {
+                        vote: Vote::Yes,
+                        anchor: Nullable::Null,
+                    },
+                )]),
+            )]))
+        });
+        let proposing = body(|body| {
+            body.proposal_procedures =
+                NonEmptySet::try_from(vec![proposal(GovAction::Information)]).ok()
+        });
+        let treasury = body(|body| body.treasury_value = Some(0));
+        let donation = body(|body| body.donation = PositiveCoin::try_from(5).ok());
+
+        for language in [Language::PlutusV1, Language::PlutusV2] {
+            assert!(matches!(
+                context(&language, &voting, &utxos()),
+                Err(Error::VotingProceduresFieldNotSupported)
+            ));
+            assert!(matches!(
+                context(&language, &proposing, &utxos()),
+                Err(Error::ProposalProceduresFieldNotSupported)
+            ));
+            assert!(matches!(
+                context(&language, &treasury, &utxos()),
+                Err(Error::CurrentTreasuryFieldNotSupported)
+            ));
+            assert!(matches!(
+                context(&language, &donation, &utxos()),
+                Err(Error::TreasuryDonationFieldNotSupported)
+            ));
+        }
+
+        for tx in [&voting, &proposing, &treasury, &donation] {
+            assert!(context(&Language::PlutusV3, tx, &utxos()).is_ok());
+        }
+    }
+
+    #[test]
+    fn byron_and_unreadable_outputs_are_refused_in_every_language() {
+        let byron =
+            body(|body| body.outputs = vec![output(key_address(3)), output(byron_address())]);
+        let unreadable = body(|body| body.outputs = vec![output(vec![0x6f, 1, 2].into())]);
+
+        for language in LANGUAGES {
+            assert!(
+                matches!(
+                    context(&language, &byron, &utxos()),
+                    Err(Error::ByronTxOutInContext(1))
+                ),
+                "{language:?}"
+            );
+            assert!(
+                matches!(
+                    context(&language, &unreadable, &utxos()),
+                    Err(Error::Address(_))
+                ),
+                "{language:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unreadable_legacy_values_are_refused_in_every_language() {
+        let policy = Hash::from([2; 28]);
+        let zero = alonzo::Value::Multiasset(
+            2_000_000,
+            KeyValuePairs::Def(vec![(
+                policy,
+                KeyValuePairs::Def(vec![(b"token".to_vec().into(), 0)]),
+            )]),
+        );
+        let empty = alonzo::Value::Multiasset(
+            2_000_000,
+            KeyValuePairs::Def(vec![(policy, KeyValuePairs::Def(vec![]))]),
+        );
+
+        for amount in [zero, empty] {
+            // In an output of the transaction, and in the output an input spends.
+            let created = body(|body| body.outputs = vec![legacy_output(amount.clone())]);
+            let spent = vec![ResolvedInput {
+                input: input(0),
+                output: legacy_output(amount.clone()),
+            }];
+
+            for language in LANGUAGES {
+                for (tx, utxos) in [(&created, utxos()), (&body(|_| {}), spent.clone())] {
+                    let result = context(&language, tx, &utxos);
+                    assert!(
+                        matches!(result, Err(Error::BadOutputValue(_))),
+                        "{language:?}: {result:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn withdrawals_need_stake_addresses() {
+        for (account, payment) in [(key_address(4), true), (vec![0xe0, 1].into(), false)] {
+            let tx = body(|body| {
+                body.withdrawals = Some(NonEmptyKeyValuePairs::Def(vec![
+                    (stake_address(4, false), 1),
+                    (account, 1),
+                ]))
+            });
+
+            fn refused<T>(payment: bool, result: &Result<T, Error>) -> bool {
+                if payment {
+                    matches!(result, Err(Error::BadWithdrawalAddress))
+                } else {
+                    matches!(result, Err(Error::Address(_)))
+                }
+            }
+
+            for language in LANGUAGES {
+                let result = context(&language, &tx, &utxos());
+                assert!(refused(payment, &result), "{language:?}: {result:?}");
+            }
+
+            // And on the way to a reward redeemer's script, and in phase one.
+            let minted: MintedTx = minicbor::decode(&tx).unwrap();
+            let lookup_table = DataLookupTable::from_transaction(&minted, &utxos());
+            let redeemer = Redeemer {
+                tag: RedeemerTag::Reward,
+                index: 0,
+                data: crate::ast::Data::integer(0.into()),
+                ex_units: ExUnits { mem: 0, steps: 0 },
+            };
+            let result = find_script(&redeemer, &minted, &utxos(), &lookup_table);
+            assert!(refused(payment, &result), "find_script");
+
+            let result = eval_phase_one(&minted, &utxos(), &lookup_table);
+            assert!(refused(payment, &result), "phase one: {result:?}");
+        }
+    }
+
+    #[test]
+    fn proposals_need_stake_accounts_and_nonzero_denominators() {
+        let mut bad_account = proposal(GovAction::Information);
+        bad_account.reward_account = key_address(4);
+
+        let bad_withdrawal = proposal(GovAction::TreasuryWithdrawals(
+            KeyValuePairs::Def(vec![(stake_address(4, false), 1), (key_address(5), 1)]),
+            Nullable::Null,
+        ));
+
+        let bad_quorum = proposal(GovAction::UpdateCommittee(
+            Nullable::Null,
+            vec![].into(),
+            KeyValuePairs::Def(vec![]),
+            RationalNumber {
+                numerator: 0,
+                denominator: 0,
+            },
+        ));
+
+        // `{ 9: 1/0 }`: a pool pledge influence of 1/0.
+        let update: ProtocolParamUpdate =
+            minicbor::decode(&[0xa1, 0x09, 0xd8, 0x1e, 0x82, 0x01, 0x00]).unwrap();
+        let bad_parameter = proposal(GovAction::ParameterChange(
+            Nullable::Null,
+            Box::new(update),
+            Nullable::Null,
+        ));
+
+        for (proposal, expected) in [
+            (bad_account, "proposal_procedures[0].reward_account"),
+            (
+                bad_withdrawal,
+                "proposal_procedures[0].gov_action.withdrawals[1]",
+            ),
+            (bad_quorum, "proposal_procedures[0].gov_action.quorum"),
+            (
+                bad_parameter,
+                "proposal_procedures[0].gov_action.parameter_update.pool_pledge_influence",
+            ),
+        ] {
+            let tx =
+                body(|body| body.proposal_procedures = NonEmptySet::try_from(vec![proposal]).ok());
+            let result = context(&Language::PlutusV3, &tx, &utxos());
+            assert!(
+                matches!(
+                    &result,
+                    Err(Error::BadRewardAccount(field) | Error::BadRationalNumber(field))
+                        if field == expected
+                ),
+                "{expected}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plutus_v1_refuses_inline_datums_and_takes_reference_inputs_and_scripts() {
+        let inline = body(|body| body.outputs = vec![with_inline_datum(key_address(3))]);
+        assert!(matches!(
+            context(&Language::PlutusV1, &inline, &utxos()),
+            Err(Error::InlineDatumNotAllowed)
+        ));
+        assert!(context(&Language::PlutusV2, &inline, &utxos()).is_ok());
+
+        // Reference inputs are translated and left out of a PlutusV1 context.
+        let referencing =
+            body(|body| body.reference_inputs = NonEmptySet::try_from(vec![input(1)]).ok());
+        assert!(matches!(
+            context(&Language::PlutusV1, &referencing, &utxos()),
+            Ok(TxInfo::V1(_))
+        ));
+
+        let mut inline_reference = utxos();
+        inline_reference[1].output = with_inline_datum(key_address(2));
+        assert!(matches!(
+            context(&Language::PlutusV1, &referencing, &inline_reference),
+            Err(Error::InlineDatumNotAllowed)
+        ));
+
+        // A reference script on a spent output is not shown, and not refused.
+        let mut with_script = utxos();
+        if let PseudoTransactionOutput::PostAlonzo(output) = &mut with_script[0].output {
+            output.script_ref = Some(pallas_codec::utils::CborWrap(
+                pallas_primitives::conway::ScriptRef::PlutusV1Script(PlutusScript::<1>(
+                    vec![0x41, 0x01].into(),
+                )),
+            ));
+        }
+        assert!(context(&Language::PlutusV1, &body(|_| {}), &with_script).is_ok());
+    }
+
+    #[test]
+    fn plutus_v2_scripts_next_to_conway_certificates_fail_instead_of_panicking() {
+        // A minting policy that accepts anything: `\_redeemer _context -> ()`.
+        let lambda = |body: Term<DeBruijn>| Term::Lambda {
+            parameter_name: DeBruijn::new(0).into(),
+            body: body.into(),
+            uniq_id: 0,
+        };
+        let script = Program::<DeBruijn> {
+            version: (1, 0, 0),
+            term: lambda(lambda(Term::Constant {
+                value: crate::ast::Constant::Unit.into(),
+                uniq_id: 0,
+            })),
+        }
+        .to_cbor()
+        .unwrap();
+        let script = PlutusScript::<2>(script.into());
+        let policy = script.compute_hash();
+
+        let tx = |certificates: Option<NonEmptySet<Certificate>>| {
+            transaction(
+                |body| {
+                    body.mint = Some(NonEmptyKeyValuePairs::Def(vec![(
+                        policy,
+                        NonEmptyKeyValuePairs::Def(vec![(
+                            b"".to_vec().into(),
+                            1.try_into().unwrap(),
+                        )]),
+                    )]));
+                    body.certificates = certificates;
+                },
+                |witness_set| {
+                    witness_set.plutus_v2_script = NonEmptySet::try_from(vec![script.clone()]).ok();
+                    witness_set.redeemer =
+                        Some(Redeemers::List(pallas_codec::utils::MaybeIndefArray::Def(
+                            vec![pallas_primitives::conway::Redeemer {
+                                tag: RedeemerTag::Mint,
+                                index: 0,
+                                data: crate::ast::Data::integer(0.into()),
+                                ex_units: ExUnits {
+                                    mem: 1_000_000,
+                                    steps: 1_000_000_000,
+                                },
+                            }],
+                        )));
+                },
+            )
+        };
+
+        let evaluate = |tx: &[u8]| {
+            let tx: MintedTx = minicbor::decode(tx).unwrap();
+            eval_phase_two(
+                &tx,
+                &utxos(),
+                None,
+                None,
+                &SlotConfig::default(),
+                true,
+                |_| (),
+            )
+        };
+
+        assert!(evaluate(&tx(None)).is_ok());
+
+        let result = evaluate(&tx(NonEmptySet::try_from(vec![Certificate::VoteDeleg(
+            credential(),
+            DRep::Abstain,
+        )])
+        .ok()));
+        assert!(
+            matches!(
+                result,
+                Err(Error::CertificateNotSupported {
+                    index: 0,
+                    kind: "VoteDeleg"
+                })
+            ),
+            "{result:?}"
+        );
+    }
+}

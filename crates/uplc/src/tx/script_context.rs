@@ -1,7 +1,7 @@
 use super::{Error, to_plutus_data::MintValue};
 use crate::tx::iter_redeemers;
 use itertools::Itertools;
-use pallas_addresses::{Address, Network, StakePayload};
+use pallas_addresses::{Address, Network, StakeAddress, StakePayload};
 use pallas_codec::utils::{
     Bytes, KeyValuePairs, NonEmptyKeyValuePairs, NonEmptySet, Nullable, PositiveCoin,
 };
@@ -11,9 +11,10 @@ use pallas_primitives::{
     conway::{
         self, AddrKeyhash, Certificate, Coin, DatumHash, DatumOption, GovAction, GovActionId, Mint,
         MintedTransactionBody, MintedTransactionOutput, MintedTx, MintedWitnessSet, PlutusData,
-        PolicyId, PostAlonzoTransactionOutput, ProposalProcedure, PseudoDatumOption, PseudoScript,
-        Redeemer, RedeemerTag, RedeemersKey, RequiredSigners, RewardAccount, ScriptHash,
-        StakeCredential, TransactionInput, TransactionOutput, Value, Voter, VotingProcedure,
+        PolicyId, PostAlonzoTransactionOutput, ProposalProcedure, ProtocolParamUpdate,
+        PseudoDatumOption, PseudoScript, PseudoTransactionOutput, RationalNumber, Redeemer,
+        RedeemerTag, RedeemersKey, RequiredSigners, RewardAccount, ScriptHash, StakeCredential,
+        TransactionInput, TransactionOutput, Value, Voter, VotingProcedure,
     },
 };
 use pallas_traverse::{ComputeHash, OriginalHash};
@@ -219,14 +220,19 @@ impl TxInfoV1 {
         utxos: &[ResolvedInput],
         slot_config: &SlotConfig,
     ) -> Result<TxInfo, Error> {
-        if tx.transaction_body.reference_inputs.is_some() {
-            return Err(Error::ScriptAndInputRefNotAllowed);
-        }
+        refuse_conway_features(&tx.transaction_body)?;
 
         let inputs = get_tx_in_info_v1(&tx.transaction_body.inputs, utxos)?;
+        // Reference inputs are translated, so what PlutusV1 cannot show is refused there too, but
+        // the context leaves them out.
+        if let Some(reference_inputs) = &tx.transaction_body.reference_inputs {
+            get_tx_in_info_v1(reference_inputs, utxos)?;
+        }
+        check_outputs(&tx.transaction_body.outputs, false)?;
         let certificates = get_certificates_info(&tx.transaction_body.certificates);
+        refuse_conway_certificates(&certificates)?;
         let withdrawals =
-            KeyValuePairs::from(get_withdrawals_info(&tx.transaction_body.withdrawals));
+            KeyValuePairs::from(get_withdrawals_info(&tx.transaction_body.withdrawals)?);
         let mint = get_mint_info(&tx.transaction_body.mint);
 
         let redeemers = get_redeemers_info(
@@ -272,17 +278,9 @@ impl TxInfoV2 {
         utxos: &[ResolvedInput],
         slot_config: &SlotConfig,
     ) -> Result<TxInfo, Error> {
+        refuse_conway_features(&tx.transaction_body)?;
+
         let inputs = get_tx_in_info_v2(&tx.transaction_body.inputs, utxos)?;
-        let certificates = get_certificates_info(&tx.transaction_body.certificates);
-        let withdrawals =
-            KeyValuePairs::from(get_withdrawals_info(&tx.transaction_body.withdrawals));
-        let mint = get_mint_info(&tx.transaction_body.mint);
-
-        let redeemers = get_redeemers_info(
-            &tx.transaction_witness_set,
-            script_purpose_builder(&inputs[..], &mint, &certificates, &withdrawals, &[], &[]),
-        )?;
-
         let reference_inputs = tx
             .transaction_body
             .reference_inputs
@@ -290,6 +288,17 @@ impl TxInfoV2 {
             .map(|refs| get_tx_in_info_v2(&refs[..], utxos))
             .transpose()?
             .unwrap_or_default();
+        check_outputs(&tx.transaction_body.outputs, true)?;
+        let certificates = get_certificates_info(&tx.transaction_body.certificates);
+        refuse_conway_certificates(&certificates)?;
+        let withdrawals =
+            KeyValuePairs::from(get_withdrawals_info(&tx.transaction_body.withdrawals)?);
+        let mint = get_mint_info(&tx.transaction_body.mint);
+
+        let redeemers = get_redeemers_info(
+            &tx.transaction_witness_set,
+            script_purpose_builder(&inputs[..], &mint, &certificates, &withdrawals, &[], &[]),
+        )?;
 
         Ok(TxInfo::V2(TxInfoV2 {
             inputs,
@@ -336,15 +345,19 @@ impl TxInfoV3 {
     ) -> Result<TxInfo, Error> {
         let inputs = get_tx_in_info_v2(&tx.transaction_body.inputs, utxos)?;
 
+        check_outputs(&tx.transaction_body.outputs, true)?;
+
         let certificates = get_certificates_info(&tx.transaction_body.certificates);
 
         let withdrawals =
-            KeyValuePairs::from(get_withdrawals_info(&tx.transaction_body.withdrawals));
+            KeyValuePairs::from(get_withdrawals_info(&tx.transaction_body.withdrawals)?);
 
         let mint = get_mint_info(&tx.transaction_body.mint);
 
         let proposal_procedures =
             get_proposal_procedures_info(&tx.transaction_body.proposal_procedures);
+
+        check_proposal_procedures(&proposal_procedures)?;
 
         let votes = get_votes_info(&tx.transaction_body.voting_procedures);
 
@@ -523,8 +536,7 @@ pub fn get_tx_in_info_v1(
             let address = Address::from_bytes(match &utxo.output {
                 TransactionOutput::Legacy(output) => output.address.as_ref(),
                 TransactionOutput::PostAlonzo(output) => output.address.as_ref(),
-            })
-            .unwrap();
+            })?;
 
             match address {
                 Address::Byron(_) => {
@@ -536,15 +548,12 @@ pub fn get_tx_in_info_v1(
                 _ => {}
             };
 
+            // A reference script is not shown to PlutusV1, nor refused (it was, before Conway).
             match &utxo.output {
-                TransactionOutput::Legacy(_) => {}
+                TransactionOutput::Legacy(output) => check_legacy_value(&output.amount)?,
                 TransactionOutput::PostAlonzo(output) => {
                     if let Some(DatumOption::Data(_)) = output.datum_option {
                         return Err(Error::InlineDatumNotAllowed);
-                    }
-
-                    if output.script_ref.is_some() {
-                        return Err(Error::ScriptAndInputRefNotAllowed);
                     }
                 }
             }
@@ -572,8 +581,7 @@ pub fn get_tx_in_info_v2(
             let address = Address::from_bytes(match &utxo.output {
                 TransactionOutput::Legacy(output) => output.address.as_ref(),
                 TransactionOutput::PostAlonzo(output) => output.address.as_ref(),
-            })
-            .unwrap();
+            })?;
 
             match address {
                 Address::Byron(_) => {
@@ -585,12 +593,285 @@ pub fn get_tx_in_info_v2(
                 _ => {}
             };
 
+            if let TransactionOutput::Legacy(output) = &utxo.output {
+                check_legacy_value(&output.amount)?;
+            }
+
             Ok(TxInInfo {
                 out_ref: utxo.input.clone(),
                 resolved: sort_tx_out_value(&utxo.output),
             })
         })
         .collect()
+}
+
+/// Refuse the fields of `body` the ledger refuses to show a PlutusV1 or V2 script
+/// (`guardConwayFeaturesForPlutusV1V2`): voting and proposal procedures, the current treasury
+/// value and a treasury donation. Vote and propose redeemers point into the first two, so no
+/// such purpose gets as far as a PlutusV1/V2 context.
+fn refuse_conway_features(body: &MintedTransactionBody) -> Result<(), Error> {
+    if body
+        .voting_procedures
+        .as_ref()
+        .is_some_and(|votes| !votes.is_empty())
+    {
+        return Err(Error::VotingProceduresFieldNotSupported);
+    }
+
+    if body
+        .proposal_procedures
+        .as_ref()
+        .is_some_and(|proposals| !proposals.is_empty())
+    {
+        return Err(Error::ProposalProceduresFieldNotSupported);
+    }
+
+    if body.treasury_value.is_some() {
+        return Err(Error::CurrentTreasuryFieldNotSupported);
+    }
+
+    if body.donation.is_some() {
+        return Err(Error::TreasuryDonationFieldNotSupported);
+    }
+
+    Ok(())
+}
+
+/// Refuse the certificates a PlutusV1 or V2 context cannot show (`transTxCertV1V2`): the ones
+/// Conway introduced, but for the deposit-carrying stake registration and deregistration, which
+/// show as their older forms.
+fn refuse_conway_certificates(certificates: &[Certificate]) -> Result<(), Error> {
+    for (index, certificate) in certificates.iter().enumerate() {
+        let kind = match certificate {
+            Certificate::StakeRegistration(..)
+            | Certificate::StakeDeregistration(..)
+            | Certificate::StakeDelegation(..)
+            | Certificate::PoolRegistration { .. }
+            | Certificate::PoolRetirement(..)
+            | Certificate::Reg(..)
+            | Certificate::UnReg(..) => continue,
+            Certificate::VoteDeleg(..) => "VoteDeleg",
+            Certificate::StakeVoteDeleg(..) => "StakeVoteDeleg",
+            Certificate::StakeRegDeleg(..) => "StakeRegDeleg",
+            Certificate::VoteRegDeleg(..) => "VoteRegDeleg",
+            Certificate::StakeVoteRegDeleg(..) => "StakeVoteRegDeleg",
+            Certificate::AuthCommitteeHot(..) => "AuthCommitteeHot",
+            Certificate::ResignCommitteeCold(..) => "ResignCommitteeCold",
+            Certificate::RegDRepCert(..) => "RegDRepCert",
+            Certificate::UnRegDRepCert(..) => "UnRegDRepCert",
+            Certificate::UpdateDRepCert(..) => "UpdateDRepCert",
+        };
+
+        return Err(Error::CertificateNotSupported { index, kind });
+    }
+
+    Ok(())
+}
+
+/// Refuse the outputs of a transaction no script context can show: one whose address cannot be
+/// read, one with a Byron address (`ByronTxOutInContext`), one whose legacy value cannot be read,
+/// and, when `inline_datums` is false (PlutusV1), one with an inline datum.
+fn check_outputs(outputs: &[MintedTransactionOutput], inline_datums: bool) -> Result<(), Error> {
+    for (index, output) in outputs.iter().enumerate() {
+        let address = match output {
+            PseudoTransactionOutput::Legacy(output) => &output.address,
+            PseudoTransactionOutput::PostAlonzo(output) => &output.address,
+        };
+
+        if let Address::Byron(_) = Address::from_bytes(address)? {
+            return Err(Error::ByronTxOutInContext(index));
+        }
+
+        match output {
+            PseudoTransactionOutput::Legacy(output) => check_legacy_value(&output.amount)?,
+            PseudoTransactionOutput::PostAlonzo(output) => {
+                if !inline_datums && matches!(output.datum_option, Some(PseudoDatumOption::Data(_)))
+                {
+                    return Err(Error::InlineDatumNotAllowed);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Refuse a legacy (array-form) output value the node refuses while decoding, and that
+/// `from_alonzo_value` cannot convert: a token quantity of 0, or a policy holding no tokens.
+fn check_legacy_value(value: &alonzo::Value) -> Result<(), Error> {
+    let alonzo::Value::Multiasset(_, assets) = value else {
+        return Ok(());
+    };
+
+    for (policy_id, tokens) in assets.iter() {
+        if tokens.is_empty() {
+            return Err(Error::BadOutputValue(format!(
+                "policy {policy_id} holds no tokens"
+            )));
+        }
+
+        for (asset_name, quantity) in tokens.iter() {
+            if *quantity == 0 {
+                return Err(Error::BadOutputValue(format!(
+                    "token {policy_id}.{} has quantity 0",
+                    hex::encode(asset_name.as_slice())
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Refuse the parts of proposal procedures the node refuses while decoding, and the context
+/// translation cannot represent: a return account or treasury withdrawal key that is not a stake
+/// address, and a rational number with denominator 0.
+fn check_proposal_procedures(proposals: &[ProposalProcedure]) -> Result<(), Error> {
+    for (index, proposal) in proposals.iter().enumerate() {
+        let field = format!("proposal_procedures[{index}]");
+
+        check_reward_account(&proposal.reward_account, || {
+            format!("{field}.reward_account")
+        })?;
+
+        match &proposal.gov_action {
+            GovAction::TreasuryWithdrawals(withdrawals, _) => {
+                for (key, (account, _)) in withdrawals.iter().enumerate() {
+                    check_reward_account(account, || {
+                        format!("{field}.gov_action.withdrawals[{key}]")
+                    })?;
+                }
+            }
+            GovAction::UpdateCommittee(_, _, _, quorum) => {
+                check_rational(quorum, || format!("{field}.gov_action.quorum"))?;
+            }
+            GovAction::ParameterChange(_, update, _) => {
+                check_parameter_update(update, &field)?;
+            }
+            GovAction::HardForkInitiation(..)
+            | GovAction::NoConfidence(..)
+            | GovAction::NewConstitution(..)
+            | GovAction::Information => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn check_reward_account(account: &[u8], field: impl FnOnce() -> String) -> Result<(), Error> {
+    match Address::from_bytes(account) {
+        Ok(Address::Stake(_)) => Ok(()),
+        _ => Err(Error::BadRewardAccount(field())),
+    }
+}
+
+fn check_rational(value: &RationalNumber, field: impl FnOnce() -> String) -> Result<(), Error> {
+    if value.denominator == 0 {
+        Err(Error::BadRationalNumber(field()))
+    } else {
+        Ok(())
+    }
+}
+
+fn check_parameter_update(update: &ProtocolParamUpdate, field: &str) -> Result<(), Error> {
+    let mut rationals: Vec<(&str, &RationalNumber)> = [
+        (
+            "pool_pledge_influence",
+            update.pool_pledge_influence.as_ref(),
+        ),
+        ("expansion_rate", update.expansion_rate.as_ref()),
+        ("treasury_growth_rate", update.treasury_growth_rate.as_ref()),
+        (
+            "minfee_refscript_cost_per_byte",
+            update.minfee_refscript_cost_per_byte.as_ref(),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, value)| value.map(|value| (name, value)))
+    .collect();
+
+    if let Some(prices) = &update.execution_costs {
+        rationals.push(("execution_costs.mem_price", &prices.mem_price));
+        rationals.push(("execution_costs.step_price", &prices.step_price));
+    }
+
+    if let Some(thresholds) = &update.pool_voting_thresholds {
+        rationals.extend([
+            (
+                "pool_voting_thresholds.motion_no_confidence",
+                &thresholds.motion_no_confidence,
+            ),
+            (
+                "pool_voting_thresholds.committee_normal",
+                &thresholds.committee_normal,
+            ),
+            (
+                "pool_voting_thresholds.committee_no_confidence",
+                &thresholds.committee_no_confidence,
+            ),
+            (
+                "pool_voting_thresholds.hard_fork_initiation",
+                &thresholds.hard_fork_initiation,
+            ),
+            (
+                "pool_voting_thresholds.security_voting_threshold",
+                &thresholds.security_voting_threshold,
+            ),
+        ]);
+    }
+
+    if let Some(thresholds) = &update.drep_voting_thresholds {
+        rationals.extend([
+            (
+                "drep_voting_thresholds.motion_no_confidence",
+                &thresholds.motion_no_confidence,
+            ),
+            (
+                "drep_voting_thresholds.committee_normal",
+                &thresholds.committee_normal,
+            ),
+            (
+                "drep_voting_thresholds.committee_no_confidence",
+                &thresholds.committee_no_confidence,
+            ),
+            (
+                "drep_voting_thresholds.update_constitution",
+                &thresholds.update_constitution,
+            ),
+            (
+                "drep_voting_thresholds.hard_fork_initiation",
+                &thresholds.hard_fork_initiation,
+            ),
+            (
+                "drep_voting_thresholds.pp_network_group",
+                &thresholds.pp_network_group,
+            ),
+            (
+                "drep_voting_thresholds.pp_economic_group",
+                &thresholds.pp_economic_group,
+            ),
+            (
+                "drep_voting_thresholds.pp_technical_group",
+                &thresholds.pp_technical_group,
+            ),
+            (
+                "drep_voting_thresholds.pp_governance_group",
+                &thresholds.pp_governance_group,
+            ),
+            (
+                "drep_voting_thresholds.treasury_withdrawal",
+                &thresholds.treasury_withdrawal,
+            ),
+        ]);
+    }
+
+    for (name, value) in rationals {
+        check_rational(value, || {
+            format!("{field}.gov_action.parameter_update.{name}")
+        })?;
+    }
+
+    Ok(())
 }
 
 pub fn get_mint_info(mint: &Option<Mint>) -> MintValue {
@@ -635,18 +916,31 @@ pub fn get_proposal_procedures_info(
         .unwrap_or_default()
 }
 
+/// The withdrawals, in the ledger's order. Every key must be a stake address: the node refuses
+/// anything else while decoding the transaction.
 pub fn get_withdrawals_info(
     withdrawals: &Option<NonEmptyKeyValuePairs<RewardAccount, Coin>>,
-) -> Vec<(Address, Coin)> {
-    withdrawals
-        .clone()
-        .map(|w| {
-            w.into_iter()
-                .sorted_by(|(accnt_a, _), (accnt_b, _)| sort_reward_accounts(accnt_a, accnt_b))
-                .map(|(reward_account, coin)| (Address::from_bytes(&reward_account).unwrap(), coin))
-                .collect()
-        })
-        .unwrap_or_default()
+) -> Result<Vec<(Address, Coin)>, Error> {
+    let Some(withdrawals) = withdrawals else {
+        return Ok(vec![]);
+    };
+
+    let mut accounts = withdrawals
+        .iter()
+        .map(
+            |(reward_account, coin)| match Address::from_bytes(reward_account)? {
+                Address::Stake(account) => Ok((account, *coin)),
+                _ => Err(Error::BadWithdrawalAddress),
+            },
+        )
+        .collect::<Result<Vec<_>, Error>>()?;
+
+    accounts.sort_by(|(a, _), (b, _)| compare_stake_addresses(a, b));
+
+    Ok(accounts
+        .into_iter()
+        .map(|(account, coin)| (Address::Stake(account), coin))
+        .collect())
 }
 
 pub fn get_validity_range_info(
@@ -859,21 +1153,15 @@ pub fn find_script(
                 lookup_script(&hash)
             }),
 
-        RedeemerTag::Reward => get_withdrawals_info(&tx.transaction_body.withdrawals)
+        RedeemerTag::Reward => get_withdrawals_info(&tx.transaction_body.withdrawals)?
             .get(redeemer.index as usize)
             .ok_or(Error::MissingScriptForRedeemer)
-            .and_then(|(addr, _)| {
-                let stake_addr = if let Address::Stake(stake_addr) = addr {
-                    stake_addr
-                } else {
-                    unreachable!("withdrawal always contains stake addresses")
-                };
-
-                if let StakePayload::Script(hash) = stake_addr.payload() {
-                    lookup_script(hash)
-                } else {
-                    Err(Error::NonScriptWithdrawal)
-                }
+            .and_then(|(addr, _)| match addr {
+                Address::Stake(stake_addr) => match stake_addr.payload() {
+                    StakePayload::Script(hash) => lookup_script(hash),
+                    StakePayload::Stake(_) => Err(Error::NonScriptWithdrawal),
+                },
+                _ => Err(Error::BadWithdrawalAddress),
             }),
 
         RedeemerTag::Cert => get_certificates_info(&tx.transaction_body.certificates)
@@ -1106,10 +1394,20 @@ fn sort_gov_action_id(a: &GovActionId, b: &GovActionId) -> Ordering {
     }
 }
 
+/// The ledger's order of two reward accounts. Both must be stake addresses (see
+/// `get_withdrawals_info`).
 pub fn sort_reward_accounts(a: &Bytes, b: &Bytes) -> Ordering {
     let addr_a = Address::from_bytes(a).expect("invalid reward address in withdrawals.");
     let addr_b = Address::from_bytes(b).expect("invalid reward address in withdrawals.");
 
+    if let (Address::Stake(accnt_a), Address::Stake(accnt_b)) = (addr_a, addr_b) {
+        compare_stake_addresses(&accnt_a, &accnt_b)
+    } else {
+        unreachable!("invalid reward address in withdrawals.");
+    }
+}
+
+fn compare_stake_addresses(accnt_a: &StakeAddress, accnt_b: &StakeAddress) -> Ordering {
     fn network_tag(network: Network) -> u8 {
         match network {
             Network::Testnet => 0,
@@ -1118,19 +1416,15 @@ pub fn sort_reward_accounts(a: &Bytes, b: &Bytes) -> Ordering {
         }
     }
 
-    if let (Address::Stake(accnt_a), Address::Stake(accnt_b)) = (addr_a, addr_b) {
-        if accnt_a.network() != accnt_b.network() {
-            return network_tag(accnt_a.network()).cmp(&network_tag(accnt_b.network()));
-        }
+    if accnt_a.network() != accnt_b.network() {
+        return network_tag(accnt_a.network()).cmp(&network_tag(accnt_b.network()));
+    }
 
-        match (accnt_a.payload(), accnt_b.payload()) {
-            (StakePayload::Script(..), StakePayload::Stake(..)) => Ordering::Less,
-            (StakePayload::Stake(..), StakePayload::Script(..)) => Ordering::Greater,
-            (StakePayload::Script(hash_a), StakePayload::Script(hash_b)) => hash_a.cmp(hash_b),
-            (StakePayload::Stake(hash_a), StakePayload::Stake(hash_b)) => hash_a.cmp(hash_b),
-        }
-    } else {
-        unreachable!("invalid reward address in withdrawals.");
+    match (accnt_a.payload(), accnt_b.payload()) {
+        (StakePayload::Script(..), StakePayload::Stake(..)) => Ordering::Less,
+        (StakePayload::Stake(..), StakePayload::Script(..)) => Ordering::Greater,
+        (StakePayload::Script(hash_a), StakePayload::Script(hash_b)) => hash_a.cmp(hash_b),
+        (StakePayload::Stake(hash_a), StakePayload::Stake(hash_b)) => hash_a.cmp(hash_b),
     }
 }
 

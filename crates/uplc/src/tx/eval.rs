@@ -80,9 +80,10 @@ fn eval_redeemer_with_optional_protocol(
         tx_info: TxInfo,
         program: Program<NamedDeBruijn>,
     ) -> Result<(Redeemer, EvalResult), Error> {
+        // A redeemer the transaction does not carry has no purpose in it.
         let script_context = tx_info
             .into_script_context(redeemer, datum.as_ref())
-            .expect("couldn't create script context from transaction?");
+            .ok_or(Error::ExtraneousRedeemer)?;
 
         let program = match script_context {
             ScriptContext::V1V2 { .. } => if let Some(datum) = datum {
