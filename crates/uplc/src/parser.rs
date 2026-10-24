@@ -121,12 +121,15 @@ peg::parser! {
           }
 
         rule builtin() -> Term<Name>
-          = "(" _* "builtin" _+ b:ident() _* ")" {
+          = "(" _* "builtin" _+ fun:builtin_name() _* ")" {
             Term::Builtin{
-                fun: DefaultFunction::from_str(&b).unwrap(),
+                fun,
                 uniq_id: next_uniq_id(),
             }
           }
+
+        rule builtin_name() -> DefaultFunction
+          = b:ident() {? DefaultFunction::from_str(&b).or(Err("a builtin function name")) }
 
         rule var(interner: &mut Interner) -> Term<Name>
           = n:name(interner) { Term::Var { name: n.into(), uniq_id: next_uniq_id() } }
@@ -1385,6 +1388,34 @@ mod tests {
                 }
             }
         )
+    }
+
+    #[test]
+    fn parse_unknown_builtin() {
+        assert!(super::program("(program 1.0.0 (builtin noSuchFunction))").is_err());
+        assert!(super::term("[(builtin addInteger') (con integer 1)]").is_err());
+    }
+
+    #[test]
+    fn parse_every_builtin_by_its_printed_name() {
+        use strum::IntoEnumIterator;
+
+        for fun in DefaultFunction::iter() {
+            let term = super::term(&format!("(builtin {fun})")).unwrap();
+
+            assert!(
+                matches!(term, Term::Builtin { fun: parsed, .. } if parsed == fun),
+                "{fun}"
+            );
+        }
+
+        assert!(matches!(
+            super::term("(builtin verifyEd25519Signature)"),
+            Ok(Term::Builtin {
+                fun: DefaultFunction::VerifyEd25519Signature,
+                ..
+            })
+        ));
     }
 
     #[test]

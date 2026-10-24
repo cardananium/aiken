@@ -404,7 +404,8 @@ impl FromStr for DefaultFunction {
             "blake2b_256" => Ok(Blake2b_256),
             "keccak_256" => Ok(Keccak_256),
             "blake2b_224" => Ok(Blake2b_224),
-            "verifyEd25519Signature" => Ok(VerifyEd25519Signature),
+            // `verifySignature` is the name the function is printed with.
+            "verifyEd25519Signature" | "verifySignature" => Ok(VerifyEd25519Signature),
             "verifyEcdsaSecp256k1Signature" => Ok(VerifyEcdsaSecp256k1Signature),
             "verifySchnorrSecp256k1Signature" => Ok(VerifySchnorrSecp256k1Signature),
             "appendString" => Ok(AppendString),
