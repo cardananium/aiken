@@ -13,7 +13,7 @@ use std::{collections::VecDeque, mem, mem::size_of, ops::Deref, rc::Rc};
 
 pub type Env = Rc<Vec<Value>>;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub enum Value {
     Con(Rc<Constant>),
     Delay {
@@ -97,6 +97,249 @@ fn detach_env(slot: &mut Env, pending: &mut Vec<Value>, filler: &mut Option<Env>
 
     if let Ok(mut env) = Rc::try_unwrap(mem::replace(slot, Rc::clone(filler))) {
         pending.append(&mut env);
+    }
+}
+
+/// A value's children are `Rc`s that clone in O(1) -- its constant, its body, its environment --
+/// except a `Constr`'s fields and a partially applied builtin's arguments, which are owned
+/// outright and nest as deep as the script makes them. The derived `Clone` copied those one stack
+/// frame per level; they are copied off an explicit stack instead, and every other value is copied
+/// in place with no allocation, which is what `lookup_var` does on every variable.
+impl Clone for Value {
+    fn clone(&self) -> Self {
+        fn shallow(value: &Value) -> Option<Value> {
+            Some(match value {
+                Value::Con(constant) => Value::Con(Rc::clone(constant)),
+                Value::Delay { body, env, term_id } => Value::Delay {
+                    body: Rc::clone(body),
+                    env: Rc::clone(env),
+                    term_id: *term_id,
+                },
+                Value::Lambda {
+                    parameter_name,
+                    body,
+                    env,
+                    term_id,
+                } => Value::Lambda {
+                    parameter_name: Rc::clone(parameter_name),
+                    body: Rc::clone(body),
+                    env: Rc::clone(env),
+                    term_id: *term_id,
+                },
+                Value::Builtin { runtime, .. } if !runtime.args.is_empty() => return None,
+                Value::Builtin {
+                    fun,
+                    runtime,
+                    term_id,
+                } => Value::Builtin {
+                    fun: *fun,
+                    runtime: BuiltinRuntime {
+                        args: Vec::new(),
+                        fun: runtime.fun,
+                        forces: runtime.forces,
+                    },
+                    term_id: *term_id,
+                },
+                Value::Constr { fields, .. } if !fields.is_empty() => return None,
+                Value::Constr { tag, term_id, .. } => Value::Constr {
+                    tag: *tag,
+                    fields: Vec::new(),
+                    term_id: *term_id,
+                },
+            })
+        }
+
+        if let Some(copy) = shallow(self) {
+            return copy;
+        }
+
+        enum Task<'a> {
+            Copy(&'a Value),
+            /// Rebuild this `Constr` or `Builtin` around the last copies made, its children.
+            Assemble(&'a Value),
+        }
+
+        let mut tasks = vec![Task::Copy(self)];
+        let mut copies: Vec<Value> = Vec::new();
+
+        while let Some(task) = tasks.pop() {
+            match task {
+                Task::Copy(value) => match shallow(value) {
+                    Some(copy) => copies.push(copy),
+                    None => {
+                        tasks.push(Task::Assemble(value));
+
+                        let children = match value {
+                            Value::Constr { fields, .. } => fields,
+                            Value::Builtin { runtime, .. } => &runtime.args,
+                            _ => unreachable!("only constr and builtin values are not shallow"),
+                        };
+
+                        tasks.extend(children.iter().rev().map(Task::Copy));
+                    }
+                },
+                Task::Assemble(value) => {
+                    let copy = match value {
+                        Value::Constr {
+                            tag,
+                            fields,
+                            term_id,
+                        } => Value::Constr {
+                            tag: *tag,
+                            fields: copies.split_off(copies.len() - fields.len()),
+                            term_id: *term_id,
+                        },
+                        Value::Builtin {
+                            fun,
+                            runtime,
+                            term_id,
+                        } => Value::Builtin {
+                            fun: *fun,
+                            runtime: BuiltinRuntime {
+                                args: copies.split_off(copies.len() - runtime.args.len()),
+                                fun: runtime.fun,
+                                forces: runtime.forces,
+                            },
+                            term_id: *term_id,
+                        },
+                        _ => unreachable!("only constr and builtin values are assembled"),
+                    };
+
+                    copies.push(copy);
+                }
+            }
+        }
+
+        copies.pop().expect("the copy of the root")
+    }
+}
+
+/// Structural equality, as derived, but iterative: values nest through `Constr` fields, builtin
+/// arguments and -- for closures -- environments, all as deep as the script makes them (see the
+/// `Drop` impl above). `pending` holds what is still to compare, in the order the derived
+/// comparison visits it: a field compared after the children of the field before it waits there
+/// as a `Check` holding its outcome.
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        enum Pending<'a> {
+            Values(&'a Value, &'a Value),
+            Check(bool),
+        }
+
+        /// Queue `xs == ys` (lengths, then items in order), followed by `then`.
+        fn queue<'a>(pending: &mut Vec<Pending<'a>>, xs: &'a [Value], ys: &'a [Value], then: bool) {
+            pending.push(Pending::Check(then));
+            pending.extend(
+                xs.iter()
+                    .zip(ys.iter())
+                    .rev()
+                    .map(|(x, y)| Pending::Values(x, y)),
+            );
+        }
+
+        let mut pending = vec![Pending::Values(self, other)];
+
+        while let Some(next) = pending.pop() {
+            let pair = match next {
+                Pending::Check(outcome) => {
+                    if !outcome {
+                        return false;
+                    }
+                    continue;
+                }
+                Pending::Values(left, right) => (left, right),
+            };
+
+            match pair {
+                (Value::Con(c1), Value::Con(c2)) => {
+                    if c1 != c2 {
+                        return false;
+                    }
+                }
+                (
+                    Value::Delay {
+                        body: b1,
+                        env: e1,
+                        term_id: i1,
+                    },
+                    Value::Delay {
+                        body: b2,
+                        env: e2,
+                        term_id: i2,
+                    },
+                ) => {
+                    if b1 != b2 || e1.len() != e2.len() {
+                        return false;
+                    }
+
+                    queue(&mut pending, e1, e2, i1 == i2);
+                }
+                (
+                    Value::Lambda {
+                        parameter_name: p1,
+                        body: b1,
+                        env: e1,
+                        term_id: i1,
+                    },
+                    Value::Lambda {
+                        parameter_name: p2,
+                        body: b2,
+                        env: e2,
+                        term_id: i2,
+                    },
+                ) => {
+                    if p1 != p2 || b1 != b2 || e1.len() != e2.len() {
+                        return false;
+                    }
+
+                    queue(&mut pending, e1, e2, i1 == i2);
+                }
+                (
+                    Value::Builtin {
+                        fun: f1,
+                        runtime: r1,
+                        term_id: i1,
+                    },
+                    Value::Builtin {
+                        fun: f2,
+                        runtime: r2,
+                        term_id: i2,
+                    },
+                ) => {
+                    if f1 != f2 || r1.args.len() != r2.args.len() {
+                        return false;
+                    }
+
+                    queue(
+                        &mut pending,
+                        &r1.args,
+                        &r2.args,
+                        r1.fun == r2.fun && r1.forces == r2.forces && i1 == i2,
+                    );
+                }
+                (
+                    Value::Constr {
+                        tag: t1,
+                        fields: f1,
+                        term_id: i1,
+                    },
+                    Value::Constr {
+                        tag: t2,
+                        fields: f2,
+                        term_id: i2,
+                    },
+                ) => {
+                    if t1 != t2 || f1.len() != f2.len() {
+                        return false;
+                    }
+
+                    queue(&mut pending, f1, f2, i1 == i2);
+                }
+                _ => return false,
+            }
+        }
+
+        true
     }
 }
 
@@ -668,7 +911,7 @@ mod tests {
     use crate::{
         ast::{Constant, NamedDeBruijn, Term, Type},
         machine::{
-            runtime::BuiltinSemantics,
+            runtime::{BuiltinRuntime, BuiltinSemantics},
             value::{Env, Value, integer_log2},
         },
     };
@@ -884,6 +1127,72 @@ mod tests {
         }
 
         drop(value);
+    }
+
+    #[test]
+    fn deep_values_clone_and_compare_without_overflowing_the_stack() {
+        // Fields, builtin arguments and environments, alternating, so every way a value nests is
+        // followed.
+        let build = |leaf: Value| {
+            let mut value = leaf;
+
+            for level in 0..DEEP {
+                value = match level % 3 {
+                    0 => Value::Constr {
+                        tag: 0,
+                        fields: vec![value],
+                        term_id: level as isize,
+                    },
+                    1 => Value::Builtin {
+                        fun: crate::builtins::DefaultFunction::IfThenElse,
+                        runtime: BuiltinRuntime {
+                            args: vec![value],
+                            fun: crate::builtins::DefaultFunction::IfThenElse,
+                            forces: 1,
+                        },
+                        term_id: level as isize,
+                    },
+                    _ => Value::Lambda {
+                        parameter_name: NamedDeBruijn {
+                            text: "x".to_string(),
+                            index: 0.into(),
+                        }
+                        .into(),
+                        body: Rc::new(Term::<NamedDeBruijn>::Error { uniq_id: 0 }),
+                        env: Rc::new(vec![value]),
+                        term_id: level as isize,
+                    },
+                };
+            }
+
+            value
+        };
+
+        let value = build(Value::Con(Rc::new(Constant::Integer(1.into()))));
+
+        let copy = value.clone();
+        assert!(copy == value);
+        assert!(value != build(Value::Con(Rc::new(Constant::Integer(2.into())))));
+    }
+
+    #[test]
+    fn value_clone_shares_rc_children() {
+        let env: Env = Rc::new(vec![Value::Con(Rc::new(Constant::Unit))]);
+        let value = Value::Constr {
+            tag: 1,
+            fields: vec![Value::Delay {
+                body: Rc::new(Term::<NamedDeBruijn>::Error { uniq_id: 3 }),
+                env: Rc::clone(&env),
+                term_id: 4,
+            }],
+            term_id: 5,
+        };
+
+        let copy = value.clone();
+
+        assert!(copy == value);
+        assert_eq!(Rc::strong_count(&env), 3);
+        assert_eq!(copy.term_id(), Some(5));
     }
 
     #[test]

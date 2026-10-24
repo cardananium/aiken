@@ -27,7 +27,7 @@ use serde::{
     ser::{Serialize, SerializeStruct, Serializer},
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     convert::AsRef,
     fmt::{self, Display},
     hash::{self, Hash},
@@ -306,7 +306,7 @@ impl Program<DeBruijn> {
 /// Specifically, `Var` and `parameter_name` in `Lambda` can be a `Name`,
 /// `NamedDebruijn`, or `DeBruijn`. When encoded to flat for on chain usage
 /// we must encode using the `DeBruijn` form.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum Term<T> {
     // tag: 0
     Var {
@@ -369,66 +369,234 @@ impl<T: Clone> Term<T> {
     /// allocations (it never bumps a reference count), so it is safe to call
     /// from several threads on terms that share `Rc` nodes — which `Rc`'s
     /// non-atomic counts would otherwise forbid.
+    ///
+    /// Iterative, like every walk over a term's depth (see the `Drop` impl below): `copies` holds
+    /// the finished copies of children whose parent is still waiting on `tasks`.
     pub fn deep_clone(&self) -> Term<T> {
-        match self {
-            Term::Var { name, uniq_id } => Term::Var {
-                name: Rc::new(name.as_ref().clone()),
-                uniq_id: *uniq_id,
-            },
-            Term::Delay { body, uniq_id } => Term::Delay {
-                body: Rc::new(body.deep_clone()),
-                uniq_id: *uniq_id,
-            },
-            Term::Lambda {
-                parameter_name,
-                body,
-                uniq_id,
-            } => Term::Lambda {
-                parameter_name: Rc::new(parameter_name.as_ref().clone()),
-                body: Rc::new(body.deep_clone()),
-                uniq_id: *uniq_id,
-            },
-            Term::Apply {
-                function,
-                argument,
-                uniq_id,
-            } => Term::Apply {
-                function: Rc::new(function.deep_clone()),
-                argument: Rc::new(argument.deep_clone()),
-                uniq_id: *uniq_id,
-            },
-            Term::Constant { value, uniq_id } => Term::Constant {
-                value: Rc::new(value.deep_clone()),
-                uniq_id: *uniq_id,
-            },
-            Term::Force { body, uniq_id } => Term::Force {
-                body: Rc::new(body.deep_clone()),
-                uniq_id: *uniq_id,
-            },
-            Term::Error { uniq_id } => Term::Error { uniq_id: *uniq_id },
-            Term::Builtin { fun, uniq_id } => Term::Builtin {
-                fun: *fun,
-                uniq_id: *uniq_id,
-            },
-            Term::Constr {
-                tag,
-                fields,
-                uniq_id,
-            } => Term::Constr {
-                tag: *tag,
-                fields: fields.iter().map(|field| field.deep_clone()).collect(),
-                uniq_id: *uniq_id,
-            },
-            Term::Case {
-                constr,
-                branches,
-                uniq_id,
-            } => Term::Case {
-                constr: Rc::new(constr.deep_clone()),
-                branches: branches.iter().map(|branch| branch.deep_clone()).collect(),
-                uniq_id: *uniq_id,
-            },
+        enum Task<'a, T> {
+            Copy(&'a Term<T>),
+            /// Rebuild this node around the last copies made, its children.
+            Assemble(&'a Term<T>),
         }
+
+        let mut tasks = vec![Task::Copy(self)];
+        let mut copies: Vec<Term<T>> = Vec::new();
+
+        while let Some(task) = tasks.pop() {
+            match task {
+                Task::Copy(term) => {
+                    tasks.push(Task::Assemble(term));
+
+                    // Children go on in reverse, so their copies come out in order.
+                    match term {
+                        Term::Delay { body, .. }
+                        | Term::Lambda { body, .. }
+                        | Term::Force { body, .. } => tasks.push(Task::Copy(body)),
+                        Term::Apply {
+                            function, argument, ..
+                        } => {
+                            tasks.push(Task::Copy(argument));
+                            tasks.push(Task::Copy(function));
+                        }
+                        Term::Constr { fields, .. } => {
+                            tasks.extend(fields.iter().rev().map(Task::Copy));
+                        }
+                        Term::Case {
+                            constr, branches, ..
+                        } => {
+                            tasks.extend(branches.iter().rev().map(Task::Copy));
+                            tasks.push(Task::Copy(constr));
+                        }
+                        Term::Var { .. }
+                        | Term::Constant { .. }
+                        | Term::Error { .. }
+                        | Term::Builtin { .. } => {}
+                    }
+                }
+                Task::Assemble(term) => {
+                    let copy = match term {
+                        Term::Var { name, uniq_id } => Term::Var {
+                            name: Rc::new(name.as_ref().clone()),
+                            uniq_id: *uniq_id,
+                        },
+                        Term::Delay { uniq_id, .. } => Term::Delay {
+                            body: Rc::new(copies.pop().expect("body copied")),
+                            uniq_id: *uniq_id,
+                        },
+                        Term::Lambda {
+                            parameter_name,
+                            uniq_id,
+                            ..
+                        } => Term::Lambda {
+                            parameter_name: Rc::new(parameter_name.as_ref().clone()),
+                            body: Rc::new(copies.pop().expect("body copied")),
+                            uniq_id: *uniq_id,
+                        },
+                        Term::Apply { uniq_id, .. } => {
+                            let argument = Rc::new(copies.pop().expect("argument copied"));
+                            let function = Rc::new(copies.pop().expect("function copied"));
+
+                            Term::Apply {
+                                function,
+                                argument,
+                                uniq_id: *uniq_id,
+                            }
+                        }
+                        Term::Constant { value, uniq_id } => Term::Constant {
+                            value: Rc::new(value.deep_clone()),
+                            uniq_id: *uniq_id,
+                        },
+                        Term::Force { uniq_id, .. } => Term::Force {
+                            body: Rc::new(copies.pop().expect("body copied")),
+                            uniq_id: *uniq_id,
+                        },
+                        Term::Error { uniq_id } => Term::Error { uniq_id: *uniq_id },
+                        Term::Builtin { fun, uniq_id } => Term::Builtin {
+                            fun: *fun,
+                            uniq_id: *uniq_id,
+                        },
+                        Term::Constr {
+                            tag,
+                            fields,
+                            uniq_id,
+                        } => Term::Constr {
+                            tag: *tag,
+                            fields: copies.split_off(copies.len() - fields.len()),
+                            uniq_id: *uniq_id,
+                        },
+                        Term::Case {
+                            branches, uniq_id, ..
+                        } => {
+                            let branches = copies.split_off(copies.len() - branches.len());
+                            let constr = Rc::new(copies.pop().expect("scrutinee copied"));
+
+                            Term::Case {
+                                constr,
+                                branches,
+                                uniq_id: *uniq_id,
+                            }
+                        }
+                    };
+
+                    copies.push(copy);
+                }
+            }
+        }
+
+        copies.pop().expect("the copy of the root")
+    }
+}
+
+/// Every child of a term sits behind an `Rc` and clones in O(1), except the fields of a `Constr`
+/// and the branches of a `Case`, which are owned outright. The derived `Clone` copied those one
+/// stack frame per level, and a `constr` can be nested as deep as any other term (see the `Drop`
+/// impl below), so they are copied off an explicit stack instead. A term without them -- the
+/// machine clones one at nearly every step -- is copied in place, with no allocation.
+impl<T> Clone for Term<T> {
+    fn clone(&self) -> Self {
+        fn shallow<T>(term: &Term<T>) -> Option<Term<T>> {
+            Some(match term {
+                Term::Var { name, uniq_id } => Term::Var {
+                    name: Rc::clone(name),
+                    uniq_id: *uniq_id,
+                },
+                Term::Delay { body, uniq_id } => Term::Delay {
+                    body: Rc::clone(body),
+                    uniq_id: *uniq_id,
+                },
+                Term::Lambda {
+                    parameter_name,
+                    body,
+                    uniq_id,
+                } => Term::Lambda {
+                    parameter_name: Rc::clone(parameter_name),
+                    body: Rc::clone(body),
+                    uniq_id: *uniq_id,
+                },
+                Term::Apply {
+                    function,
+                    argument,
+                    uniq_id,
+                } => Term::Apply {
+                    function: Rc::clone(function),
+                    argument: Rc::clone(argument),
+                    uniq_id: *uniq_id,
+                },
+                Term::Constant { value, uniq_id } => Term::Constant {
+                    value: Rc::clone(value),
+                    uniq_id: *uniq_id,
+                },
+                Term::Force { body, uniq_id } => Term::Force {
+                    body: Rc::clone(body),
+                    uniq_id: *uniq_id,
+                },
+                Term::Error { uniq_id } => Term::Error { uniq_id: *uniq_id },
+                Term::Builtin { fun, uniq_id } => Term::Builtin {
+                    fun: *fun,
+                    uniq_id: *uniq_id,
+                },
+                Term::Constr { .. } | Term::Case { .. } => return None,
+            })
+        }
+
+        if let Some(copy) = shallow(self) {
+            return copy;
+        }
+
+        enum Task<'a, T> {
+            Copy(&'a Term<T>),
+            /// Rebuild this `constr` or `case` around the last copies made, its children.
+            Assemble(&'a Term<T>),
+        }
+
+        let mut tasks = vec![Task::Copy(self)];
+        let mut copies: Vec<Term<T>> = Vec::new();
+
+        while let Some(task) = tasks.pop() {
+            match task {
+                Task::Copy(term) => match shallow(term) {
+                    Some(copy) => copies.push(copy),
+                    None => {
+                        tasks.push(Task::Assemble(term));
+
+                        let children = match term {
+                            Term::Constr { fields, .. } => fields,
+                            Term::Case { branches, .. } => branches,
+                            _ => unreachable!("only constr and case are not shallow"),
+                        };
+
+                        tasks.extend(children.iter().rev().map(Task::Copy));
+                    }
+                },
+                Task::Assemble(term) => {
+                    let copy = match term {
+                        Term::Constr {
+                            tag,
+                            fields,
+                            uniq_id,
+                        } => Term::Constr {
+                            tag: *tag,
+                            fields: copies.split_off(copies.len() - fields.len()),
+                            uniq_id: *uniq_id,
+                        },
+                        Term::Case {
+                            constr,
+                            branches,
+                            uniq_id,
+                        } => Term::Case {
+                            constr: Rc::clone(constr),
+                            branches: copies.split_off(copies.len() - branches.len()),
+                            uniq_id: *uniq_id,
+                        },
+                        _ => unreachable!("only constr and case are assembled"),
+                    };
+
+                    copies.push(copy);
+                }
+            }
+        }
+
+        copies.pop().expect("the copy of the root")
     }
 }
 
@@ -449,9 +617,17 @@ impl<T> Term<T> {
         }
     }
 
+    /// A constant, possibly under any number of `delay`s and `force`s.
     pub fn is_constant(&self) -> bool {
-        matches!(self, Term::Constant { .. })
-            || matches!(self, Term::Delay { body: term, .. } | Term::Force { body: term, .. } if term.is_constant())
+        let mut term = self;
+
+        loop {
+            match term {
+                Term::Constant { .. } => return true,
+                Term::Delay { body, .. } | Term::Force { body, .. } => term = body,
+                _ => return false,
+            }
+        }
     }
 
     pub fn is_true(&self) -> bool {
@@ -471,56 +647,193 @@ impl<T> Term<T> {
     }
 }
 
-impl<T> PartialEq for Term<T> 
+/// Structural equality, ignoring term ids. Iterative, like every walk over a term's depth (see the
+/// `Drop` impl below): `pending` holds what is still to compare, in the order a recursive
+/// comparison visits it -- left children on top, and an outcome already known but due only after
+/// some subterms waiting as a `Check`.
+impl<T> PartialEq for Term<T>
 where
     T: PartialEq,
 {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Term::Var { name: n1, .. }, Term::Var { name: n2, .. }) => n1 == n2,
-            (Term::Delay { body: b1, .. }, Term::Delay { body: b2, .. }) => b1 == b2,
-            (Term::Lambda { parameter_name: p1, body: b1, .. }, Term::Lambda { parameter_name: p2, body: b2, .. }) => {
-                p1 == p2 && b1 == b2
-            }
-            (Term::Apply { function: f1, argument: a1, .. }, Term::Apply { function: f2, argument: a2, .. }) => {
-                f1 == f2 && a1 == a2
-            }
-            (Term::Constant { value: v1, .. }, Term::Constant { value: v2, .. }) => v1 == v2,
-            (Term::Force { body: b1, .. }, Term::Force { body: b2, .. }) => b1 == b2,
-            (Term::Error { .. }, Term::Error { .. }) => true,
-            (Term::Builtin { fun: f1, .. }, Term::Builtin { fun: f2, .. }) => f1 == f2,
-            (Term::Constr { tag: t1, fields: f1, .. }, Term::Constr { tag: t2, fields: f2, .. }) => {
-                t1 == t2 && f1 == f2
-            }
-            (Term::Case { constr: c1, branches: b1, .. }, Term::Case { constr: c2, branches: b2, .. }) => {
-                c1 == c2 && b1 == b2
-            }
-            _ => false,
+        enum Pending<'a, T> {
+            Terms(&'a Term<T>, &'a Term<T>),
+            Check(bool),
         }
+
+        let mut pending = vec![Pending::Terms(self, other)];
+
+        while let Some(next) = pending.pop() {
+            let pair = match next {
+                Pending::Check(outcome) => {
+                    if !outcome {
+                        return false;
+                    }
+                    continue;
+                }
+                Pending::Terms(left, right) => (left, right),
+            };
+
+            match pair {
+                (Term::Var { name: n1, .. }, Term::Var { name: n2, .. }) => {
+                    if n1 != n2 {
+                        return false;
+                    }
+                }
+                (Term::Delay { body: b1, .. }, Term::Delay { body: b2, .. })
+                | (Term::Force { body: b1, .. }, Term::Force { body: b2, .. }) => {
+                    pending.push(Pending::Terms(b1, b2));
+                }
+                (
+                    Term::Lambda {
+                        parameter_name: p1,
+                        body: b1,
+                        ..
+                    },
+                    Term::Lambda {
+                        parameter_name: p2,
+                        body: b2,
+                        ..
+                    },
+                ) => {
+                    if p1 != p2 {
+                        return false;
+                    }
+
+                    pending.push(Pending::Terms(b1, b2));
+                }
+                (
+                    Term::Apply {
+                        function: f1,
+                        argument: a1,
+                        ..
+                    },
+                    Term::Apply {
+                        function: f2,
+                        argument: a2,
+                        ..
+                    },
+                ) => {
+                    pending.push(Pending::Terms(a1, a2));
+                    pending.push(Pending::Terms(f1, f2));
+                }
+                (Term::Constant { value: v1, .. }, Term::Constant { value: v2, .. }) => {
+                    if v1 != v2 {
+                        return false;
+                    }
+                }
+                (Term::Error { .. }, Term::Error { .. }) => {}
+                (Term::Builtin { fun: f1, .. }, Term::Builtin { fun: f2, .. }) => {
+                    if f1 != f2 {
+                        return false;
+                    }
+                }
+                (
+                    Term::Constr {
+                        tag: t1,
+                        fields: f1,
+                        ..
+                    },
+                    Term::Constr {
+                        tag: t2,
+                        fields: f2,
+                        ..
+                    },
+                ) => {
+                    if t1 != t2 || f1.len() != f2.len() {
+                        return false;
+                    }
+
+                    pending.extend(
+                        f1.iter()
+                            .zip(f2.iter())
+                            .rev()
+                            .map(|(x, y)| Pending::Terms(x, y)),
+                    );
+                }
+                (
+                    Term::Case {
+                        constr: c1,
+                        branches: b1,
+                        ..
+                    },
+                    Term::Case {
+                        constr: c2,
+                        branches: b2,
+                        ..
+                    },
+                ) => {
+                    // The scrutinees are compared before the branches, whose lengths are only
+                    // looked at then.
+                    if b1.len() == b2.len() {
+                        pending.extend(
+                            b1.iter()
+                                .zip(b2.iter())
+                                .rev()
+                                .map(|(x, y)| Pending::Terms(x, y)),
+                        );
+                    } else {
+                        pending.push(Pending::Check(false));
+                    }
+
+                    pending.push(Pending::Terms(c1, c2));
+                }
+                _ => return false,
+            }
+        }
+
+        true
     }
 }
 
 impl<T> Term<T> {
-    /// Change a constant integer to its opposite.
+    /// Change a constant integer, possibly under `delay`s and `force`s, to its opposite.
     pub fn try_negate(&self) -> Option<Self> {
-        match self {
-            Self::Constant { value: cst, .. } => match cst.as_ref() {
-                Constant::Integer(i) => Some(Self::Constant {
-                    value: Rc::new(Constant::Integer(-1 * i)),
+        // The wrappers on the way down, outermost first, rebuilt innermost first: the same order
+        // a recursive rebuild hands out fresh ids in.
+        let mut delays = Vec::new();
+        let mut term = self;
+
+        let mut negated = loop {
+            match term {
+                Self::Constant { value: cst, .. } => match cst.as_ref() {
+                    Constant::Integer(i) => {
+                        break Self::Constant {
+                            value: Rc::new(Constant::Integer(-1 * i)),
+                            uniq_id: next_uniq_id(),
+                        };
+                    }
+                    _ => return None,
+                },
+                Self::Delay { body, .. } => {
+                    delays.push(true);
+                    term = body;
+                }
+                Self::Force { body, .. } => {
+                    delays.push(false);
+                    term = body;
+                }
+                _ => return None,
+            }
+        };
+
+        while let Some(is_delay) = delays.pop() {
+            let body = Rc::new(negated);
+
+            negated = if is_delay {
+                Self::Delay {
+                    body,
                     uniq_id: next_uniq_id(),
-                }),
-                _ => None,
-            },
-            Self::Delay { body: rc, .. } => rc.try_negate().map(Rc::new).map(|body| Self::Delay {
-                body,
-                uniq_id: next_uniq_id(),
-            }),
-            Self::Force { body: rc, .. } => rc.try_negate().map(Rc::new).map(|body| Self::Force {
-                body,
-                uniq_id: next_uniq_id(),
-            }),
-            _ => None,
+                }
+            } else {
+                Self::Force {
+                    body,
+                    uniq_id: next_uniq_id(),
+                }
+            };
         }
+
+        Some(negated)
     }
 }
 
@@ -645,7 +958,7 @@ fn detach_term_child<T>(
 
 /// A container for the various constants that are available
 /// in Untyped Plutus Core. Used in the `Constant` variant of `Term`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Constant {
     // tag: 0
     Integer(BigInt),
@@ -683,37 +996,72 @@ impl Constant {
     /// Whether this constant contains a native `Value`, which is only
     /// available from protocol version 11 (Van Rossem) onwards.
     pub fn contains_value(constant: impl AsRef<Constant>) -> bool {
-        match constant.as_ref() {
-            Constant::Value(_) => true,
-            Constant::ProtoList(r#type, elements) | Constant::ProtoArray(r#type, elements) => {
-                r#type.contains_value() || elements.iter().any(Constant::contains_value)
-            }
-            Constant::ProtoPair(fst, snd, left, right) => {
-                fst.contains_value()
-                    || snd.contains_value()
-                    || Constant::contains_value(left)
-                    || Constant::contains_value(right)
-            }
-            _ => false,
-        }
+        constant.as_ref().mentions(
+            |constant| matches!(constant, Constant::Value(_)),
+            |typ| matches!(typ, Type::Value),
+        )
     }
 
     /// Whether this constant contains an array, which is only available from
     /// protocol version 11 (Van Rossem) onwards.
     pub fn contains_array(constant: impl AsRef<Constant>) -> bool {
-        match constant.as_ref() {
-            Constant::ProtoArray(..) => true,
-            Constant::ProtoList(r#type, elements) => {
-                r#type.contains_array() || elements.iter().any(Constant::contains_array)
+        constant.as_ref().mentions(
+            |constant| matches!(constant, Constant::ProtoArray(..)),
+            |typ| matches!(typ, Type::Array(_)),
+        )
+    }
+
+    /// Whether this constant, one nested in it, or any type they carry (declared types included,
+    /// so a type-inconsistent constant built by hand cannot hide anything) matches.
+    ///
+    /// Iterative, for the depth reason given on the `Drop` impl below. Shared nodes are visited
+    /// once: a nested constant's type shares its `Rc` children with the enclosing type, so
+    /// walking each declared type in full would cost the square of the depth, and constants built
+    /// as DAGs could cost exponentially more.
+    fn mentions(
+        &self,
+        constant_matches: impl Fn(&Constant) -> bool,
+        type_matches: impl Fn(&Type) -> bool,
+    ) -> bool {
+        let mut constants = vec![self];
+        let mut types: Vec<&Type> = Vec::new();
+        let mut seen_constants: HashSet<*const Constant> = HashSet::new();
+        let mut seen_types: HashSet<*const Type> = HashSet::new();
+
+        while let Some(constant) = constants.pop() {
+            if constant_matches(constant) {
+                return true;
             }
-            Constant::ProtoPair(fst, snd, left, right) => {
-                fst.contains_array()
-                    || snd.contains_array()
-                    || Constant::contains_array(left)
-                    || Constant::contains_array(right)
+
+            match constant {
+                Constant::ProtoList(r#type, elements) | Constant::ProtoArray(r#type, elements) => {
+                    types.push(r#type);
+
+                    for element in elements {
+                        if seen_constants.insert(Rc::as_ptr(element)) {
+                            constants.push(element);
+                        }
+                    }
+                }
+                Constant::ProtoPair(fst, snd, left, right) => {
+                    types.push(fst);
+                    types.push(snd);
+
+                    for element in [left, right] {
+                        if seen_constants.insert(Rc::as_ptr(element)) {
+                            constants.push(element);
+                        }
+                    }
+                }
+                _ => {}
             }
-            _ => false,
+
+            if Type::any_in(&mut types, &mut seen_types, &type_matches) {
+                return true;
+            }
         }
+
+        false
     }
 }
 
@@ -1350,7 +1698,7 @@ impl Data {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub enum Type {
     Bool,
     Integer,
@@ -1371,23 +1719,51 @@ impl Type {
     /// Whether this type mentions the native `Value` type, which is only
     /// available from protocol version 11 (Van Rossem) onwards.
     pub fn contains_value(&self) -> bool {
-        match self {
-            Type::Value => true,
-            Type::List(r#type) | Type::Array(r#type) => r#type.contains_value(),
-            Type::Pair(fst, snd) => fst.contains_value() || snd.contains_value(),
-            _ => false,
-        }
+        Type::any_in(&mut vec![self], &mut HashSet::new(), &|typ| {
+            matches!(typ, Type::Value)
+        })
     }
 
     /// Whether this type mentions the `array` type, which is only available
     /// from protocol version 11 (Van Rossem) onwards.
     pub fn contains_array(&self) -> bool {
-        match self {
-            Type::Array(_) => true,
-            Type::List(r#type) => r#type.contains_array(),
-            Type::Pair(fst, snd) => fst.contains_array() || snd.contains_array(),
-            _ => false,
+        Type::any_in(&mut vec![self], &mut HashSet::new(), &|typ| {
+            matches!(typ, Type::Array(_))
+        })
+    }
+
+    /// Whether a type on `pending`, or one nested in it, matches; drains `pending`. Iterative,
+    /// for the depth reason given on the `Drop` impl below, and visiting each shared `Rc` child
+    /// once (it is recorded in `seen`), so a type shaped as a DAG costs no more than its size.
+    fn any_in<'a>(
+        pending: &mut Vec<&'a Type>,
+        seen: &mut HashSet<*const Type>,
+        matches: &impl Fn(&Type) -> bool,
+    ) -> bool {
+        while let Some(typ) = pending.pop() {
+            if matches(typ) {
+                pending.clear();
+                return true;
+            }
+
+            match typ {
+                Type::List(inner) | Type::Array(inner) => {
+                    if seen.insert(Rc::as_ptr(inner)) {
+                        pending.push(inner);
+                    }
+                }
+                Type::Pair(fst, snd) => {
+                    for inner in [fst, snd] {
+                        if seen.insert(Rc::as_ptr(inner)) {
+                            pending.push(inner);
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
+
+        false
     }
 }
 
@@ -1397,46 +1773,119 @@ impl Constant {
     /// `Rc` reference counts are not atomic, so a constant that may end up
     /// embedded in programs handled by different threads (e.g. tests run in
     /// parallel) must not share `Rc`s with anything else.
+    ///
+    /// Iterative, for the depth reason given on the `Drop` impl below: `copies` holds the finished
+    /// copies of the elements whose enclosing constant is still waiting on `tasks`.
     pub fn deep_clone(&self) -> Constant {
-        match self {
-            Constant::ProtoList(tipo, items) => Constant::ProtoList(
-                tipo.deep_clone(),
-                items
-                    .iter()
-                    .map(|item| Rc::new(item.deep_clone()))
-                    .collect(),
-            ),
-            Constant::ProtoArray(tipo, items) => Constant::ProtoArray(
-                tipo.deep_clone(),
-                items
-                    .iter()
-                    .map(|item| Rc::new(item.deep_clone()))
-                    .collect(),
-            ),
-            Constant::ProtoPair(fst_tipo, snd_tipo, fst, snd) => Constant::ProtoPair(
-                fst_tipo.deep_clone(),
-                snd_tipo.deep_clone(),
-                Rc::new(fst.deep_clone()),
-                Rc::new(snd.deep_clone()),
-            ),
-            // The remaining variants own their contents outright.
-            other => other.clone(),
+        enum Task<'a> {
+            Copy(&'a Constant),
+            /// Rebuild this list, array or pair around the last copies made, its elements.
+            Assemble(&'a Constant),
         }
+
+        let mut tasks = vec![Task::Copy(self)];
+        let mut copies: Vec<Rc<Constant>> = Vec::new();
+
+        while let Some(task) = tasks.pop() {
+            match task {
+                Task::Copy(constant) => match constant {
+                    Constant::ProtoList(_, items) | Constant::ProtoArray(_, items) => {
+                        tasks.push(Task::Assemble(constant));
+                        tasks.extend(items.iter().rev().map(|item| Task::Copy(item)));
+                    }
+                    Constant::ProtoPair(_, _, fst, snd) => {
+                        tasks.push(Task::Assemble(constant));
+                        tasks.push(Task::Copy(snd));
+                        tasks.push(Task::Copy(fst));
+                    }
+                    // The remaining variants own their contents outright.
+                    other => copies.push(Rc::new(other.clone())),
+                },
+                Task::Assemble(constant) => {
+                    let copy = match constant {
+                        Constant::ProtoList(tipo, items) => Constant::ProtoList(
+                            tipo.deep_clone(),
+                            copies.split_off(copies.len() - items.len()),
+                        ),
+                        Constant::ProtoArray(tipo, items) => Constant::ProtoArray(
+                            tipo.deep_clone(),
+                            copies.split_off(copies.len() - items.len()),
+                        ),
+                        Constant::ProtoPair(fst_tipo, snd_tipo, _, _) => {
+                            let snd = copies.pop().expect("second component copied");
+                            let fst = copies.pop().expect("first component copied");
+
+                            Constant::ProtoPair(
+                                fst_tipo.deep_clone(),
+                                snd_tipo.deep_clone(),
+                                fst,
+                                snd,
+                            )
+                        }
+                        _ => unreachable!("only lists, arrays and pairs are assembled"),
+                    };
+
+                    copies.push(Rc::new(copy));
+                }
+            }
+        }
+
+        let root = copies.pop().expect("the copy of the root");
+
+        Rc::try_unwrap(root).unwrap_or_else(|_| unreachable!("the root copy is not shared"))
     }
 }
 
 impl Type {
     /// An equal type sharing no allocation with `self` (see
     /// `Constant::deep_clone`).
+    ///
+    /// Iterative, for the depth reason given on the `Drop` impl below.
     pub fn deep_clone(&self) -> Type {
-        match self {
-            Type::List(inner) => Type::List(Rc::new(inner.deep_clone())),
-            Type::Array(inner) => Type::Array(Rc::new(inner.deep_clone())),
-            Type::Pair(fst, snd) => {
-                Type::Pair(Rc::new(fst.deep_clone()), Rc::new(snd.deep_clone()))
-            }
-            other => other.clone(),
+        enum Task<'a> {
+            Copy(&'a Type),
+            /// Rebuild this list, array or pair around the last copies made, its operands.
+            Assemble(&'a Type),
         }
+
+        let mut tasks = vec![Task::Copy(self)];
+        let mut copies: Vec<Type> = Vec::new();
+
+        while let Some(task) = tasks.pop() {
+            match task {
+                Task::Copy(typ) => match typ {
+                    Type::List(inner) | Type::Array(inner) => {
+                        tasks.push(Task::Assemble(typ));
+                        tasks.push(Task::Copy(inner));
+                    }
+                    Type::Pair(fst, snd) => {
+                        tasks.push(Task::Assemble(typ));
+                        tasks.push(Task::Copy(snd));
+                        tasks.push(Task::Copy(fst));
+                    }
+                    other => copies.push(other.clone()),
+                },
+                Task::Assemble(typ) => {
+                    let copy = match typ {
+                        Type::List(_) => Type::List(Rc::new(copies.pop().expect("operand copied"))),
+                        Type::Array(_) => {
+                            Type::Array(Rc::new(copies.pop().expect("operand copied")))
+                        }
+                        Type::Pair(_, _) => {
+                            let snd = Rc::new(copies.pop().expect("second operand copied"));
+                            let fst = Rc::new(copies.pop().expect("first operand copied"));
+
+                            Type::Pair(fst, snd)
+                        }
+                        _ => unreachable!("only lists, arrays and pairs are assembled"),
+                    };
+
+                    copies.push(copy);
+                }
+            }
+        }
+
+        copies.pop().expect("the copy of the root")
     }
 }
 
@@ -1522,23 +1971,197 @@ fn detach_type_child(slot: &mut Rc<Type>, pending: &mut Vec<Type>, filler: &mut 
     }
 }
 
+/// Iterative, for the depth reason given on the `Drop` impl above: `pending` holds the types and
+/// separators still to write, the next one on top.
 impl Display for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Type::Bool => write!(f, "bool"),
-            Type::Integer => write!(f, "integer"),
-            Type::String => write!(f, "string"),
-            Type::ByteString => write!(f, "bytestring"),
-            Type::Unit => write!(f, "unit"),
-            Type::List(t) => write!(f, "list {t}"),
-            Type::Pair(t1, t2) => write!(f, "pair {t1} {t2}"),
-            Type::Data => write!(f, "data"),
-            Type::Bls12_381G1Element => write!(f, "bls12_381_G1_element"),
-            Type::Bls12_381G2Element => write!(f, "bls12_381_G2_element"),
-            Type::Bls12_381MlResult => write!(f, "bls12_381_mlresult"),
-            Type::Value => write!(f, "value"),
-            Type::Array(t) => write!(f, "array {t}"),
+        enum Piece<'a> {
+            Type(&'a Type),
+            Space,
         }
+
+        let mut pending = vec![Piece::Type(self)];
+
+        while let Some(piece) = pending.pop() {
+            let typ = match piece {
+                Piece::Space => {
+                    f.write_str(" ")?;
+                    continue;
+                }
+                Piece::Type(typ) => typ,
+            };
+
+            match typ {
+                Type::Bool => write!(f, "bool")?,
+                Type::Integer => write!(f, "integer")?,
+                Type::String => write!(f, "string")?,
+                Type::ByteString => write!(f, "bytestring")?,
+                Type::Unit => write!(f, "unit")?,
+                Type::List(t) => {
+                    write!(f, "list ")?;
+                    pending.push(Piece::Type(t));
+                }
+                Type::Pair(t1, t2) => {
+                    write!(f, "pair ")?;
+                    pending.push(Piece::Type(t2));
+                    pending.push(Piece::Space);
+                    pending.push(Piece::Type(t1));
+                }
+                Type::Data => write!(f, "data")?,
+                Type::Bls12_381G1Element => write!(f, "bls12_381_G1_element")?,
+                Type::Bls12_381G2Element => write!(f, "bls12_381_G2_element")?,
+                Type::Bls12_381MlResult => write!(f, "bls12_381_mlresult")?,
+                Type::Value => write!(f, "value")?,
+                Type::Array(t) => {
+                    write!(f, "array ")?;
+                    pending.push(Piece::Type(t));
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Structural equality, as derived.
+impl PartialEq for Type {
+    fn eq(&self, other: &Self) -> bool {
+        types_equal(self, other, &mut HashSet::new())
+    }
+}
+
+/// Structural equality of two types, iterative for the depth reason given on the `Drop` impl
+/// above: `pending` holds the pairs of operands still to compare.
+///
+/// `seen` records the pairs of shared operands already compared (or queued), across calls: the
+/// element types of a nested constant share their operands with the enclosing type, so without it
+/// comparing two constants would compare the same deep operands once per level. Equality of types
+/// is pure, so skipping a repeated pair cannot change the answer.
+fn types_equal<'a>(
+    left: &'a Type,
+    right: &'a Type,
+    seen: &mut HashSet<(*const Type, *const Type)>,
+) -> bool {
+    fn queue<'a>(
+        pending: &mut Vec<(&'a Type, &'a Type)>,
+        seen: &mut HashSet<(*const Type, *const Type)>,
+        t1: &'a Rc<Type>,
+        t2: &'a Rc<Type>,
+    ) {
+        if !Rc::ptr_eq(t1, t2) && seen.insert((Rc::as_ptr(t1), Rc::as_ptr(t2))) {
+            pending.push((t1.as_ref(), t2.as_ref()));
+        }
+    }
+
+    let mut pending = vec![(left, right)];
+
+    while let Some(pair) = pending.pop() {
+        match pair {
+            (Type::List(t1), Type::List(t2)) | (Type::Array(t1), Type::Array(t2)) => {
+                queue(&mut pending, seen, t1, t2);
+            }
+            (Type::Pair(l1, r1), Type::Pair(l2, r2)) => {
+                queue(&mut pending, seen, r1, r2);
+                queue(&mut pending, seen, l1, l2);
+            }
+            (Type::List(_) | Type::Array(_) | Type::Pair(_, _), _)
+            | (_, Type::List(_) | Type::Array(_) | Type::Pair(_, _)) => return false,
+            // The remaining variants carry nothing.
+            (t1, t2) => {
+                if mem::discriminant(t1) != mem::discriminant(t2) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    true
+}
+
+/// Structural equality, as derived, but iterative for the depth reason given on the `Drop` impl
+/// above: `pending` holds the pairs of elements still to compare. The types are compared with one
+/// shared `seen` set, so a nested constant's types cost their size once, not once per level.
+impl PartialEq for Constant {
+    fn eq(&self, other: &Self) -> bool {
+        let mut pending = vec![(self, other)];
+        let mut seen_types = HashSet::new();
+
+        while let Some(pair) = pending.pop() {
+            match pair {
+                (Constant::ProtoList(t1, xs), Constant::ProtoList(t2, ys))
+                | (Constant::ProtoArray(t1, xs), Constant::ProtoArray(t2, ys)) => {
+                    if !types_equal(t1, t2, &mut seen_types) || xs.len() != ys.len() {
+                        return false;
+                    }
+
+                    pending.extend(
+                        xs.iter()
+                            .zip(ys.iter())
+                            .rev()
+                            .map(|(x, y)| (x.as_ref(), y.as_ref())),
+                    );
+                }
+                (Constant::ProtoPair(f1, s1, l1, r1), Constant::ProtoPair(f2, s2, l2, r2)) => {
+                    if !types_equal(f1, f2, &mut seen_types)
+                        || !types_equal(s1, s2, &mut seen_types)
+                    {
+                        return false;
+                    }
+
+                    pending.push((r1, r2));
+                    pending.push((l1, l2));
+                }
+                (Constant::Integer(x), Constant::Integer(y)) => {
+                    if x != y {
+                        return false;
+                    }
+                }
+                (Constant::ByteString(x), Constant::ByteString(y)) => {
+                    if x != y {
+                        return false;
+                    }
+                }
+                (Constant::String(x), Constant::String(y)) => {
+                    if x != y {
+                        return false;
+                    }
+                }
+                (Constant::Unit, Constant::Unit) => {}
+                (Constant::Bool(x), Constant::Bool(y)) => {
+                    if x != y {
+                        return false;
+                    }
+                }
+                (Constant::Data(x), Constant::Data(y)) => {
+                    if x != y {
+                        return false;
+                    }
+                }
+                (Constant::Bls12_381G1Element(x), Constant::Bls12_381G1Element(y)) => {
+                    if x != y {
+                        return false;
+                    }
+                }
+                (Constant::Bls12_381G2Element(x), Constant::Bls12_381G2Element(y)) => {
+                    if x != y {
+                        return false;
+                    }
+                }
+                (Constant::Bls12_381MlResult(x), Constant::Bls12_381MlResult(y)) => {
+                    if x != y {
+                        return false;
+                    }
+                }
+                (Constant::Value(x), Constant::Value(y)) => {
+                    if x != y {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+
+        true
     }
 }
 
@@ -2253,6 +2876,266 @@ mod tests {
         }
 
         drop(typ);
+    }
+
+    /// A `constr` / `case` spine, which nests through owned vectors rather than `Rc`s.
+    fn deep_constr_spine(depth: usize) -> Term<Name> {
+        let mut term: Term<Name> = Term::Error { uniq_id: 0 };
+
+        for level in 0..depth {
+            term = if level % 2 == 0 {
+                Term::Constr {
+                    tag: level,
+                    fields: vec![term],
+                    uniq_id: level as isize,
+                }
+            } else {
+                Term::Case {
+                    constr: Rc::new(Term::Error { uniq_id: 0 }),
+                    branches: vec![Term::Error { uniq_id: 0 }, term],
+                    uniq_id: level as isize,
+                }
+            };
+        }
+
+        term
+    }
+
+    #[test]
+    fn deep_terms_clone_and_compare_without_overflowing_the_stack() {
+        for term in [deep_constr_spine(DEEP), deep_delay_spine(DEEP)] {
+            let copy = term.clone();
+            assert!(copy == term);
+
+            let deep_copy = term.deep_clone();
+            assert!(deep_copy == term);
+        }
+
+        // A difference at the very bottom is still found.
+        let left = deep_constr_spine(DEEP);
+        let mut right: Term<Name> = Term::Builtin {
+            fun: DefaultFunction::AddInteger,
+            uniq_id: 0,
+        };
+        for level in 0..DEEP {
+            right = if level % 2 == 0 {
+                Term::Constr {
+                    tag: level,
+                    fields: vec![right],
+                    uniq_id: -1,
+                }
+            } else {
+                Term::Case {
+                    constr: Rc::new(Term::Error { uniq_id: -1 }),
+                    branches: vec![Term::Error { uniq_id: -1 }, right],
+                    uniq_id: -1,
+                }
+            };
+        }
+        assert!(left != right);
+    }
+
+    #[test]
+    fn term_clone_keeps_ids_and_shares_rc_children() {
+        let shared = Rc::new(Term::<Name>::Error { uniq_id: 9 });
+        let term = Term::Constr {
+            tag: 3,
+            fields: vec![
+                Term::Delay {
+                    body: Rc::clone(&shared),
+                    uniq_id: 1,
+                },
+                Term::Case {
+                    constr: Rc::clone(&shared),
+                    branches: vec![Term::Error { uniq_id: 2 }],
+                    uniq_id: 3,
+                },
+            ],
+            uniq_id: 4,
+        };
+
+        let copy = term.clone();
+
+        assert!(copy == term);
+        assert_eq!(copy.uniq_id(), 4);
+        assert_eq!(Rc::strong_count(&shared), 5);
+
+        let Term::Constr { fields, .. } = &copy else {
+            panic!("not a constr")
+        };
+        assert_eq!(fields[0].uniq_id(), 1);
+        assert_eq!(fields[1].uniq_id(), 3);
+    }
+
+    #[test]
+    fn deep_wrappers_negate_and_count_as_constants() {
+        let mut term: Term<Name> = Term::Constant {
+            value: Constant::Integer(BigInt::from(7)).into(),
+            uniq_id: 0,
+        };
+        for level in 0..DEEP {
+            term = if level % 2 == 0 {
+                Term::Delay {
+                    body: Rc::new(term),
+                    uniq_id: 0,
+                }
+            } else {
+                Term::Force {
+                    body: Rc::new(term),
+                    uniq_id: 0,
+                }
+            };
+        }
+
+        assert!(term.is_constant());
+
+        let negated = term
+            .try_negate()
+            .expect("an integer under delays and forces");
+        let mut cursor = &negated;
+        let mut wrappers = 0;
+        while let Term::Delay { body, .. } | Term::Force { body, .. } = cursor {
+            wrappers += 1;
+            cursor = body;
+        }
+        assert_eq!(wrappers, DEEP);
+        assert!(cursor.is_int());
+        assert!(
+            matches!(cursor, Term::Constant { value, .. } if value.as_ref() == &Constant::Integer(BigInt::from(-7)))
+        );
+        // Fresh ids, handed out innermost first.
+        assert!(negated.uniq_id() > cursor.uniq_id());
+    }
+
+    /// A list nested `depth` times, its declared type as deep, around `leaf`.
+    fn deep_list(depth: usize, leaf: Constant, leaf_type: Type) -> Constant {
+        let mut constant = leaf;
+        let mut typ = leaf_type;
+
+        for _ in 0..depth {
+            constant = Constant::ProtoList(typ.clone(), vec![Rc::new(constant)]);
+            typ = Type::List(Rc::new(typ));
+        }
+
+        constant
+    }
+
+    /// A pair nested `depth` times through its first component.
+    fn deep_pair(depth: usize, leaf: Constant, leaf_type: Type) -> Constant {
+        let mut constant = leaf;
+        let mut typ = leaf_type;
+
+        for _ in 0..depth {
+            constant = Constant::ProtoPair(
+                typ.clone(),
+                Type::Bool,
+                Rc::new(constant),
+                Rc::new(Constant::Bool(true)),
+            );
+            typ = Type::Pair(Rc::new(typ), Rc::new(Type::Bool));
+        }
+
+        constant
+    }
+
+    #[test]
+    fn deep_constants_compare_clone_and_check_without_overflowing_the_stack() {
+        for build in [deep_list, deep_pair] {
+            let constant = Rc::new(build(
+                DEEP,
+                Constant::Integer(BigInt::from(1)),
+                Type::Integer,
+            ));
+
+            assert!(*constant == build(DEEP, Constant::Integer(BigInt::from(1)), Type::Integer));
+            assert!(*constant != build(DEEP, Constant::Integer(BigInt::from(2)), Type::Integer));
+
+            assert!(!Constant::contains_value(&constant));
+            assert!(!Constant::contains_array(&constant));
+
+            let with_value = Rc::new(build(DEEP, Constant::Value(Value::empty()), Type::Value));
+            assert!(Constant::contains_value(&with_value));
+            assert!(!Constant::contains_array(&with_value));
+
+            let with_array = Rc::new(build(
+                DEEP,
+                Constant::ProtoArray(Type::Unit, vec![]),
+                Type::Array(Rc::new(Type::Unit)),
+            ));
+            assert!(Constant::contains_array(&with_array));
+            assert!(!Constant::contains_value(&with_array));
+        }
+
+        // `deep_clone` shares nothing, so it copies every level's declared type afresh; keep the
+        // types flat here and let the nesting come from the values alone.
+        let mut constant = Constant::Integer(BigInt::from(1));
+        for level in 0..DEEP {
+            constant = if level % 2 == 0 {
+                Constant::ProtoList(Type::Integer, vec![Rc::new(constant)])
+            } else {
+                Constant::ProtoPair(
+                    Type::Integer,
+                    Type::Unit,
+                    Rc::new(constant),
+                    Rc::new(Constant::Unit),
+                )
+            };
+        }
+        assert!(constant.deep_clone() == constant);
+    }
+
+    #[test]
+    fn deep_types_compare_print_and_check_without_overflowing_the_stack() {
+        let mut typ = Type::Integer;
+        let mut other = Type::Integer;
+
+        for level in 0..DEEP {
+            if level % 2 == 0 {
+                typ = Type::List(Rc::new(typ));
+                other = Type::List(Rc::new(other));
+            } else {
+                typ = Type::Pair(Rc::new(Type::Unit), Rc::new(typ));
+                other = Type::Pair(Rc::new(Type::Unit), Rc::new(other));
+            }
+        }
+
+        assert!(typ == other);
+        assert!(typ.deep_clone() == typ);
+        assert!(!typ.contains_value());
+        assert!(!typ.contains_array());
+
+        let text = typ.to_string();
+        assert!(text.starts_with("pair unit list pair unit list "));
+        assert!(text.ends_with(" list integer"));
+
+        let small = Type::Pair(
+            Rc::new(Type::List(Rc::new(Type::Array(Rc::new(Type::Value))))),
+            Rc::new(Type::Bool),
+        );
+        assert_eq!(small.to_string(), "pair list array value bool");
+        assert!(small.contains_value());
+        assert!(small.contains_array());
+    }
+
+    #[test]
+    fn availability_checks_visit_shared_nodes_once() {
+        // Both components of every pair are the same `Rc`: 2^64 paths, 64 nodes.
+        let mut constant = Rc::new(Constant::Unit);
+        let mut typ = Rc::new(Type::Unit);
+
+        for _ in 0..64 {
+            constant = Rc::new(Constant::ProtoPair(
+                typ.as_ref().clone(),
+                typ.as_ref().clone(),
+                Rc::clone(&constant),
+                Rc::clone(&constant),
+            ));
+            typ = Rc::new(Type::Pair(Rc::clone(&typ), Rc::clone(&typ)));
+        }
+
+        assert!(!Constant::contains_value(&constant));
+        assert!(!Constant::contains_array(&constant));
+        assert!(!typ.contains_value());
     }
 
     fn data_value_with_quantity(quantity: conway::BigInt) -> PlutusData {

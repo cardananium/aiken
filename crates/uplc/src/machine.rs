@@ -31,7 +31,7 @@ pub enum MachineState {
     Done(Term<NamedDeBruijn>),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum Context {
     FrameAwaitArg(Value, Box<Context>),
     FrameAwaitFunTerm(Env, Term<NamedDeBruijn>, Box<Context>),
@@ -63,6 +63,67 @@ impl Drop for Context {
         while let Some(mut context) = pending.pop() {
             detach_context_child(&mut context, &mut pending);
         }
+    }
+}
+
+/// The derived `Clone` copied the frame below one stack frame per machine frame, for the same depth
+/// reason as the `Drop` impl above. The frames are listed top to bottom first, then rebuilt bottom
+/// up, so the copy is assembled without recursion.
+impl Clone for Context {
+    fn clone(&self) -> Self {
+        let mut frames = Vec::new();
+        let mut cursor = self;
+
+        while let Some(tail) = context_tail(cursor) {
+            frames.push(cursor);
+            cursor = tail;
+        }
+
+        let mut copy = Context::NoFrame;
+
+        for frame in frames.into_iter().rev() {
+            let tail = Box::new(copy);
+
+            copy = match frame {
+                Context::FrameAwaitArg(value, _) => Context::FrameAwaitArg(value.clone(), tail),
+                Context::FrameAwaitFunTerm(env, term, _) => {
+                    Context::FrameAwaitFunTerm(env.clone(), term.clone(), tail)
+                }
+                Context::FrameAwaitFunValue(value, _) => {
+                    Context::FrameAwaitFunValue(value.clone(), tail)
+                }
+                Context::FrameForce(_) => Context::FrameForce(tail),
+                Context::FrameConstr(env, tag, fields, resolved_fields, _, term_id) => {
+                    Context::FrameConstr(
+                        env.clone(),
+                        *tag,
+                        fields.clone(),
+                        resolved_fields.clone(),
+                        tail,
+                        *term_id,
+                    )
+                }
+                Context::FrameCases(env, branches, _) => {
+                    Context::FrameCases(env.clone(), branches.clone(), tail)
+                }
+                Context::NoFrame => unreachable!("the bottom frame is not listed"),
+            };
+        }
+
+        copy
+    }
+}
+
+/// The frame below `context`, unless it is the bottom one.
+pub(crate) fn context_tail(context: &Context) -> Option<&Context> {
+    match context {
+        Context::NoFrame => None,
+        Context::FrameAwaitArg(_, tail)
+        | Context::FrameAwaitFunTerm(_, _, tail)
+        | Context::FrameAwaitFunValue(_, tail)
+        | Context::FrameForce(tail)
+        | Context::FrameConstr(_, _, _, _, tail, _)
+        | Context::FrameCases(_, _, tail) => Some(tail),
     }
 }
 
