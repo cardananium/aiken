@@ -161,3 +161,10 @@ opt-level = 3
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+[patch.crates-io]
+pallas-addresses = { git = "file:///home/evgenii/svc/pallas", rev = "437295c63d1846a50692129655205ed2182c54f3" }
+pallas-codec = { git = "file:///home/evgenii/svc/pallas", rev = "437295c63d1846a50692129655205ed2182c54f3" }
+pallas-crypto = { git = "file:///home/evgenii/svc/pallas", rev = "437295c63d1846a50692129655205ed2182c54f3" }
+pallas-primitives = { git = "file:///home/evgenii/svc/pallas", rev = "437295c63d1846a50692129655205ed2182c54f3" }
+pallas-traverse = { git = "file:///home/evgenii/svc/pallas", rev = "437295c63d1846a50692129655205ed2182c54f3" }
