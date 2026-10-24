@@ -129,6 +129,8 @@ pub enum Error {
     UnexpectedEd25519PublicKeyLength(usize),
     #[error("Ed25519S Signature should be 64 bytes but it was {0}")]
     UnexpectedEd25519SignatureLength(usize),
+    #[error("Secp256k1 {0} should be {1} bytes but it was {2}")]
+    UnexpectedSecp256k1Length(&'static str, usize, usize),
     #[error(
       "failed to deserialise PlutusData using {0}\n{:>13} {}",
       "Value",

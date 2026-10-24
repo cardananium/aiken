@@ -844,12 +844,22 @@ impl DefaultFunction {
                 let message = args[1].unwrap_byte_string()?;
                 let signature = args[2].unwrap_byte_string()?;
 
+                // A compressed public key, a message hash and a compact signature. Arguments of
+                // any other length are malformed, which fails rather than returns False.
+                expect_secp256k1_length("ECDSA public key", public_key, 33)?;
+                expect_secp256k1_length("ECDSA message hash", message, 32)?;
+                expect_secp256k1_length("ECDSA signature", signature, 64)?;
+
                 verify_ecdsa(public_key, message, signature)
             }
             DefaultFunction::VerifySchnorrSecp256k1Signature => {
                 let public_key = args[0].unwrap_byte_string()?;
                 let message = args[1].unwrap_byte_string()?;
                 let signature = args[2].unwrap_byte_string()?;
+
+                // An x-only public key and a signature; the message can have any length.
+                expect_secp256k1_length("Schnorr public key", public_key, 32)?;
+                expect_secp256k1_length("Schnorr signature", signature, 64)?;
 
                 verify_schnorr(public_key, message, signature)
             }
@@ -2364,6 +2374,18 @@ pub fn convert_constr_to_tag(constr: u64) -> Option<u64> {
 
 pub static ANY_TAG: u64 = 102;
 
+fn expect_secp256k1_length(what: &'static str, bytes: &[u8], expected: usize) -> Result<(), Error> {
+    if bytes.len() == expected {
+        Ok(())
+    } else {
+        Err(Error::UnexpectedSecp256k1Length(
+            what,
+            expected,
+            bytes.len(),
+        ))
+    }
+}
+
 #[cfg(not(target_family = "wasm"))]
 fn verify_ecdsa(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result<Value, Error> {
     use secp256k1::{Message, PublicKey, Secp256k1, ecdsa::Signature};
@@ -2411,17 +2433,42 @@ fn verify_schnorr(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result
     Ok(Value::Con(Constant::Bool(valid == 1).into()))
 }
 
+// The k256 versions below get arguments of the right lengths (checked by the caller). Where k256
+// and libsecp256k1 disagree on what else is well-formed, they follow libsecp256k1, as Plutus does.
+
 #[cfg(target_family = "wasm")]
 fn verify_ecdsa(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result<Value, Error> {
-    use k256::ecdsa::{self, signature::hazmat::PrehashVerifier};
+    use k256::{
+        Secp256k1,
+        ecdsa::{self, signature::hazmat::PrehashVerifier},
+        elliptic_curve::ScalarPrimitive,
+    };
 
-    let verifying_key = ecdsa::VerifyingKey::try_from(public_key)?;
+    // libsecp256k1 reads 33 bytes as a compressed point only; k256 would also take the "compact"
+    // tag 0x05.
+    if !matches!(public_key[0], 0x02 | 0x03) {
+        return Err(ecdsa::Error::new().into());
+    }
 
-    let signature = ecdsa::Signature::try_from(signature)?;
+    let verifying_key = ecdsa::VerifyingKey::from_sec1_bytes(public_key)?;
 
-    let valid = verifying_key.verify_prehash(message, &signature);
+    // A component that is not below the group order makes the signature malformed. A zero one
+    // does not: libsecp256k1 parses it and verification then fails, whereas k256 refuses to
+    // build such a signature at all.
+    let (r, s) = signature.split_at(32);
 
-    Ok(Value::Con(Constant::Bool(valid.is_ok()).into()))
+    if ScalarPrimitive::<Secp256k1>::from_slice(r).is_err()
+        || ScalarPrimitive::<Secp256k1>::from_slice(s).is_err()
+    {
+        return Err(ecdsa::Error::new().into());
+    }
+
+    let valid = match ecdsa::Signature::from_slice(signature) {
+        Ok(signature) => verifying_key.verify_prehash(message, &signature).is_ok(),
+        Err(_) => false,
+    };
+
+    Ok(Value::Con(Constant::Bool(valid).into()))
 }
 
 #[cfg(target_family = "wasm")]
@@ -2430,11 +2477,15 @@ fn verify_schnorr(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result
 
     let verifying_key = schnorr::VerifyingKey::from_bytes(public_key)?;
 
-    let signature = schnorr::Signature::try_from(signature)?;
+    // libsecp256k1 takes any 64 bytes as a signature, and verification rejects the ones whose `r`
+    // is not a field element or whose `s` is not below the group order. k256 refuses to build
+    // those, and ones with a zero `r` or `s`, which never verify either.
+    let valid = match schnorr::Signature::try_from(signature) {
+        Ok(signature) => verifying_key.verify_prehash(message, &signature).is_ok(),
+        Err(_) => false,
+    };
 
-    let valid = verifying_key.verify_prehash(message, &signature);
-
-    Ok(Value::Con(Constant::Bool(valid.is_ok()).into()))
+    Ok(Value::Con(Constant::Bool(valid).into()))
 }
 
 #[cfg(test)]
@@ -2640,6 +2691,86 @@ mod tests {
                 .call(BuiltinSemantics::E, &args, &mut vec![])
                 .is_err()
         );
+    }
+
+    fn verify(
+        fun: DefaultFunction,
+        public_key: &str,
+        message: &str,
+        signature: &str,
+    ) -> Result<Value, Error> {
+        let args = [public_key, message, signature]
+            .map(|bytes| Value::byte_string(hex::decode(bytes).unwrap()));
+
+        fun.call(BuiltinSemantics::E, &args, &mut vec![])
+    }
+
+    #[test]
+    fn secp256k1_fails_on_malformed_arguments_and_refutes_bad_signatures() {
+        use DefaultFunction::{
+            VerifyEcdsaSecp256k1Signature as Ecdsa, VerifySchnorrSecp256k1Signature as Schnorr,
+        };
+
+        let zero = "00".repeat(32);
+        let order = "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141";
+        let field = "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f";
+
+        // A valid key, message hash and signature (conformance test vector 01).
+        let key = "032e433589dce61863199171f4d1e3fa946a5832621fcd29559940a0950f96fb6f";
+        let uncompressed = "042e433589dce61863199171f4d1e3fa946a5832621fcd29559940a0950f96fb6f\
+                            503f0ede730b04c413cc9525f51d638b834fadefea334c42df7d96ea54c00723";
+        let hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let r = "4941155e2303988a1be97a021fbaf9fe6064d05ea694bc5e89328f297154e5c6";
+        let s = "3a2f3e7b5f509294a4c2e22feb697a16b792fabfebe9d0f38403b1c929836b5a";
+        let signature = format!("{r}{s}");
+
+        assert_eq!(verify(Ecdsa, key, hash, &signature), Ok(Value::bool(true)));
+        // Only a compressed key: neither the same point uncompressed, nor with a "compact" tag.
+        assert!(verify(Ecdsa, uncompressed, hash, &signature).is_err());
+        assert!(verify(Ecdsa, &format!("05{}", &key[2..]), hash, &signature).is_err());
+        assert!(verify(Ecdsa, key, &format!("{hash}00"), &signature).is_err());
+        assert!(verify(Ecdsa, key, &hash[2..], &signature).is_err());
+        assert!(verify(Ecdsa, key, hash, &signature[2..]).is_err());
+        // A zero component is well-formed, one that is not below the group order is not.
+        assert_eq!(
+            verify(Ecdsa, key, hash, &format!("{zero}{s}")),
+            Ok(Value::bool(false))
+        );
+        assert_eq!(
+            verify(Ecdsa, key, hash, &format!("{r}{zero}")),
+            Ok(Value::bool(false))
+        );
+        assert!(verify(Ecdsa, key, hash, &format!("{order}{s}")).is_err());
+        assert!(verify(Ecdsa, key, hash, &format!("{r}{order}")).is_err());
+
+        // A valid key, message and signature (BIP-340 test vector 17, a 17-byte message).
+        let key = "778caa53b4393ac467774d09497a87224bf9fab6f6e68b23086497324d6fd117";
+        let message = "0102030405060708090a0b0c0d0e0f1011";
+        let r = "5130f39a4059b43bc7cac09a19ece52b5d8699d1a71e3c52da9afdb6b50ac370";
+        let s = "c4a482b77bf960f8681540e25b6771ece1e5a37fd80e5a51897c5566a97ea5a5";
+        let signature = format!("{r}{s}");
+
+        assert_eq!(
+            verify(Schnorr, key, message, &signature),
+            Ok(Value::bool(true))
+        );
+        assert!(verify(Schnorr, &format!("02{key}"), message, &signature).is_err());
+        assert!(verify(Schnorr, &key[2..], message, &signature).is_err());
+        assert!(verify(Schnorr, key, message, &format!("{signature}00")).is_err());
+        assert!(verify(Schnorr, key, message, &signature[2..]).is_err());
+        assert!(verify(Schnorr, key, message, "").is_err());
+        // Any 64 bytes are a signature, and the ones that cannot verify are refuted.
+        for signature in [
+            format!("{zero}{s}"),
+            format!("{field}{s}"),
+            format!("{r}{zero}"),
+            format!("{r}{order}"),
+        ] {
+            assert_eq!(
+                verify(Schnorr, key, message, &signature),
+                Ok(Value::bool(false))
+            );
+        }
     }
 
     #[test]
