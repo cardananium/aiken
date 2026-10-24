@@ -1,7 +1,11 @@
 use std::{fmt::Display, mem, rc::Rc};
 
-use crate::ast::{Constant, NamedDeBruijn, Term, Type};
+use crate::{
+    ast::{Constant, NamedDeBruijn, Term, Type},
+    builtins::DefaultFunction,
+};
 use num_traits::ToPrimitive;
+use strum::IntoEnumIterator;
 
 pub mod cost_model;
 pub mod discharge;
@@ -138,6 +142,10 @@ pub struct Machine {
     pub traces: Vec<Trace>,
     pub spend_counter: Option<[i64; (TERM_COUNT + BUILTIN_COUNT) * 2]>,
     semantics: BuiltinSemantics,
+    language: Language,
+    /// The protocol version builtin availability is judged against. A machine built without one
+    /// follows the latest rules, under which every builtin is available.
+    protocol_major_version: Option<u16>,
 }
 
 impl Machine {
@@ -157,6 +165,8 @@ impl Machine {
             traces: vec![],
             spend_counter: None,
             semantics,
+            language: version,
+            protocol_major_version: None,
         }
     }
 
@@ -178,6 +188,8 @@ impl Machine {
             traces: vec![],
             spend_counter: None,
             semantics,
+            language: version,
+            protocol_major_version: Some(protocol_major_version),
         }
     }
 
@@ -197,6 +209,8 @@ impl Machine {
             traces: vec![],
             spend_counter: Some([0; (TERM_COUNT + BUILTIN_COUNT) * 2]),
             semantics,
+            language: version,
+            protocol_major_version: None,
         }
     }
 
@@ -218,6 +232,8 @@ impl Machine {
             traces: vec![],
             spend_counter: Some([0; (TERM_COUNT + BUILTIN_COUNT) * 2]),
             semantics,
+            language: version,
+            protocol_major_version: Some(protocol_major_version),
         }
     }
 
@@ -245,9 +261,7 @@ impl Machine {
     /// Validate the program for this machine's semantics, charge the startup cost and hand back the
     /// initial state. Shared by `run` and the step-by-step `ManualMachine`.
     pub(crate) fn start(&mut self, term: Term<NamedDeBruijn>) -> Result<MachineState, Error> {
-        if !self.semantics.supports_values() {
-            Self::assert_no_values(&term)?;
-        }
+        self.assert_available(&term)?;
 
         let startup_budget = self.costs.machine_costs.get(StepKind::StartUp);
 
@@ -271,12 +285,32 @@ impl Machine {
         self.costs.machine_costs.get(StepKind::StartUp)
     }
 
-    /// The CIP-0153 value builtins and native `Value` constants only exist for
-    /// Plutus V3 from protocol version 11 (Van Rossem) onwards. Availability is
-    /// a whole-program well-formedness rule: occurrences in latent code (under
-    /// lambdas, delays or untaken branches) are rejected too, so the entire
-    /// term is validated up-front before evaluation starts.
-    pub(crate) fn assert_no_values(term: &Term<NamedDeBruijn>) -> Result<(), Error> {
+    /// Whether this machine's language may use `fun` at its protocol version.
+    fn is_builtin_available(&self, fun: DefaultFunction) -> bool {
+        match self.protocol_major_version {
+            Some(protocol_major_version) => {
+                fun.is_available_in(&self.language, protocol_major_version)
+            }
+            None => true,
+        }
+    }
+
+    /// Each builtin becomes available to each Plutus version at a protocol
+    /// version of its own (see `DefaultFunction::introduced_in`), and native
+    /// `Value` constants exist for every Plutus version from protocol version
+    /// 11 (Van Rossem) onwards. Availability is a whole-program well-formedness
+    /// rule: occurrences in latent code (under lambdas, delays or untaken
+    /// branches) are rejected too, so the entire term is validated up-front
+    /// before evaluation starts.
+    pub(crate) fn assert_available(&self, term: &Term<NamedDeBruijn>) -> Result<(), Error> {
+        let semantics = self.semantics;
+
+        if semantics.supports_values()
+            && DefaultFunction::iter().all(|fun| self.is_builtin_available(fun))
+        {
+            return Ok(());
+        }
+
         let mut stack = vec![term];
 
         while let Some(term) = stack.pop() {
@@ -293,12 +327,12 @@ impl Machine {
                 Term::Constant {
                     value: constant, ..
                 } => {
-                    if Constant::contains_value(constant) {
+                    if !semantics.supports_values() && Constant::contains_value(constant) {
                         return Err(Error::ValueConstantNotAvailable);
                     }
                 }
                 Term::Builtin { fun, .. } => {
-                    if fun.is_value_builtin() {
+                    if !self.is_builtin_available(*fun) {
                         return Err(Error::BuiltinNotAvailable(*fun));
                     }
                 }
@@ -793,15 +827,20 @@ mod tests {
     use num_bigint::BigInt;
     use std::rc::Rc;
 
-    use super::{Context, Error, cost_model::ExBudget, runtime::Compressable};
+    use super::{
+        Context, Error,
+        cost_model::ExBudget,
+        runtime::{Compressable, VAN_ROSSEM_PROTOCOL_VERSION},
+    };
     use crate::{
         ast::{Constant, NamedDeBruijn, Program, Term},
         builtins::DefaultFunction,
     };
     use pallas_primitives::conway::Language;
+    use strum::IntoEnumIterator;
 
     #[test]
-    fn value_builtins_unavailable_before_van_rossem_or_outside_v3() {
+    fn value_builtins_unavailable_before_van_rossem() {
         let program = |term: Term<NamedDeBruijn>| Program {
             version: (1, 1, 0),
             term,
@@ -844,8 +883,8 @@ mod tests {
 
         for (language, protocol) in [
             (Language::PlutusV3, 10),
-            (Language::PlutusV2, 11),
-            (Language::PlutusV1, 11),
+            (Language::PlutusV2, 10),
+            (Language::PlutusV1, 10),
         ] {
             let result = program(builtin.clone())
                 .eval_version_with_protocol(ExBudget::default(), &language, protocol)
@@ -896,11 +935,89 @@ mod tests {
             );
         }
 
-        for term in [builtin, constant, latent] {
-            let result = program(term)
-                .eval_version_with_protocol(ExBudget::default(), &Language::PlutusV3, 11)
+        // Protocol version 11 opened them to every Plutus version.
+        for language in [Language::PlutusV1, Language::PlutusV2, Language::PlutusV3] {
+            for term in [builtin.clone(), constant.clone(), latent.clone()] {
+                let result = program(term)
+                    .eval_version_with_protocol(ExBudget::default(), &language, 11)
+                    .result();
+                assert!(result.is_ok(), "{language:?}: {result:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn builtins_become_available_per_plutus_version_and_protocol_version() {
+        use DefaultFunction::*;
+
+        // (builtin, language, first protocol version it is available at)
+        let introductions = [
+            (AddInteger, Language::PlutusV1, 5),
+            (SerialiseData, Language::PlutusV1, 11),
+            (VerifyEcdsaSecp256k1Signature, Language::PlutusV1, 11),
+            (Bls12_381_G1_Add, Language::PlutusV1, 11),
+            (IntegerToByteString, Language::PlutusV1, 11),
+            (AndByteString, Language::PlutusV1, 11),
+            (ExpModInteger, Language::PlutusV1, 11),
+            (AddInteger, Language::PlutusV2, 7),
+            (SerialiseData, Language::PlutusV2, 7),
+            (VerifySchnorrSecp256k1Signature, Language::PlutusV2, 8),
+            (ByteStringToInteger, Language::PlutusV2, 10),
+            (Keccak_256, Language::PlutusV2, 11),
+            (Ripemd_160, Language::PlutusV2, 11),
+            (DropList, Language::PlutusV2, 11),
+            (InsertCoin, Language::PlutusV2, 11),
+            (AddInteger, Language::PlutusV3, 9),
+            (Bls12_381_FinalVerify, Language::PlutusV3, 9),
+            (IntegerToByteString, Language::PlutusV3, 9),
+            (CountSetBits, Language::PlutusV3, 10),
+            (Bls12_381_G2_MultiScalarMul, Language::PlutusV3, 11),
+            (ScaleValue, Language::PlutusV3, 11),
+        ];
+
+        for (fun, language, protocol) in &introductions {
+            assert_eq!(
+                fun.introduced_in(language),
+                *protocol,
+                "{fun} in {language:?}"
+            );
+            assert!(!fun.is_available_in(language, protocol - 1));
+            assert!(fun.is_available_in(language, *protocol));
+        }
+
+        for fun in DefaultFunction::iter() {
+            for language in [Language::PlutusV1, Language::PlutusV2, Language::PlutusV3] {
+                assert!(fun.is_available_in(&language, VAN_ROSSEM_PROTOCOL_VERSION));
+            }
+        }
+
+        // The machine refuses a program that mentions a builtin its Plutus version cannot use yet,
+        // even one that evaluation would never reach.
+        let latent = |fun: DefaultFunction| Program::<NamedDeBruijn> {
+            version: (1, 0, 0),
+            term: Term::Delay {
+                body: Term::Builtin { fun, uniq_id: 1 }.into(),
+                uniq_id: 0,
+            },
+        };
+
+        for (fun, language, protocol) in introductions {
+            let result = latent(fun)
+                .eval_version_with_protocol(ExBudget::default(), &language, protocol - 1)
                 .result();
-            assert!(result.is_ok(), "{result:?}");
+            assert!(
+                matches!(result, Err(Error::BuiltinNotAvailable(refused)) if refused == fun),
+                "expected {fun} to be refused in {language:?} at protocol {}, got {result:?}",
+                protocol - 1
+            );
+
+            let result = latent(fun)
+                .eval_version_with_protocol(ExBudget::default(), &language, protocol)
+                .result();
+            assert!(
+                result.is_ok(),
+                "{fun} in {language:?} at {protocol}: {result:?}"
+            );
         }
     }
 

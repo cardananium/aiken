@@ -677,7 +677,7 @@ pub enum Constant {
 
 impl Constant {
     /// Whether this constant contains a native `Value`, which is only
-    /// available from Plutus V3 / protocol version 11 (Van Rossem) onwards.
+    /// available from protocol version 11 (Van Rossem) onwards.
     pub fn contains_value(constant: impl AsRef<Constant>) -> bool {
         match constant.as_ref() {
             Constant::Value(_) => true,
@@ -1346,7 +1346,7 @@ pub enum Type {
 
 impl Type {
     /// Whether this type mentions the native `Value` type, which is only
-    /// available from Plutus V3 / protocol version 11 (Van Rossem) onwards.
+    /// available from protocol version 11 (Van Rossem) onwards.
     pub fn contains_value(&self) -> bool {
         match self {
             Type::Value => true,

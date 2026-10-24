@@ -265,9 +265,7 @@ impl ManualMachine {
             return Err(Error::OutOfExError(self.machine.ex_budget));
         }
 
-        if !self.machine.semantics().supports_values() {
-            Machine::assert_no_values(&term)?;
-        }
+        self.machine.assert_available(&term)?;
 
         self.machine.clear_run_state();
         self.state = self.machine.start(term)?;

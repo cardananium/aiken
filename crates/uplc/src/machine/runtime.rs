@@ -46,7 +46,11 @@ const BLST_P2_COMPRESSED_SIZE: usize = 96;
 
 pub const INTEGER_TO_BYTE_STRING_MAXIMUM_OUTPUT_LENGTH: i64 = 8192;
 
+pub const ALONZO_PROTOCOL_VERSION: u16 = 5;
+pub const VASIL_PROTOCOL_VERSION: u16 = 7;
+pub const VALENTINE_PROTOCOL_VERSION: u16 = 8;
 pub const CHANG_PROTOCOL_VERSION: u16 = 9;
+pub const PLOMIN_PROTOCOL_VERSION: u16 = 10;
 pub const VAN_ROSSEM_PROTOCOL_VERSION: u16 = 11;
 
 /// Ledger builtin semantics variants.
@@ -95,10 +99,21 @@ impl BuiltinSemantics {
         matches!(self, BuiltinSemantics::C | BuiltinSemantics::E)
     }
 
-    /// The CIP-0153 value builtins and native `Value` constants only exist
-    /// for Plutus V3 from protocol version 11 (Van Rossem) onwards.
+    /// Native `Value` constants (CIP-0153) exist for every Plutus version from
+    /// protocol version 11 (Van Rossem) onwards.
     pub fn supports_values(self) -> bool {
-        matches!(self, BuiltinSemantics::E)
+        matches!(self, BuiltinSemantics::D | BuiltinSemantics::E)
+    }
+
+    /// Whether `fun` may be called under these semantics, as far as they can tell.
+    ///
+    /// The builtins introduced at protocol version 11 (Van Rossem) arrived in every Plutus
+    /// version at once, which is exactly where `D` and `E` begin. Earlier builtins were introduced
+    /// at protocol versions these variants do not tell apart, and differently for Plutus V1 and
+    /// V2, which share variants; the machine checks those against the exact language and protocol
+    /// version before evaluation starts (see `DefaultFunction::is_available_in`).
+    pub fn supports_builtin(self, fun: DefaultFunction) -> bool {
+        !fun.is_van_rossem_builtin() || matches!(self, BuiltinSemantics::D | BuiltinSemantics::E)
     }
 }
 
@@ -486,7 +501,7 @@ impl DefaultFunction {
         args: &[Value],
         traces: &mut Vec<Trace>,
     ) -> Result<Value, Error> {
-        if self.is_value_builtin() && !semantics.supports_values() {
+        if !semantics.supports_builtin(*self) {
             return Err(Error::BuiltinNotAvailable(*self));
         }
 
@@ -2398,7 +2413,7 @@ mod tests {
 
         assert_eq!(
             DefaultFunction::ExpModInteger
-                .call(BuiltinSemantics::C, &positive, &mut vec![])
+                .call(BuiltinSemantics::E, &positive, &mut vec![])
                 .unwrap(),
             Value::integer(445.into())
         );
@@ -2411,7 +2426,7 @@ mod tests {
 
         assert_eq!(
             DefaultFunction::ExpModInteger
-                .call(BuiltinSemantics::C, &inverse, &mut vec![])
+                .call(BuiltinSemantics::E, &inverse, &mut vec![])
                 .unwrap(),
             Value::integer(4.into())
         );
@@ -2426,7 +2441,7 @@ mod tests {
         ];
 
         assert!(matches!(
-            DefaultFunction::ExpModInteger.call(BuiltinSemantics::C, &no_inverse, &mut vec![]),
+            DefaultFunction::ExpModInteger.call(BuiltinSemantics::E, &no_inverse, &mut vec![]),
             Err(Error::ExpModIntegerNoInverse(_, _))
         ));
 
@@ -2437,7 +2452,7 @@ mod tests {
         ];
 
         assert!(matches!(
-            DefaultFunction::ExpModInteger.call(BuiltinSemantics::C, &zero_modulus, &mut vec![]),
+            DefaultFunction::ExpModInteger.call(BuiltinSemantics::E, &zero_modulus, &mut vec![]),
             Err(Error::OutsideNaturalBounds(_))
         ));
 
@@ -2450,7 +2465,7 @@ mod tests {
 
         assert!(matches!(
             DefaultFunction::ExpModInteger.call(
-                BuiltinSemantics::C,
+                BuiltinSemantics::E,
                 &out_of_bounds_modulus,
                 &mut vec![],
             ),
@@ -2466,7 +2481,7 @@ mod tests {
         assert_eq!(
             DefaultFunction::ExpModInteger
                 .call(
-                    BuiltinSemantics::C,
+                    BuiltinSemantics::E,
                     &modulus_one_short_circuits,
                     &mut vec![],
                 )
