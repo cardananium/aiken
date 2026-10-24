@@ -857,14 +857,14 @@ impl Machine {
     }
 }
 
-fn transfer_arg_stack(mut args: Vec<Value>, ctx: Context) -> Context {
-    if args.is_empty() {
-        ctx
-    } else {
-        let popped_field = args.pop().unwrap();
-
-        transfer_arg_stack(args, Context::FrameAwaitFunValue(popped_field, ctx.into()))
+/// Push one `FrameAwaitFunValue` per argument, the last argument deepest. A loop rather than the
+/// tail call it was: a `constr` can carry as many fields as a script has room for.
+fn transfer_arg_stack(mut args: Vec<Value>, mut ctx: Context) -> Context {
+    while let Some(popped_field) = args.pop() {
+        ctx = Context::FrameAwaitFunValue(popped_field, ctx.into());
     }
+
+    ctx
 }
 
 impl From<&Constant> for Type {
@@ -896,7 +896,7 @@ mod tests {
 
     use super::{
         Context, Error,
-        cost_model::ExBudget,
+        cost_model::{CostModel, ExBudget},
         runtime::{
             BuiltinSemantics, CHANG_PROTOCOL_VERSION, Compressable, VAN_ROSSEM_PROTOCOL_VERSION,
         },
@@ -1273,6 +1273,205 @@ mod tests {
     /// Deep enough that a destructor taking one stack frame per level cannot survive the test
     /// harness's ~2 MiB thread stack, let alone the ~1 MiB a `wasm32` engine gives us.
     const DEEP: usize = 100_000;
+
+    fn unit() -> Term<NamedDeBruijn> {
+        Term::Constant {
+            value: Constant::Unit.into(),
+            uniq_id: 0,
+        }
+    }
+
+    fn name() -> Rc<NamedDeBruijn> {
+        NamedDeBruijn {
+            text: "x".to_string(),
+            index: 0.into(),
+        }
+        .into()
+    }
+
+    fn var(index: usize) -> Term<NamedDeBruijn> {
+        Term::Var {
+            name: NamedDeBruijn {
+                text: "x".to_string(),
+                index: index.into(),
+            }
+            .into(),
+            uniq_id: 0,
+        }
+    }
+
+    fn lambda(body: Term<NamedDeBruijn>) -> Term<NamedDeBruijn> {
+        Term::Lambda {
+            parameter_name: name(),
+            body: body.into(),
+            uniq_id: 0,
+        }
+    }
+
+    fn apply(function: Term<NamedDeBruijn>, argument: Term<NamedDeBruijn>) -> Term<NamedDeBruijn> {
+        Term::Apply {
+            function: function.into(),
+            argument: argument.into(),
+            uniq_id: 0,
+        }
+    }
+
+    /// The deep programs below each evaluate to a value as deep as the program: discharging it back
+    /// into a term, cloning and comparing it all follow that depth. Every one is built with a loop.
+    fn deep_results() -> Vec<(&'static str, Term<NamedDeBruijn>)> {
+        // `lam x (lam x ... (con unit ()))`: the result is the program itself, discharged through
+        // every lambda.
+        let mut lambdas = unit();
+        for _ in 0..DEEP {
+            lambdas = lambda(lambdas);
+        }
+
+        // `[(lam a (lam b a)) [(lam a (lam b a)) ... (con unit ())]]`: each closure captures the
+        // previous one, so discharging substitutes a chain of environments.
+        let mut closures = unit();
+        for _ in 0..DEEP {
+            closures = apply(lambda(lambda(var(2))), closures);
+        }
+
+        // `constr 0 [constr 0 [... (con unit ())]]`: a value nested through owned fields.
+        let mut constrs = unit();
+        for _ in 0..DEEP {
+            constrs = Term::Constr {
+                tag: 0,
+                fields: vec![constrs],
+                uniq_id: 0,
+            };
+        }
+
+        vec![
+            ("lambdas", lambdas),
+            ("closures", closures),
+            ("constrs", constrs),
+        ]
+    }
+
+    #[test]
+    fn deep_results_evaluate_and_discharge_without_overflowing_the_stack() {
+        for (name, term) in deep_results() {
+            let program = Program {
+                version: (1, 1, 0),
+                term: term.clone(),
+            };
+
+            let result = program
+                .eval_version_with_protocol(ExBudget::max(), &Language::PlutusV3, 11)
+                .result()
+                .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+
+            let copy = result.clone();
+            assert!(copy == result, "{name}");
+
+            let mut machine = crate::manual_machine::ManualMachine::new_with_protocol(
+                Language::PlutusV3,
+                11,
+                CostModel::default(),
+                ExBudget::max(),
+                200,
+                term,
+            )
+            .unwrap();
+
+            // Half way through, the machine holds a deep control stack: copying it copies that.
+            for _ in 0..DEEP {
+                machine.step();
+            }
+            let mut snapshot = machine.clone();
+
+            let finished = match machine.run_to_completion() {
+                crate::manual_machine::ExecutionStatus::Done(term) => term.clone(),
+                status => panic!("{name}: {status:?}"),
+            };
+            assert!(finished == result, "{name}");
+
+            match snapshot.run_to_completion() {
+                crate::manual_machine::ExecutionStatus::Done(term) => {
+                    assert!(*term == result, "{name}")
+                }
+                status => panic!("{name}: {status:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn wide_case_scrutinees_do_not_grow_the_stack() {
+        // `case (constr 0 [() x WIDE]) [lam x (lam x ... (con unit ()))]`: the scrutinee's fields
+        // all go onto the control stack at once. Every application copies the environment, so the
+        // width is kept moderate and the stack small instead.
+        const WIDE: usize = 10_000;
+
+        let result = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let mut branch = unit();
+                for _ in 0..WIDE {
+                    branch = lambda(branch);
+                }
+
+                let program = Program {
+                    version: (1, 1, 0),
+                    term: Term::Case {
+                        constr: Term::Constr {
+                            tag: 0,
+                            fields: vec![unit(); WIDE],
+                            uniq_id: 0,
+                        }
+                        .into(),
+                        branches: vec![branch],
+                        uniq_id: 0,
+                    },
+                };
+
+                let result = program
+                    .eval_version_with_protocol(ExBudget::max(), &Language::PlutusV3, 11)
+                    .result();
+                matches!(result, Ok(Term::Constant { .. }))
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+
+        assert!(result);
+    }
+
+    #[test]
+    fn discharge_hands_out_fresh_ids_in_evaluation_order() {
+        // `[(builtin addInteger) (con integer 1)]`, partially applied: discharging rebuilds the
+        // application around a freshly numbered constant.
+        let program = Program {
+            version: (1, 1, 0),
+            term: apply(
+                Term::Builtin {
+                    fun: DefaultFunction::AddInteger,
+                    uniq_id: 5,
+                },
+                Term::Constant {
+                    value: Constant::Integer(1.into()).into(),
+                    uniq_id: 6,
+                },
+            ),
+        };
+
+        let result = program.eval(ExBudget::max()).result().unwrap();
+
+        let Term::Apply {
+            function,
+            argument,
+            uniq_id,
+        } = &result
+        else {
+            panic!("not an application: {result:?}")
+        };
+        assert_eq!(function.uniq_id(), 5);
+        assert!(
+            argument.uniq_id() < *uniq_id,
+            "the argument is numbered first"
+        );
+    }
 
     /// The control stack grows one frame per pending force/apply, so its depth follows the nesting
     /// depth of the term being evaluated, which is attacker-controlled. Built with a loop on
