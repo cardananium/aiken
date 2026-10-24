@@ -2439,10 +2439,14 @@ fn verify_schnorr(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result
 
 #[cfg(test)]
 mod tests {
-    use super::{BuiltinSemantics, Error, convert_constr_to_tag, convert_tag_to_constr};
+    use super::{
+        BuiltinSemantics, Error, convert_constr_to_tag, convert_tag_to_constr,
+        plutus_data_structural_eq,
+    };
     use crate::{builtins::DefaultFunction, machine::value::Value};
     use num_bigint::BigInt;
     use pallas_primitives::conway::Language;
+    use pallas_primitives::conway::PlutusData;
 
     #[test]
     fn exp_mod_integer_handles_positive_and_negative_exponents() {
@@ -2529,6 +2533,73 @@ mod tests {
                 .unwrap(),
             Value::integer(0.into())
         );
+    }
+
+    /// Constructors, maps and both kinds of arrays, nested `depth` times around an integer.
+    fn deep_data(depth: usize, leaf: i64) -> PlutusData {
+        let mut data = PlutusData::BigInt(pallas_primitives::conway::BigInt::Int(leaf.into()));
+
+        for level in 0..depth {
+            data = match level % 4 {
+                0 => PlutusData::Constr(pallas_primitives::conway::Constr {
+                    tag: 121,
+                    any_constructor: None,
+                    fields: pallas_primitives::MaybeIndefArray::Indef(vec![data]),
+                }),
+                1 => PlutusData::Map(pallas_primitives::KeyValuePairs::Def(vec![(
+                    PlutusData::BoundedBytes(vec![1].into()),
+                    data,
+                )])),
+                2 => PlutusData::Array(pallas_primitives::MaybeIndefArray::Def(vec![data])),
+                _ => PlutusData::Array(pallas_primitives::MaybeIndefArray::Indef(vec![data])),
+            };
+        }
+
+        data
+    }
+
+    #[test]
+    fn deep_data_serialises_and_compares_on_a_small_stack() {
+        const DEPTH: usize = 2_000;
+
+        let data = deep_data(DEPTH, 7);
+        let same = deep_data(DEPTH, 7);
+        let other = deep_data(DEPTH, 8);
+
+        // Built and dropped here; only the walks under test run on the small stack.
+        let (serialised, equal, different, data, same, other) = std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(move || {
+                let serialised = crate::plutus_data_to_bytes(&data);
+                let equal = plutus_data_structural_eq(&data, &same);
+                let different = plutus_data_structural_eq(&data, &other);
+                (serialised, equal, different, data, same, other)
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+
+        assert!(equal);
+        assert!(!different);
+
+        // Canonical CBOR: every non-empty array indefinite, maps definite.
+        let mut expected = Vec::new();
+        for level in (0..DEPTH).rev() {
+            match level % 4 {
+                0 => expected.extend([0xd8, 0x79, 0x9f]),
+                1 => expected.extend([0xa1, 0x41, 0x01]),
+                _ => expected.push(0x9f),
+            }
+        }
+        expected.push(0x07);
+        for level in 0..DEPTH {
+            if level % 4 != 1 {
+                expected.push(0xff);
+            }
+        }
+        assert_eq!(serialised, expected);
+
+        drop((data, same, other));
     }
 
     #[test]
@@ -2632,34 +2703,53 @@ mod tests {
 /// chain against the same value rebuilt while constructing a script context.
 ///
 /// This compares the algebraic value and nothing else.
+///
+/// Data nests as deep as its CBOR says (see the `Drop` impl on `Term` in `ast.rs` for why depth
+/// matters), so the pairs still to compare are kept on an explicit stack.
 fn plutus_data_structural_eq(left: &PlutusData, right: &PlutusData) -> bool {
-    match (left, right) {
-        (PlutusData::Constr(a), PlutusData::Constr(b)) => {
-            constr_index(a) == constr_index(b)
-                && a.fields.len() == b.fields.len()
-                && a.fields
-                    .iter()
-                    .zip(b.fields.iter())
-                    .all(|(x, y)| plutus_data_structural_eq(x, y))
+    let mut pending = vec![(left, right)];
+
+    while let Some(pair) = pending.pop() {
+        match pair {
+            (PlutusData::Constr(a), PlutusData::Constr(b)) => {
+                if constr_index(a) != constr_index(b) || a.fields.len() != b.fields.len() {
+                    return false;
+                }
+
+                pending.extend(a.fields.iter().zip(b.fields.iter()).rev());
+            }
+            (PlutusData::Map(a), PlutusData::Map(b)) => {
+                if a.len() != b.len() {
+                    return false;
+                }
+
+                for ((ak, av), (bk, bv)) in a.iter().zip(b.iter()).rev() {
+                    pending.push((av, bv));
+                    pending.push((ak, bk));
+                }
+            }
+            (PlutusData::Array(a), PlutusData::Array(b)) => {
+                if a.len() != b.len() {
+                    return false;
+                }
+
+                pending.extend(a.iter().zip(b.iter()).rev());
+            }
+            (PlutusData::BoundedBytes(a), PlutusData::BoundedBytes(b)) => {
+                if a.deref() != b.deref() {
+                    return false;
+                }
+            }
+            (PlutusData::BigInt(a), PlutusData::BigInt(b)) => {
+                if from_pallas_bigint(a) != from_pallas_bigint(b) {
+                    return false;
+                }
+            }
+            _ => return false,
         }
-        (PlutusData::Map(a), PlutusData::Map(b)) => {
-            a.len() == b.len()
-                && a.iter().zip(b.iter()).all(|((ak, av), (bk, bv))| {
-                    plutus_data_structural_eq(ak, bk) && plutus_data_structural_eq(av, bv)
-                })
-        }
-        (PlutusData::Array(a), PlutusData::Array(b)) => {
-            a.len() == b.len()
-                && a.iter()
-                    .zip(b.iter())
-                    .all(|(x, y)| plutus_data_structural_eq(x, y))
-        }
-        (PlutusData::BoundedBytes(a), PlutusData::BoundedBytes(b)) => a.deref() == b.deref(),
-        (PlutusData::BigInt(a), PlutusData::BigInt(b)) => {
-            from_pallas_bigint(a) == from_pallas_bigint(b)
-        }
-        _ => false,
     }
+
+    true
 }
 
 /// The constructor index the ledger sees, whatever tag carried it.
