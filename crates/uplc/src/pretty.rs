@@ -49,6 +49,73 @@ fn render(doc: Builder<'_>) -> String {
         .join("\n")
 }
 
+/// The first lines of `term`'s text, laid out as by `Term::to_pretty`, up to and including the
+/// `limit`th, and whether more follow. Laying out stops there: the text of a term grows with the
+/// square of its depth, and only its beginning is wanted (see `redacted_pretty` in
+/// `machine/error.rs`).
+pub(crate) fn first_lines<'a, T: Binder<'a>>(term: &Term<T>, limit: usize) -> (Vec<String>, bool) {
+    /// Collects lines until the `limit`th is complete, then fails the write, which stops the
+    /// layout.
+    struct Lines {
+        lines: Vec<String>,
+        current: Vec<u8>,
+        limit: usize,
+    }
+
+    impl Lines {
+        fn finish_line(&mut self) {
+            let line = String::from_utf8_lossy(&self.current).into_owned();
+            self.current.clear();
+            // As in `render`.
+            self.lines.push(if line.chars().all(|c| c.is_whitespace()) {
+                String::new()
+            } else {
+                line
+            });
+        }
+    }
+
+    impl std::io::Write for Lines {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            for &byte in bytes {
+                if self.lines.len() >= self.limit {
+                    return Err(std::io::Error::other("enough lines"));
+                }
+
+                if byte == b'\n' {
+                    self.finish_line();
+                } else {
+                    self.current.push(byte);
+                }
+            }
+
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let arena = Arena::new();
+    let doc = arena.nil().append(term_doc(&arena, term));
+
+    let mut lines = Lines {
+        lines: Vec::new(),
+        current: Vec::new(),
+        limit,
+    };
+
+    // A term's text never ends with a newline, so a full `lines` means more text follows.
+    let more = doc.into_doc().render(80, &mut lines).is_err();
+
+    if !more && (!lines.current.is_empty() || lines.lines.is_empty()) {
+        lines.finish_line();
+    }
+
+    (lines.lines, more)
+}
+
 impl<'a, T> Program<T>
 where
     T: Binder<'a>,

@@ -18,7 +18,7 @@ pub enum Error {
     #[error(
         "cannot evaluate an open term:\n{:>13} {}",
         "Term",
-        indent(redacted(.0.to_pretty(), 10)),
+        indent(redacted_pretty(&.0, 10)),
     )]
     OpenTermEvaluated(Term<NamedDeBruijn>),
     #[error("the validator crashed / exited prematurely")]
@@ -43,7 +43,11 @@ pub enum Error {
         indent(redacted_debug(&.0, 10)),
     )]
     NonConstrScrutinized(Value),
-    #[error("Cases: {0:#?}\n\n are missing branch for constr:\n\n{1:#?}")]
+    #[error(
+        "Cases: {}\n\n are missing branch for constr:\n\n{}",
+        redacted_debug(&.0, 10),
+        redacted_debug(&.1, 10),
+    )]
     MissingCaseBranch(Vec<Term<NamedDeBruijn>>, Value),
     #[error("type mismatch\n{:>13} {0}\n{:>13} {1}", "Expected", "Got")]
     TypeMismatch(Type, Type),
@@ -249,6 +253,32 @@ fn redacted_debug(value: &impl fmt::Debug, max_rows: usize) -> String {
     s
 }
 
+/// `redacted(term.to_pretty(), max_rows)`, without laying out the rows it leaves out, for the same
+/// reason as `redacted_debug`: the text of a term grows with the square of its depth. When rows
+/// are left out, the last row is the closing bracket of the outermost form, the one the text
+/// starts with: a term whose text spans more than one line ends with it on a line of its own.
+fn redacted_pretty(term: &Term<NamedDeBruijn>, max_rows: usize) -> String {
+    let (lines, more) = crate::pretty::first_lines(term, max_rows + 1);
+
+    if !more {
+        return redacted(lines.join("\n"), max_rows);
+    }
+
+    let last_line = match lines.first().and_then(|first| first.chars().next()) {
+        Some('(') => ")",
+        Some('[') => "]",
+        _ => return redacted(term.to_pretty(), max_rows),
+    };
+
+    let mut s = lines
+        .into_iter()
+        .take(max_rows)
+        .collect::<Vec<_>>()
+        .join("\n");
+    s.push_str(&format!("\n    ...redacted...\n{last_line}"));
+    s
+}
+
 /// Collects what is written to it up to its `max_newlines`th newline, then fails that write and
 /// every later one.
 ///
@@ -300,7 +330,7 @@ fn indent(s: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, redacted, redacted_debug};
+    use super::{Error, redacted, redacted_debug, redacted_pretty};
     use crate::{
         ast::{Constant, NamedDeBruijn, Term, Type},
         machine::value::Value,
@@ -401,6 +431,125 @@ mod tests {
                 assert!(message.len() < 1_000, "{message}");
                 assert!(
                     message.ends_with("...redacted...\n              }"),
+                    "{message}"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn delays(depth: usize) -> Term<NamedDeBruijn> {
+        let mut term = Term::Constant {
+            value: Constant::Unit.into(),
+            uniq_id: 0,
+        };
+
+        for _ in 0..depth {
+            term = term.delay();
+        }
+
+        term
+    }
+
+    #[test]
+    fn redacted_pretty_shows_what_redacting_all_of_it_shows() {
+        let integers = Term::Constant {
+            value: Constant::ProtoList(
+                Type::Integer,
+                (0..60)
+                    .map(|i| Constant::Integer(i.into()).into())
+                    .collect(),
+            )
+            .into(),
+            uniq_id: 0,
+        };
+
+        let mut spine = var(1);
+        for _ in 0..30 {
+            spine = spine.apply(var(2));
+        }
+
+        let terms = vec![
+            var(1),
+            Term::Error { uniq_id: 0 },
+            delays(1),
+            delays(5),
+            delays(40),
+            spine,
+            integers.clone(),
+            Term::Constr {
+                tag: 3,
+                fields: vec![integers.clone(), delays(12), var(1)],
+                uniq_id: 0,
+            },
+            Term::Case {
+                constr: var(1).into(),
+                branches: vec![delays(9), integers],
+                uniq_id: 0,
+            },
+        ];
+
+        for max_rows in [0, 1, 2, 5, 10, 25, 1000] {
+            for term in &terms {
+                assert_eq!(
+                    redacted_pretty(term, max_rows),
+                    redacted(term.to_pretty(), max_rows),
+                    "{max_rows} rows of {}",
+                    term.to_pretty()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deep_failing_cases_and_open_terms_format_in_bounded_space() {
+        // All of `{:#?}` or `to_pretty` would be tens of gigabytes here.
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                // No branch for tag 5; the one branch there is, and the scrutinee, are deep.
+                let mut scrutinee = Term::Constr {
+                    tag: 5,
+                    fields: vec![],
+                    uniq_id: 0,
+                };
+                for _ in 0..100_000 {
+                    scrutinee = Term::Constr {
+                        tag: 5,
+                        fields: vec![scrutinee],
+                        uniq_id: 0,
+                    };
+                }
+
+                let program = crate::ast::Program {
+                    version: (1, 1, 0),
+                    term: Term::Case {
+                        constr: scrutinee.into(),
+                        branches: vec![delays(100_000)],
+                        uniq_id: 0,
+                    },
+                };
+
+                let result = program
+                    .eval_version_with_protocol(
+                        crate::machine::cost_model::ExBudget::max(),
+                        &pallas_primitives::conway::Language::PlutusV3,
+                        11,
+                    )
+                    .result();
+                let Err(error @ Error::MissingCaseBranch(..)) = result else {
+                    panic!("{result:?}")
+                };
+
+                let message = error.to_string();
+                assert!(message.len() < 2_000, "{message}");
+                assert!(message.contains("...redacted..."), "{message}");
+
+                let message = Error::OpenTermEvaluated(delays(100_000)).to_string();
+                assert!(message.len() < 1_000, "{message}");
+                assert!(
+                    message.ends_with("...redacted...\n              )"),
                     "{message}"
                 );
             })
