@@ -947,15 +947,19 @@ impl UntypedExpr {
         cst: uplc::ast::Constant,
         tipo: Rc<Type>,
     ) -> Result<Self, String> {
-        Self::reify_with(data_types, cst, tipo, |data_types, cst, tipo| match cst {
-            uplc::ast::Constant::Data(data) => UntypedExpr::do_reify_data(data_types, data, tipo),
+        // `Constant` has a manual `Drop`, so its fields cannot be moved out by pattern; they are
+        // cloned out of the borrow instead.
+        Self::reify_with(data_types, cst, tipo, |data_types, cst, tipo| match &cst {
+            uplc::ast::Constant::Data(data) => {
+                UntypedExpr::do_reify_data(data_types, data.clone(), tipo)
+            }
 
             uplc::ast::Constant::Integer(i) => {
-                UntypedExpr::do_reify_data(data_types, Data::integer(i), tipo)
+                UntypedExpr::do_reify_data(data_types, Data::integer(i.clone()), tipo)
             }
 
             uplc::ast::Constant::ByteString(bytes) => {
-                UntypedExpr::do_reify_data(data_types, Data::bytestring(bytes), tipo)
+                UntypedExpr::do_reify_data(data_types, Data::bytestring(bytes.clone()), tipo)
             }
 
             uplc::ast::Constant::ProtoList(_, args) => match tipo.deref() {
@@ -969,11 +973,11 @@ impl UntypedExpr {
                         Ok(UntypedExpr::List {
                             location: Span::empty(),
                             elements: args
-                                .into_iter()
+                                .iter()
                                 .map(|arg| {
                                     UntypedExpr::do_reify_constant(
                                         data_types,
-                                        Rc::unwrap_or_clone(arg),
+                                        arg.as_ref().clone(),
                                         inner.clone(),
                                     )
                                 })
@@ -990,12 +994,12 @@ impl UntypedExpr {
                 Type::Tuple { elems, .. } => Ok(UntypedExpr::Tuple {
                     location: Span::empty(),
                     elems: args
-                        .into_iter()
+                        .iter()
                         .zip(elems)
                         .map(|(arg, arg_type)| {
                             UntypedExpr::do_reify_constant(
                                 data_types,
-                                Rc::unwrap_or_clone(arg),
+                                arg.as_ref().clone(),
                                 arg_type.clone(),
                             )
                         })
@@ -1038,30 +1042,30 @@ impl UntypedExpr {
 
             uplc::ast::Constant::Bool(is_true) => Ok(UntypedExpr::Var {
                 location: Span::empty(),
-                name: if is_true { "True" } else { "False" }.to_string(),
+                name: if *is_true { "True" } else { "False" }.to_string(),
             }),
 
             uplc::ast::Constant::String(value) => Ok(UntypedExpr::String {
                 location: Span::empty(),
-                value,
+                value: value.clone(),
             }),
 
             uplc::ast::Constant::Bls12_381G1Element(pt) => Ok(UntypedExpr::CurvePoint {
                 location: Span::empty(),
-                point: Curve::Bls12_381(Bls12_381Point::G1(*pt)).into(),
+                point: Curve::Bls12_381(Bls12_381Point::G1(**pt)).into(),
                 preferred_format: ByteArrayFormatPreference::HexadecimalString,
             }),
 
             uplc::ast::Constant::Bls12_381G2Element(pt) => Ok(UntypedExpr::CurvePoint {
                 location: Span::empty(),
-                point: Curve::Bls12_381(Bls12_381Point::G2(*pt)).into(),
+                point: Curve::Bls12_381(Bls12_381Point::G2(**pt)).into(),
                 preferred_format: ByteArrayFormatPreference::HexadecimalString,
             }),
 
             uplc::ast::Constant::Bls12_381MlResult(ml) => {
                 let mut bytes = Vec::new();
 
-                bytes.extend((*ml).to_bendian());
+                bytes.extend(ml.to_bendian());
 
                 // NOTE: We don't actually have a syntax for representing MillerLoop results, so we
                 // just fake it as a constructor with a bytearray. Note also that the bytearray is
@@ -1089,7 +1093,7 @@ impl UntypedExpr {
             }
 
             uplc::ast::Constant::Value(value) => {
-                let value = Arc::new(value.into_entries());
+                let value = Arc::new(value.clone().into_entries());
                 let spans = ValueLiteralSpans::empty(value.as_ref());
 
                 Ok(UntypedExpr::Value {

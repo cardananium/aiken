@@ -23,6 +23,7 @@ use uplc::{
     ast::{Constant as UplcConstant, Data, Name, Term, Type as UplcType},
     builder::{CONSTR_FIELDS_EXPOSER, CONSTR_INDEX_EXPOSER},
     builtins::DefaultFunction,
+    global_uniq::next_uniq_id,
     machine::{runtime::Compressable, value::to_pallas_bigint},
 };
 
@@ -511,7 +512,7 @@ pub fn known_data_to_type(
         }
         Some(UplcType::Bls12_381MlResult) => panic!("ML Result not supported"),
         Some(UplcType::Array(_)) => panic!("Array not supported"),
-        Some(UplcType::Value) => Term::Builtin(DefaultFunction::UnValueData).apply(term),
+        Some(UplcType::Value) => Term::from(DefaultFunction::UnValueData).apply(term),
         Some(UplcType::Data) | None => {
             let list_decorator = lookup_data_type_by_tipo(data_types, field_type)
                 .map(|dt| {
@@ -551,7 +552,7 @@ pub fn unknown_data_to_type(
         }
         Some(UplcType::Bls12_381MlResult) => panic!("ML Result not supported"),
         Some(UplcType::Array(_)) => panic!("Array not supported"),
-        Some(UplcType::Value) => Term::Builtin(DefaultFunction::UnValueData).apply(term),
+        Some(UplcType::Value) => Term::from(DefaultFunction::UnValueData).apply(term),
         Some(UplcType::Pair(_, _)) => Term::tail_list()
             .apply(Term::tail_list().apply(Term::var("__list_data")))
             .delayed_choose_list(
@@ -560,13 +561,17 @@ pub fn unknown_data_to_type(
                     .apply(
                         Term::head_list().apply(Term::tail_list().apply(Term::var("__list_data"))),
                     ),
-                Term::Error,
+                Term::error(),
             )
             .lambda("__list_data")
             .apply(Term::unlist_data().apply(term)),
-        Some(UplcType::Bool) => Term::unwrap_bool_or(term, |result| result, &Term::Error.delay()),
+        Some(UplcType::Bool) => Term::unwrap_bool_or(term, |result| result, &Term::error().delay()),
         Some(UplcType::Unit) => term.as_var("val", |val| {
-            Term::Var(val).unwrap_void_or(|result| result, &Term::Error.delay())
+            Term::Var {
+                name: val,
+                uniq_id: next_uniq_id(),
+            }
+            .unwrap_void_or(|result| result, &Term::error().delay())
         }),
         Some(UplcType::Data) | None => {
             let list_decorator = lookup_data_type_by_tipo(data_types, field_type)
@@ -597,7 +602,7 @@ pub fn softcast_data_to_type_otherwise(
     otherwise_delayed: Term<Name>,
     data_types: &IndexMap<&DataTypeKey, &TypedDataType>,
 ) -> Term<Name> {
-    assert!(matches!(otherwise_delayed, Term::Var(_)));
+    assert!(matches!(otherwise_delayed, Term::Var { .. }));
 
     let uplc_type = field_type.get_uplc_type();
 
@@ -621,9 +626,15 @@ pub fn softcast_data_to_type_otherwise(
         }
 
         Some(UplcType::Value) => {
-            callback(Term::Builtin(DefaultFunction::UnValueData).apply(Term::Var(val)))
+            callback(Term::from(DefaultFunction::UnValueData).apply(Term::Var {
+                name: val,
+                uniq_id: next_uniq_id(),
+            }))
         }
-        Some(UplcType::Data) => callback(Term::Var(val)),
+        Some(UplcType::Data) => callback(Term::Var {
+            name: val,
+            uniq_id: next_uniq_id(),
+        }),
 
         Some(UplcType::Bls12_381MlResult) => {
             unreachable!("attempted to cast Data into Bls12_381MlResult?!")
@@ -692,6 +703,10 @@ pub fn convert_constants_to_data(constants: Vec<Rc<UplcConstant>>) -> Option<Vec
 }
 
 fn convert_constant_to_data(constant: &UplcConstant) -> Option<UplcConstant> {
+    constant_to_plutus_data(constant).map(UplcConstant::Data)
+}
+
+fn constant_to_plutus_data(constant: &UplcConstant) -> Option<PlutusData> {
     let data = match constant {
         UplcConstant::Integer(i) => PlutusData::BigInt(to_pallas_bigint(i)),
         UplcConstant::ByteString(b) => PlutusData::BoundedBytes(b.clone().into()),
@@ -705,12 +720,8 @@ fn convert_constant_to_data(constant: &UplcConstant) -> Option<UplcConstant> {
                         let UplcConstant::ProtoPair(_, _, left, right) = pair.as_ref() else {
                             return None;
                         };
-                        let UplcConstant::Data(left) = convert_constant_to_data(left)? else {
-                            return None;
-                        };
-                        let UplcConstant::Data(right) = convert_constant_to_data(right)? else {
-                            return None;
-                        };
+                        let left = constant_to_plutus_data(left)?;
+                        let right = constant_to_plutus_data(right)?;
                         Some((left, right))
                     })
                     .collect::<Option<Vec<_>>>()?;
@@ -719,24 +730,15 @@ fn convert_constant_to_data(constant: &UplcConstant) -> Option<UplcConstant> {
             } else {
                 let items = constants
                     .iter()
-                    .map(|constant| {
-                        let UplcConstant::Data(data) = convert_constant_to_data(constant)? else {
-                            return None;
-                        };
-                        Some(data)
-                    })
+                    .map(|constant| constant_to_plutus_data(constant))
                     .collect::<Option<Vec<_>>>()?;
 
                 Data::list(items)
             }
         }
         UplcConstant::ProtoPair(_, _, left, right) => {
-            let UplcConstant::Data(left) = convert_constant_to_data(left)? else {
-                return None;
-            };
-            let UplcConstant::Data(right) = convert_constant_to_data(right)? else {
-                return None;
-            };
+            let left = constant_to_plutus_data(left)?;
+            let right = constant_to_plutus_data(right)?;
 
             Data::list(vec![left, right])
         }
@@ -753,7 +755,7 @@ fn convert_constant_to_data(constant: &UplcConstant) -> Option<UplcConstant> {
         UplcConstant::Value(value) => value.to_data_checked().ok()?,
     };
 
-    Some(UplcConstant::Data(data))
+    Some(data)
 }
 
 pub fn convert_type_to_data(
@@ -775,7 +777,7 @@ pub fn convert_type_to_data(
         }
         Some(UplcType::Bls12_381MlResult) => panic!("ML Result not supported"),
         Some(UplcType::Array(_)) => panic!("Array not supported"),
-        Some(UplcType::Value) => Term::Builtin(DefaultFunction::ValueData).apply(term),
+        Some(UplcType::Value) => Term::from(DefaultFunction::ValueData).apply(term),
         Some(UplcType::Pair(_, _)) => Term::list_data()
             .apply(
                 Term::mk_cons()
@@ -788,12 +790,10 @@ pub fn convert_type_to_data(
             )
             .lambda("__pair")
             .apply(term),
-        Some(UplcType::Unit) => Term::Constant(UplcConstant::Data(Data::constr(0, vec![])).into())
-            .lambda("_")
-            .apply(term),
+        Some(UplcType::Unit) => Term::data(Data::constr(0, vec![])).lambda("_").apply(term),
         Some(UplcType::Bool) => term.if_then_else(
-            Term::Constant(UplcConstant::Data(Data::constr(1, vec![])).into()),
-            Term::Constant(UplcConstant::Data(Data::constr(0, vec![])).into()),
+            Term::data(Data::constr(1, vec![])),
+            Term::data(Data::constr(0, vec![])),
         ),
         Some(UplcType::Data) | None => {
             let list_decorator = lookup_data_type_by_tipo(data_types, field_type)
@@ -871,7 +871,7 @@ pub fn list_access_to_uplc(
                 .apply(Term::head_list().apply(Term::var(tail_name.to_string())))
         } else if matches!(expect_level, ExpectLevel::Full) {
             // Expect level is full so we have an unknown piece of data to cast
-            if otherwise_delayed == Term::Error.delay() {
+            if otherwise_delayed == Term::error().delay() {
                 then.lambda(name).apply(unknown_data_to_type(
                     Term::head_list().apply(Term::var(tail_name.to_string())),
                     &tipo.to_owned(),
@@ -936,7 +936,7 @@ pub fn list_access_to_uplc(
                                         head_item(name, tipo, &tail_name, acc),
                                     )
                                     .lambda(tail_name)
-                            } else if otherwise_delayed == Term::Error.delay() {
+                            } else if otherwise_delayed == Term::error().delay() {
                                 // Check head is last item in this list
                                 head_item(
                                     name,
@@ -944,7 +944,7 @@ pub fn list_access_to_uplc(
                                     &tail_name,
                                     Term::tail_list()
                                         .apply(Term::var(tail_name.to_string()))
-                                        .delayed_choose_list(acc, Term::Error),
+                                        .delayed_choose_list(acc, Term::error()),
                                 )
                                 .lambda(tail_name)
                             } else {
@@ -977,7 +977,7 @@ pub fn list_access_to_uplc(
                     // let head_item = head_item(name, tipo, &tail_name);
 
                     if matches!(expect_level, ExpectLevel::None)
-                        || otherwise_delayed == Term::Error.delay()
+                        || otherwise_delayed == Term::error().delay()
                     {
                         head_item(
                             name,
@@ -1229,11 +1229,13 @@ pub fn wrap_validator_condition(air_tree: AirTree, trace: TraceLevel) -> AirTree
 pub fn extract_constant(term: &Term<Name>) -> Option<Rc<UplcConstant>> {
     let mut constant = None;
 
-    if let Term::Constant(c) = term {
+    if let Term::Constant { value: c, .. } = term {
         constant = Some(c.clone());
-    } else if let Term::Apply { function, argument } = term
-        && let Term::Constant(c) = argument.as_ref()
-        && let Term::Builtin(b) = function.as_ref()
+    } else if let Term::Apply {
+        function, argument, ..
+    } = term
+        && let Term::Constant { value: c, .. } = argument.as_ref()
+        && let Term::Builtin { fun: b, .. } = function.as_ref()
         && matches!(
             b,
             DefaultFunction::BData

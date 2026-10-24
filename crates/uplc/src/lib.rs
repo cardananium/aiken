@@ -10,7 +10,7 @@ pub mod parser;
 mod pretty;
 pub mod tx;
 
-pub(crate) mod global_uniq;
+pub mod global_uniq;
 
 use pallas_codec::minicbor;
 pub use pallas_crypto::hash::Hash;

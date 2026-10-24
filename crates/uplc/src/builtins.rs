@@ -1,10 +1,14 @@
-use crate::machine::runtime::{
-    ALONZO_PROTOCOL_VERSION, CHANG_PROTOCOL_VERSION, PLOMIN_PROTOCOL_VERSION,
-    VALENTINE_PROTOCOL_VERSION, VAN_ROSSEM_PROTOCOL_VERSION, VASIL_PROTOCOL_VERSION,
+use crate::{
+    ast::Term,
+    global_uniq::next_uniq_id,
+    machine::runtime::{
+        ALONZO_PROTOCOL_VERSION, CHANG_PROTOCOL_VERSION, PLOMIN_PROTOCOL_VERSION,
+        VALENTINE_PROTOCOL_VERSION, VAN_ROSSEM_PROTOCOL_VERSION, VASIL_PROTOCOL_VERSION,
+    },
 };
 use pallas_codec::flat::de;
 use pallas_primitives::conway::Language;
-use std::{fmt::Display, str::FromStr};
+use std::{fmt::Display, rc::Rc, str::FromStr};
 use strum::EnumIter;
 
 /// All the possible builtin functions in Untyped Plutus Core.
@@ -877,5 +881,20 @@ impl DefaultFunction {
             // CaseData => "case_data",
         }
         .to_string()
+    }
+}
+
+impl<T> From<DefaultFunction> for Term<T> {
+    fn from(fun: DefaultFunction) -> Self {
+        Term::Builtin {
+            fun,
+            uniq_id: next_uniq_id(),
+        }
+    }
+}
+
+impl<T> From<DefaultFunction> for Rc<Term<T>> {
+    fn from(fun: DefaultFunction) -> Self {
+        Term::from(fun).into()
     }
 }

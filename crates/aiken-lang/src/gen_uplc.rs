@@ -60,6 +60,7 @@ use uplc::{
     ast::{Constant as UplcConstant, Name, NamedDeBruijn, Program, Term, Type as UplcType, Value},
     builder::{CONSTR_FIELDS_EXPOSER, CONSTR_INDEX_EXPOSER, EXPECT_ON_LIST},
     builtins::DefaultFunction,
+    global_uniq::next_uniq_id,
     machine::cost_model::ExBudget,
     optimize::{aiken_optimize_and_intern, interner::CodeGenInterner, shrinker::NO_INLINE},
 };
@@ -258,7 +259,10 @@ struct CachedConstant {
 
 impl CachedConstant {
     fn fresh_term(&self) -> Term<Name> {
-        Term::Constant(Rc::new(self.constant.deep_clone()))
+        Term::Constant {
+            value: Rc::new(self.constant.deep_clone()),
+            uniq_id: next_uniq_id(),
+        }
     }
 }
 
@@ -527,7 +531,7 @@ impl<'a> CodeGenerator<'a> {
                 } else {
                     self.special_functions.insert_new_function(
                         msg_func_name.clone(),
-                        Term::Error.delayed_trace(Term::string(msg)).delay(),
+                        Term::error().delayed_trace(Term::string(msg)).delay(),
                         Type::void(),
                     );
 
@@ -4010,7 +4014,10 @@ impl<'a> CodeGenerator<'a> {
                         )
                     });
 
-                Some(Term::Constant(UplcConstant::Value(value).into()))
+                Some(Term::Constant {
+                    value: UplcConstant::Value(value).into(),
+                    uniq_id: next_uniq_id(),
+                })
             }
             Air::Bool { value } => Some(Term::bool(value)),
             Air::CurvePoint { point, .. } => match point {
@@ -4022,13 +4029,14 @@ impl<'a> CodeGenerator<'a> {
                 constructor,
                 variant_name,
             } => match &constructor.variant {
-                ValueConstructorVariant::LocalVariable { .. } => Some(Term::Var(
-                    Name {
+                ValueConstructorVariant::LocalVariable { .. } => Some(Term::Var {
+                    name: Name {
                         text: name,
                         unique: 0.into(),
                     }
                     .into(),
-                )),
+                    uniq_id: next_uniq_id(),
+                }),
                 ValueConstructorVariant::ModuleConstant {
                     module,
                     name,
@@ -4114,7 +4122,10 @@ impl<'a> CodeGenerator<'a> {
                     // Only pure constant results are position-independent for
                     // certain; anything else (which shouldn't happen for a
                     // module constant) is recompiled per reference as before.
-                    if let Term::Constant(constant) = &term {
+                    if let Term::Constant {
+                        value: constant, ..
+                    } = &term
+                    {
                         let cached = CachedConstant {
                             constant: constant.as_ref().deep_clone(),
                             interner_delta: self.interner.counter() - interner_before,
@@ -4180,13 +4191,14 @@ impl<'a> CodeGenerator<'a> {
                             format!("{func_name}{variant_name}")
                         };
 
-                        Some(Term::Var(
-                            Name {
+                        Some(Term::Var {
+                            name: Name {
                                 text: name,
                                 unique: 0.into(),
                             }
                             .into(),
-                        ))
+                            uniq_id: next_uniq_id(),
+                        })
                     }
                 }
                 ValueConstructorVariant::Record {
@@ -4195,7 +4207,7 @@ impl<'a> CodeGenerator<'a> {
                     if constructor.tipo.is_bool() {
                         Some(Term::bool(constr_name == "True"))
                     } else if constructor.tipo.is_void() {
-                        Some(Term::Constant(UplcConstant::Unit.into()))
+                        Some(Term::unit())
                     } else if constructor.is_pair() {
                         let args = constructor.tipo.arg_types().unwrap();
                         let mut args = args.iter();
@@ -4292,7 +4304,7 @@ impl<'a> CodeGenerator<'a> {
                     }
                 }
             },
-            Air::Void => Some(Term::Constant(UplcConstant::Unit.into())),
+            Air::Void => Some(Term::unit()),
             Air::List { count, tipo, tail } => {
                 let mut args = vec![];
 
@@ -4326,8 +4338,8 @@ impl<'a> CodeGenerator<'a> {
                             builder::convert_constants_to_data(convert_keys),
                             builder::convert_constants_to_data(convert_values),
                         ) {
-                            (Some(convert_keys), Some(convert_values)) => Some(Term::Constant(
-                                UplcConstant::ProtoList(
+                            (Some(convert_keys), Some(convert_values)) => Some(Term::Constant {
+                                value: UplcConstant::ProtoList(
                                     UplcType::Pair(UplcType::Data.into(), UplcType::Data.into()),
                                     convert_keys
                                         .into_iter()
@@ -4343,18 +4355,20 @@ impl<'a> CodeGenerator<'a> {
                                         .collect_vec(),
                                 )
                                 .into(),
-                            )),
+                                uniq_id: next_uniq_id(),
+                            }),
                             _ => None,
                         }
                     } else {
                         builder::convert_constants_to_data(constants).map(|constants| {
-                            Term::Constant(
-                                UplcConstant::ProtoList(
+                            Term::Constant {
+                                value: UplcConstant::ProtoList(
                                     UplcType::Data,
                                     constants.into_iter().map(Rc::new).collect(),
                                 )
                                 .into(),
-                            )
+                                uniq_id: next_uniq_id(),
+                            }
                         })
                     }
                 } else {
@@ -4402,7 +4416,7 @@ impl<'a> CodeGenerator<'a> {
                 let otherwise = if matches!(expect_level, ExpectLevel::Full | ExpectLevel::Items) {
                     arg_stack.pop().unwrap()
                 } else {
-                    Term::Error.delay()
+                    Term::error().delay()
                 };
 
                 let list_id = self.id_gen.next();
@@ -4470,8 +4484,10 @@ impl<'a> CodeGenerator<'a> {
                 } else {
                     let term = arg_stack.pop().unwrap();
                     match term.pierce_no_inlines_ref() {
-                        Term::Var(_) => Some(term.force()),
-                        Term::Delay(inner_term) => Some(inner_term.as_ref().clone()),
+                        Term::Var { .. } => Some(term.force()),
+                        Term::Delay {
+                            body: inner_term, ..
+                        } => Some(inner_term.as_ref().clone()),
                         Term::Apply { .. } => Some(term.force()),
                         _ => unreachable!(
                             "Shouldn't call anything other than var or apply\n{:#?}",
@@ -4636,29 +4652,29 @@ impl<'a> CodeGenerator<'a> {
                             binop_eq
                         }
                     }
-                    BinOp::LtInt => Term::Builtin(DefaultFunction::LessThanInteger)
+                    BinOp::LtInt => Term::from(DefaultFunction::LessThanInteger)
                         .apply(left)
                         .apply(right),
-                    BinOp::LtEqInt => Term::Builtin(DefaultFunction::LessThanEqualsInteger)
+                    BinOp::LtEqInt => Term::from(DefaultFunction::LessThanEqualsInteger)
                         .apply(left)
                         .apply(right),
-                    BinOp::GtEqInt => Term::Builtin(DefaultFunction::LessThanEqualsInteger)
+                    BinOp::GtEqInt => Term::from(DefaultFunction::LessThanEqualsInteger)
                         .apply(right)
                         .apply(left),
-                    BinOp::GtInt => Term::Builtin(DefaultFunction::LessThanInteger)
+                    BinOp::GtInt => Term::from(DefaultFunction::LessThanInteger)
                         .apply(right)
                         .apply(left),
                     BinOp::AddInt => Term::add_integer().apply(left).apply(right),
-                    BinOp::SubInt => Term::Builtin(DefaultFunction::SubtractInteger)
+                    BinOp::SubInt => Term::from(DefaultFunction::SubtractInteger)
                         .apply(left)
                         .apply(right),
-                    BinOp::MultInt => Term::Builtin(DefaultFunction::MultiplyInteger)
+                    BinOp::MultInt => Term::from(DefaultFunction::MultiplyInteger)
                         .apply(left)
                         .apply(right),
-                    BinOp::DivInt => Term::Builtin(DefaultFunction::DivideInteger)
+                    BinOp::DivInt => Term::from(DefaultFunction::DivideInteger)
                         .apply(left)
                         .apply(right),
-                    BinOp::ModInt => Term::Builtin(DefaultFunction::ModInteger)
+                    BinOp::ModInt => Term::from(DefaultFunction::ModInteger)
                         .apply(left)
                         .apply(right),
                 };
@@ -4938,12 +4954,12 @@ impl<'a> CodeGenerator<'a> {
                 // Expected to be delayed
                 let term = arg_stack.pop().unwrap();
 
-                assert!(matches!(term, Term::Delay(_) | Term::Var(_)));
+                assert!(matches!(term, Term::Delay { .. } | Term::Var { .. }));
 
                 let other_clauses = term.clone();
 
                 let body = if tipo.is_bool() {
-                    if matches!(clause, Term::Constant(boolean) if matches!(boolean.as_ref(), UplcConstant::Bool(true)))
+                    if matches!(&clause, Term::Constant { value: boolean, .. } if matches!(boolean.as_ref(), UplcConstant::Bool(true)))
                     {
                         Term::var(subject_name)
                             .if_then_else(body.delay(), other_clauses)
@@ -5001,7 +5017,7 @@ impl<'a> CodeGenerator<'a> {
                 let body = arg_stack.pop().unwrap();
                 let mut term = arg_stack.pop().unwrap();
 
-                assert!(matches!(term, Term::Delay(_)));
+                assert!(matches!(term, Term::Delay { .. }));
 
                 term = if let Some((current_tail, next_tail_name)) = next_tail_name {
                     term.force()
@@ -5073,7 +5089,7 @@ impl<'a> CodeGenerator<'a> {
                 let otherwise = if is_expect {
                     arg_stack.pop().unwrap()
                 } else {
-                    Term::Error.delay()
+                    Term::error().delay()
                 };
 
                 let list_id = self.id_gen.next();
@@ -5160,14 +5176,13 @@ impl<'a> CodeGenerator<'a> {
                 }
 
                 let constant_tuple = if constants.len() == args.len() {
-                    builder::convert_constants_to_data(constants).map(|constants| {
-                        Term::Constant(
-                            UplcConstant::ProtoList(
-                                UplcType::Data,
-                                constants.into_iter().map(Rc::new).collect(),
-                            )
-                            .into(),
+                    builder::convert_constants_to_data(constants).map(|constants| Term::Constant {
+                        value: UplcConstant::ProtoList(
+                            UplcType::Data,
+                            constants.into_iter().map(Rc::new).collect(),
                         )
+                        .into(),
+                        uniq_id: next_uniq_id(),
                     })
                 } else {
                     None
@@ -5191,16 +5206,15 @@ impl<'a> CodeGenerator<'a> {
 
                 let constant_pair = match (extract_constant(&fst), extract_constant(&snd)) {
                     (Some(fst), Some(snd)) => builder::convert_constants_to_data(vec![fst, snd])
-                        .map(|mut pair_fields| {
-                            Term::Constant(
-                                UplcConstant::ProtoPair(
-                                    UplcType::Data,
-                                    UplcType::Data,
-                                    pair_fields.remove(0).into(),
-                                    pair_fields.remove(0).into(),
-                                )
-                                .into(),
+                        .map(|mut pair_fields| Term::Constant {
+                            value: UplcConstant::ProtoPair(
+                                UplcType::Data,
+                                UplcType::Data,
+                                pair_fields.remove(0).into(),
+                                pair_fields.remove(0).into(),
                             )
+                            .into(),
+                            uniq_id: next_uniq_id(),
                         }),
                     _ => None,
                 };
@@ -5338,7 +5352,7 @@ impl<'a> CodeGenerator<'a> {
                 let term = match op {
                     UnOp::Not => value.if_then_else(Term::bool(false), Term::bool(true)),
                     UnOp::Negate => {
-                        if let Term::Constant(c) = &value {
+                        if let Term::Constant { value: c, .. } = &value {
                             if let UplcConstant::Integer(i) = c.as_ref() {
                                 Term::integer(-i)
                             } else {
@@ -5368,7 +5382,7 @@ impl<'a> CodeGenerator<'a> {
                 let otherwise = if is_expect {
                     arg_stack.pop().unwrap()
                 } else {
-                    Term::Error.delay()
+                    Term::error().delay()
                 };
                 let list_id = self.id_gen.next();
 
@@ -5412,7 +5426,7 @@ impl<'a> CodeGenerator<'a> {
                 let otherwise = if is_expect {
                     arg_stack.pop().unwrap()
                 } else {
-                    Term::Error.delay()
+                    Term::error().delay()
                 };
 
                 let list_id = self.id_gen.next();
@@ -5420,7 +5434,7 @@ impl<'a> CodeGenerator<'a> {
                 if let Some(name) = snd {
                     let value = Term::snd_pair().apply(Term::var(format!("__pair_{list_id}")));
                     term = if is_expect {
-                        if otherwise == Term::Error.delay() {
+                        if otherwise == Term::error().delay() {
                             term.lambda(name).apply(unknown_data_to_type(
                                 value,
                                 &inner_types[1],
@@ -5448,7 +5462,7 @@ impl<'a> CodeGenerator<'a> {
                 if let Some(name) = fst {
                     let value = Term::fst_pair().apply(Term::var(format!("__pair_{list_id}")));
                     term = if is_expect {
-                        if otherwise == Term::Error.delay() {
+                        if otherwise == Term::error().delay() {
                             term.lambda(name).apply(unknown_data_to_type(
                                 value,
                                 &inner_types[0],
@@ -5488,9 +5502,9 @@ impl<'a> CodeGenerator<'a> {
             }
             Air::ErrorTerm { validator, .. } => {
                 if validator {
-                    Some(Term::Error.apply(Term::Error.force()))
+                    Some(Term::error().apply(Term::error().force()))
                 } else {
-                    Some(Term::Error)
+                    Some(Term::error())
                 }
             }
 
@@ -5500,7 +5514,7 @@ impl<'a> CodeGenerator<'a> {
                 let then = arg_stack.pop().unwrap();
                 let otherwise = arg_stack.pop().unwrap();
 
-                if otherwise == Term::Error.delay() {
+                if otherwise == Term::error().delay() {
                     Some(then.lambda(name).apply(unknown_data_to_type(
                         value,
                         &tipo,
@@ -5604,7 +5618,10 @@ mod tests {
 
         let program = generator.generate_raw(&expression, &[], "").unwrap();
 
-        let Term::Constant(constant) = program.term else {
+        let Term::Constant {
+            value: constant, ..
+        } = &program.term
+        else {
             panic!("Value literal did not lower to a direct UPLC constant")
         };
         let UplcConstant::Value(value) = constant.as_ref() else {
@@ -5724,17 +5741,25 @@ mod tests {
 
     fn contains_value_data(term: &Term<Name>) -> bool {
         match term {
-            Term::Builtin(DefaultFunction::ValueData) => true,
-            Term::Delay(term) | Term::Force(term) => contains_value_data(term),
+            Term::Builtin {
+                fun: DefaultFunction::ValueData,
+                ..
+            } => true,
+            Term::Delay { body: term, .. } | Term::Force { body: term, .. } => {
+                contains_value_data(term)
+            }
             Term::Lambda { body, .. } => contains_value_data(body),
-            Term::Apply { function, argument } => {
-                contains_value_data(function) || contains_value_data(argument)
-            }
+            Term::Apply {
+                function, argument, ..
+            } => contains_value_data(function) || contains_value_data(argument),
             Term::Constr { fields, .. } => fields.iter().any(contains_value_data),
-            Term::Case { constr, branches } => {
-                contains_value_data(constr) || branches.iter().any(contains_value_data)
-            }
-            Term::Var(_) | Term::Constant(_) | Term::Error | Term::Builtin(_) => false,
+            Term::Case {
+                constr, branches, ..
+            } => contains_value_data(constr) || branches.iter().any(contains_value_data),
+            Term::Var { .. }
+            | Term::Constant { .. }
+            | Term::Error { .. }
+            | Term::Builtin { .. } => false,
         }
     }
 
@@ -5760,16 +5785,16 @@ mod tests {
         let mut generator = empty_generator();
         let under_limit = value_data_term(&mut generator, uplc::ast::VALUE_DATA_MAX_SIZE - 1);
         assert!(matches!(
-            under_limit,
-            Term::Constant(constant)
+            &under_limit,
+            Term::Constant { value: constant, .. }
                 if matches!(constant.as_ref(), UplcConstant::Data(_))
         ));
 
         let legal = value_data_term(&mut generator, uplc::ast::VALUE_DATA_MAX_SIZE);
 
         assert!(matches!(
-            legal,
-            Term::Constant(constant)
+            &legal,
+            Term::Constant { value: constant, .. }
                 if matches!(constant.as_ref(), UplcConstant::Data(_))
         ));
 
@@ -5810,8 +5835,8 @@ mod tests {
             let legal = build_term(&mut generator, uplc::ast::VALUE_DATA_MAX_SIZE);
             assert!(
                 matches!(
-                    legal,
-                    Term::Constant(constant) if is_expected_constant(constant.as_ref())
+                    &legal,
+                    Term::Constant { value: constant, .. } if is_expected_constant(constant.as_ref())
                 ),
                 "{case}"
             );

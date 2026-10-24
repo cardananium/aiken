@@ -569,10 +569,7 @@ impl Benchmark {
         let mut size = 0;
 
         while error.is_none() && max_size >= size {
-            let fuzzer = self
-                .sampler
-                .program
-                .apply_term(&Term::Constant(Constant::Integer(size.into()).into()));
+            let fuzzer = self.sampler.program.apply_term(&Term::integer(size.into()));
 
             match prng.sample(&fuzzer) {
                 Ok(None) => {
@@ -768,7 +765,7 @@ impl Prng {
             unreachable!("malformed Prng: {cst:#?}")
         }
 
-        if let Term::Constant(rc) = &result
+        if let Term::Constant { value: rc, .. } = &result
             && let Constant::Data(PlutusData::Constr(Constr { tag, fields, .. })) = &rc.borrow()
         {
             if *tag == 121 + Prng::SOME
