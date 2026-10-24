@@ -21,7 +21,9 @@ use pallas_primitives::conway::Language;
 
 use self::{
     cost_model::CostModel,
-    runtime::{BuiltinRuntime, BuiltinSemantics},
+    runtime::{
+        BuiltinRuntime, BuiltinSemantics, CHANG_PROTOCOL_VERSION, VAN_ROSSEM_PROTOCOL_VERSION,
+    },
     value::{Env, Value},
 };
 
@@ -248,7 +250,16 @@ pub struct Machine {
     /// The protocol version builtin availability is judged against. A machine built without one
     /// follows the latest rules, under which every builtin is available.
     protocol_major_version: Option<u16>,
+    /// The version the program being run declares, when known: which versions the ledger accepts,
+    /// and whether `constr` and `case` may appear, depend on it (see `assert_available`).
+    program_version: Option<(usize, usize, usize)>,
 }
+
+/// The most fields a `constr` term may carry, from protocol version 11 on.
+const MAX_CONSTR_FIELDS: usize = 1024;
+
+/// The most type tags a constant's type may span, from protocol version 11 on.
+const MAX_TYPE_HEADER_TAGS: usize = 32;
 
 impl Machine {
     pub fn new(
@@ -269,6 +280,7 @@ impl Machine {
             semantics,
             language: version,
             protocol_major_version: None,
+            program_version: None,
         }
     }
 
@@ -292,6 +304,7 @@ impl Machine {
             semantics,
             language: version,
             protocol_major_version: Some(protocol_major_version),
+            program_version: None,
         }
     }
 
@@ -313,6 +326,7 @@ impl Machine {
             semantics,
             language: version,
             protocol_major_version: None,
+            program_version: None,
         }
     }
 
@@ -336,12 +350,21 @@ impl Machine {
             semantics,
             language: version,
             protocol_major_version: Some(protocol_major_version),
+            program_version: None,
         }
     }
 
     /// The builtin semantics variant this machine evaluates with.
     pub fn semantics(&self) -> BuiltinSemantics {
         self.semantics
+    }
+
+    /// Judge the programs this machine runs as declaring `version`. The ledger accepts only some
+    /// versions for each Plutus version and protocol version, and `constr` and `case` only in a
+    /// 1.1.0 program. A machine without a protocol version accepts every version.
+    pub fn with_program_version(mut self, version: (usize, usize, usize)) -> Self {
+        self.program_version = Some(version);
+        self
     }
 
     pub fn run(&mut self, term: Term<NamedDeBruijn>) -> Result<Term<NamedDeBruijn>, Error> {
@@ -404,10 +427,56 @@ impl Machine {
     /// whole-program well-formedness rule: occurrences in latent code (under
     /// lambdas, delays or untaken branches) are rejected too, so the entire
     /// term is validated up-front before evaluation starts.
+    ///
+    /// The other rules the ledger applies when it deserialises a script are checked here too:
+    ///
+    /// - the program's version: only 1.0.0 for Plutus V1 and V2 below protocol version 11
+    ///   (semantics A and B), 1.0.0 or 1.1.0 otherwise;
+    /// - `constr` and `case` terms, which need a 1.1.0 program, and protocol version 9 for
+    ///   Plutus V3, 11 for Plutus V1 and V2;
+    /// - from protocol version 11 (`maxBoundsByPV` in plutus-ledger-api), at most 1024 fields in
+    ///   a `constr` term, and at most 32 type tags in a constant's type.
+    ///
+    /// The rules that depend on the program's version apply when it is known (see
+    /// `with_program_version`).
     pub(crate) fn assert_available(&self, term: &Term<NamedDeBruijn>) -> Result<(), Error> {
+        let Some(protocol_major_version) = self.protocol_major_version else {
+            // The latest rules, under which every builtin and constant is available, and nothing
+            // is bounded.
+            return Ok(());
+        };
+
         let semantics = self.semantics;
 
-        if semantics.supports_values()
+        if let Some(version) = self.program_version {
+            let available = match semantics {
+                BuiltinSemantics::A | BuiltinSemantics::B => version == (1, 0, 0),
+                BuiltinSemantics::C | BuiltinSemantics::D | BuiltinSemantics::E => {
+                    version == (1, 0, 0) || version == (1, 1, 0)
+                }
+            };
+
+            if !available {
+                return Err(Error::ProgramVersionNotAvailable(
+                    version.0, version.1, version.2,
+                ));
+            }
+        }
+
+        let constr_case_available = match self.language {
+            Language::PlutusV1 | Language::PlutusV2 => {
+                protocol_major_version >= VAN_ROSSEM_PROTOCOL_VERSION
+            }
+            Language::PlutusV3 => protocol_major_version >= CHANG_PROTOCOL_VERSION,
+        } && self
+            .program_version
+            .is_none_or(|version| version >= (1, 1, 0));
+
+        let bounded = protocol_major_version >= VAN_ROSSEM_PROTOCOL_VERSION;
+
+        if !bounded
+            && constr_case_available
+            && semantics.supports_values()
             && semantics.supports_arrays()
             && DefaultFunction::iter().all(|fun| self.is_builtin_available(fun))
         {
@@ -437,6 +506,10 @@ impl Machine {
                     if !semantics.supports_arrays() && Constant::contains_array(constant) {
                         return Err(Error::ArrayConstantNotAvailable);
                     }
+
+                    if bounded && type_header_exceeds(constant, MAX_TYPE_HEADER_TAGS) {
+                        return Err(Error::TypeHeaderTooLong(MAX_TYPE_HEADER_TAGS));
+                    }
                 }
                 Term::Builtin { fun, .. } => {
                     if !self.is_builtin_available(*fun) {
@@ -444,11 +517,23 @@ impl Machine {
                     }
                 }
                 Term::Constr { fields, .. } => {
+                    if !constr_case_available {
+                        return Err(Error::ConstrCaseNotAvailable("constr"));
+                    }
+
+                    if bounded && fields.len() > MAX_CONSTR_FIELDS {
+                        return Err(Error::ConstrTooManyFields(fields.len(), MAX_CONSTR_FIELDS));
+                    }
+
                     stack.extend(fields.iter());
                 }
                 Term::Case {
                     constr, branches, ..
                 } => {
+                    if !constr_case_available {
+                        return Err(Error::ConstrCaseNotAvailable("case"));
+                    }
+
                     stack.push(constr.as_ref());
                     stack.extend(branches.iter());
                 }
@@ -908,6 +993,50 @@ fn transfer_arg_stack(mut args: Vec<Value>, mut ctx: Context) -> Context {
     ctx
 }
 
+/// Whether the type of `constant` spans more than `limit` type tags: one per type constructor and
+/// one per application, exactly the tags flat spells out (`list t` is `7 5 t`, `pair a b` is
+/// `7 7 6 a b`; plutus-core's `defaultUniSize`).
+///
+/// Counting stops past `limit`, so a type built with shared operands costs no more than a tree.
+fn type_header_exceeds(constant: &Constant, limit: usize) -> bool {
+    let mut tags: usize = 0;
+    let mut pending: Vec<&Type> = Vec::new();
+
+    match constant {
+        Constant::ProtoList(item, _) | Constant::ProtoArray(item, _) => {
+            tags += 2;
+            pending.push(item);
+        }
+        Constant::ProtoPair(first, second, _, _) => {
+            tags += 3;
+            pending.push(first);
+            pending.push(second);
+        }
+        _ => tags += 1,
+    }
+
+    while let Some(typ) = pending.pop() {
+        if tags > limit {
+            break;
+        }
+
+        match typ {
+            Type::List(item) | Type::Array(item) => {
+                tags += 2;
+                pending.push(item);
+            }
+            Type::Pair(first, second) => {
+                tags += 3;
+                pending.push(first);
+                pending.push(second);
+            }
+            _ => tags += 1,
+        }
+    }
+
+    tags > limit
+}
+
 impl From<&Constant> for Type {
     fn from(constant: &Constant) -> Self {
         match constant {
@@ -936,7 +1065,7 @@ mod tests {
     use std::rc::Rc;
 
     use super::{
-        Context, Error,
+        Context, Error, Machine,
         cost_model::{CostModel, ExBudget},
         runtime::{
             BuiltinSemantics, CHANG_PROTOCOL_VERSION, Compressable, VAN_ROSSEM_PROTOCOL_VERSION,
@@ -951,8 +1080,9 @@ mod tests {
 
     #[test]
     fn value_builtins_unavailable_before_van_rossem() {
+        // 1.0.0: the only version Plutus V1 and V2 programs may declare below protocol version 11.
         let program = |term: Term<NamedDeBruijn>| Program {
-            version: (1, 1, 0),
+            version: (1, 0, 0),
             term,
         };
 
@@ -1134,8 +1264,9 @@ mod tests {
 
     #[test]
     fn array_builtins_and_constants_unavailable_before_van_rossem() {
+        // 1.0.0: the only version Plutus V1 and V2 programs may declare below protocol version 11.
         let program = |term: Term<NamedDeBruijn>| Program {
-            version: (1, 1, 0),
+            version: (1, 0, 0),
             term,
         };
 
@@ -1357,6 +1488,203 @@ mod tests {
         }
     }
 
+    /// `term` as a program declaring `version`, evaluated for `language` at `protocol`.
+    fn run_as(
+        version: (usize, usize, usize),
+        language: Language,
+        protocol: u16,
+        term: Term<NamedDeBruijn>,
+    ) -> Result<Term<NamedDeBruijn>, Error> {
+        Program { version, term }
+            .eval_version_with_protocol(ExBudget::max(), &language, protocol)
+            .result()
+    }
+
+    #[test]
+    fn program_versions_follow_the_ledger() {
+        use Language::*;
+
+        // Semantics A and B: Plutus V1 and V2 below protocol version 11 take 1.0.0 only.
+        for (language, protocol) in [(PlutusV1, 8), (PlutusV2, 8), (PlutusV1, 9), (PlutusV2, 10)] {
+            assert!(run_as((1, 0, 0), language.clone(), protocol, unit()).is_ok());
+
+            for version in [(1, 1, 0), (0, 0, 0), (1, 0, 1), (2, 0, 0)] {
+                let result = run_as(version, language.clone(), protocol, unit());
+                assert!(
+                    matches!(result, Err(Error::ProgramVersionNotAvailable(..))),
+                    "{version:?} for {language:?} at {protocol}: {result:?}"
+                );
+            }
+        }
+
+        // Semantics C, D and E: 1.0.0 and 1.1.0.
+        for (language, protocol) in [
+            (PlutusV3, 9),
+            (PlutusV3, 10),
+            (PlutusV1, 11),
+            (PlutusV2, 11),
+            (PlutusV3, 11),
+        ] {
+            for version in [(1, 0, 0), (1, 1, 0)] {
+                assert!(run_as(version, language.clone(), protocol, unit()).is_ok());
+            }
+
+            for version in [(1, 2, 0), (1, 1, 1), (0, 0, 0), (2, 0, 0)] {
+                let result = run_as(version, language.clone(), protocol, unit());
+                assert!(
+                    matches!(result, Err(Error::ProgramVersionNotAvailable(..))),
+                    "{version:?} for {language:?} at {protocol}: {result:?}"
+                );
+            }
+        }
+
+        // The same with an explicit cost model.
+        let result = Program {
+            version: (1, 1, 0),
+            term: unit(),
+        }
+        .eval_as_with_protocol(&PlutusV2, 10, &[], None)
+        .result();
+        assert!(matches!(
+            result,
+            Err(Error::ProgramVersionNotAvailable(1, 1, 0))
+        ));
+
+        // Without a protocol version, any version.
+        let result = Program {
+            version: (0, 0, 0),
+            term: unit(),
+        }
+        .eval_version(ExBudget::max(), &PlutusV2)
+        .result();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn constr_and_case_follow_the_ledger() {
+        use Language::*;
+
+        let constr = || Term::Constr {
+            tag: 0,
+            fields: vec![],
+            uniq_id: 0,
+        };
+        let case = || Term::Case {
+            constr: constr().into(),
+            branches: vec![unit()],
+            uniq_id: 0,
+        };
+        // Latent occurrences count too.
+        let latent = || lambda(case());
+
+        fn refused(term: &str, result: Result<Term<NamedDeBruijn>, Error>) -> bool {
+            matches!(result, Err(Error::ConstrCaseNotAvailable(t)) if t == term)
+        }
+
+        // Plutus V3 from protocol version 9, Plutus V1 and V2 from 11, in a 1.1.0 program.
+        for (language, protocol) in [(PlutusV3, 9), (PlutusV1, 11), (PlutusV2, 11)] {
+            for term in [constr(), case(), latent()] {
+                let result = run_as((1, 1, 0), language.clone(), protocol, term);
+                assert!(result.is_ok(), "{language:?} at {protocol}: {result:?}");
+            }
+
+            assert!(refused(
+                "constr",
+                run_as((1, 0, 0), language.clone(), protocol, constr())
+            ));
+            assert!(refused(
+                "case",
+                run_as((1, 0, 0), language.clone(), protocol, latent())
+            ));
+        }
+
+        assert!(refused("constr", run_as((1, 1, 0), PlutusV3, 8, constr())));
+        assert!(refused("case", run_as((1, 0, 0), PlutusV2, 10, case())));
+
+        // A program of unknown version: the protocol version alone decides.
+        let run = |language: Language, protocol, term| {
+            Machine::new_with_protocol(
+                language,
+                protocol,
+                CostModel::default(),
+                ExBudget::max(),
+                200,
+            )
+            .run(term)
+        };
+
+        assert!(run(PlutusV3, 9, case()).is_ok());
+        assert!(run(PlutusV2, 11, case()).is_ok());
+        assert!(refused("case", run(PlutusV2, 10, latent())));
+    }
+
+    #[test]
+    fn constr_fields_are_bounded_from_protocol_11() {
+        let constr = |fields: usize| Term::Constr {
+            tag: 0,
+            fields: vec![unit(); fields],
+            uniq_id: 0,
+        };
+
+        assert!(run_as((1, 1, 0), Language::PlutusV3, 11, constr(1024)).is_ok());
+        assert!(matches!(
+            run_as((1, 1, 0), Language::PlutusV3, 11, lambda(constr(1025))),
+            Err(Error::ConstrTooManyFields(1025, 1024))
+        ));
+        assert!(run_as((1, 1, 0), Language::PlutusV3, 10, constr(1025)).is_ok());
+    }
+
+    #[test]
+    fn type_headers_are_bounded_from_protocol_11() {
+        // `list (list ... integer)`, `depth` lists deep: 2 * depth + 1 tags. Every type spans an
+        // odd number of tags, so 31 is the largest within the bound and 33 the smallest past it.
+        let lists = |depth: usize| {
+            let mut typ = Type::Integer;
+            for _ in 0..depth {
+                typ = Type::List(typ.into());
+            }
+            typ
+        };
+        let empty_list = |depth: usize| Term::Constant {
+            value: Constant::ProtoList(lists(depth - 1), vec![]).into(),
+            uniq_id: 0,
+        };
+        // `pair integer (list ... integer)`: 3 + 1 + (2 * depth + 1) tags.
+        let pair = |depth: usize| Term::Constant {
+            value: Constant::ProtoPair(
+                Type::Integer,
+                lists(depth),
+                Rc::new(Constant::Integer(1.into())),
+                Rc::new(Constant::ProtoList(lists(depth - 1), vec![])),
+            )
+            .into(),
+            uniq_id: 0,
+        };
+
+        for (within, past) in [(empty_list(15), empty_list(16)), (pair(13), pair(14))] {
+            assert!(run_as((1, 0, 0), Language::PlutusV3, 11, within).is_ok());
+            assert!(matches!(
+                run_as((1, 0, 0), Language::PlutusV3, 11, lambda(past.clone())),
+                Err(Error::TypeHeaderTooLong(32))
+            ));
+            assert!(run_as((1, 0, 0), Language::PlutusV3, 10, past).is_ok());
+        }
+
+        // A type of shared operands is a tree of 2^64 tags; counting stops at the bound.
+        let mut shared = Rc::new(Type::Integer);
+        for _ in 0..64 {
+            shared = Rc::new(Type::Pair(Rc::clone(&shared), shared));
+        }
+        let huge = Term::Constant {
+            value: Constant::ProtoList(shared.as_ref().clone(), vec![]).into(),
+            uniq_id: 0,
+        };
+        assert!(matches!(
+            run_as((1, 0, 0), Language::PlutusV3, 11, huge),
+            Err(Error::TypeHeaderTooLong(32))
+        ));
+    }
+
     /// The deep programs below each evaluate to a value as deep as the program: discharging it back
     /// into a term, cloning and comparing it all follow that depth. Every one is built with a loop.
     fn deep_results() -> Vec<(&'static str, Term<NamedDeBruijn>)> {
@@ -1442,7 +1770,8 @@ mod tests {
     fn wide_case_scrutinees_do_not_grow_the_stack() {
         // `case (constr 0 [() x WIDE]) [lam x (lam x ... (con unit ()))]`: the scrutinee's fields
         // all go onto the control stack at once. Every application copies the environment, so the
-        // width is kept moderate and the stack small instead.
+        // width is kept moderate and the stack small instead. Protocol version 10, as from 11 on
+        // the ledger allows no more than 1024 fields.
         const WIDE: usize = 10_000;
 
         let result = std::thread::Builder::new()
@@ -1468,7 +1797,7 @@ mod tests {
                 };
 
                 let result = program
-                    .eval_version_with_protocol(ExBudget::max(), &Language::PlutusV3, 11)
+                    .eval_version_with_protocol(ExBudget::max(), &Language::PlutusV3, 10)
                     .result();
                 matches!(result, Ok(Term::Constant { .. }))
             })

@@ -150,6 +150,14 @@ pub enum Error {
     ValueConstantNotAvailable,
     #[error("array constants are not available in this plutus / protocol version")]
     ArrayConstantNotAvailable,
+    #[error("program version {0}.{1}.{2} is not available in this plutus / protocol version")]
+    ProgramVersionNotAvailable(usize, usize, usize),
+    #[error("{0} terms are not available in this plutus / protocol / program version")]
+    ConstrCaseNotAvailable(&'static str),
+    #[error("a constr term carries {0} fields, but at most {1} are allowed")]
+    ConstrTooManyFields(usize, usize),
+    #[error("a constant's type spans more than {0} type tags")]
+    TypeHeaderTooLong(usize),
     #[error("{0} is not within the bounds of a Natural")]
     OutsideNaturalBounds(BigInt),
     #[error("{0} is not within the bounds of a Byte")]

@@ -2717,7 +2717,8 @@ impl Program<NamedDeBruijn> {
             CostModel::default_for_language_and_protocol(version, protocol_major_version),
             initial_budget,
             200,
-        );
+        )
+        .with_program_version(self.version);
 
         let term = machine.run(self.term);
 
@@ -2773,7 +2774,8 @@ impl Program<NamedDeBruijn> {
             initialize_cost_model_with_protocol(version, protocol_major_version, costs),
             budget,
             200, //slippage
-        );
+        )
+        .with_program_version(self.version);
 
         let term = machine.run(self.term);
 

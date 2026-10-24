@@ -7,6 +7,7 @@ use std::{
 use uplc::{
     ast::{Name, NamedDeBruijn, Program, Term},
     machine::{
+        Machine,
         cost_model::{ExBudget, initialize_cost_model_with_protocol},
         runtime::{CHANG_PROTOCOL_VERSION, VAN_ROSSEM_PROTOCOL_VERSION},
     },
@@ -159,11 +160,23 @@ fn actual_evaluation_result(
         }
     };
 
+    // The cases test evaluation, as plutus-conformance runs them: by the evaluator alone, without
+    // the rules the ledger applies to the scripts it deserialises (which versions a program may
+    // declare, among others; many fixtures here declare 0.0.0). Those are tested on their own,
+    // and the parity test below runs every case through both machines with them.
     let version = program.version;
-    let eval = program.eval_as_with_protocol(language, protocol_major_version, costs, None);
-    let cost = eval.cost();
+    let budget = ExBudget::default();
+    let mut machine = Machine::new_with_protocol(
+        language.clone(),
+        protocol_major_version,
+        initialize_cost_model_with_protocol(language, protocol_major_version, costs),
+        budget,
+        200,
+    );
+    let result = machine.run(program.term);
+    let cost = budget - machine.ex_budget;
 
-    match eval.result() {
+    match result {
         Ok(term) => ConformanceResult {
             result: Ok(Program { version, term }),
             budget: Ok(cost),
@@ -297,14 +310,17 @@ fn manual_outcome(
     let budget = ExBudget::default();
     let cost_model = initialize_cost_model_with_protocol(language, protocol_major_version, costs);
 
-    let mut machine = match ManualMachine::new_debug_with_protocol(
+    // With the program's version, as `Program::eval_as_with_protocol` runs it.
+    let machine = Machine::new_debug_with_protocol(
         language.clone(),
         protocol_major_version,
         cost_model,
         budget,
         200,
-        program.term,
-    ) {
+    )
+    .with_program_version(program.version);
+
+    let mut machine = match ManualMachine::from_machine(machine, program.term) {
         Ok(machine) => machine,
         Err(error) => {
             // Refused before the first step, as `Machine::run` would be; only the error is
