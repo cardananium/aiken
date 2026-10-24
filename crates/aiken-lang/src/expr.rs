@@ -18,7 +18,7 @@ use indexmap::IndexMap;
 use pallas_primitives::alonzo::{Constr, PlutusData};
 use std::{fmt::Debug, ops::Deref, rc::Rc, sync::Arc};
 use uplc::{
-    BigInt, KeyValuePairs,
+    BigInt,
     ast::{Data, ValueEntries},
     machine::{runtime::convert_tag_to_constr, value::from_pallas_bigint},
 };
@@ -1106,8 +1106,10 @@ impl UntypedExpr {
     }
 
     fn reify_blind(data: PlutusData) -> Self {
-        match data {
-            PlutusData::BigInt(ref i) => UntypedExpr::UInt {
+        // `PlutusData` can carry a manual `Drop` (the iterative one of a stack-safe pallas), so its
+        // parts are read through a borrow rather than moved out by pattern.
+        match &data {
+            PlutusData::BigInt(i) => UntypedExpr::UInt {
                 location: Span::empty(),
                 base: Base::Decimal {
                     numeric_underscore: false,
@@ -1116,7 +1118,7 @@ impl UntypedExpr {
             },
 
             PlutusData::BoundedBytes(bytes) => {
-                let bytes: Vec<u8> = bytes.into();
+                let bytes: Vec<u8> = bytes.to_vec();
 
                 UntypedExpr::ByteArray {
                     location: Span::empty(),
@@ -1128,43 +1130,36 @@ impl UntypedExpr {
             PlutusData::Array(elems) => UntypedExpr::List {
                 location: Span::empty(),
                 elements: elems
-                    .to_vec()
-                    .into_iter()
+                    .iter()
+                    .cloned()
                     .map(UntypedExpr::reify_blind)
                     .collect::<Vec<_>>(),
                 tail: None,
             },
 
-            PlutusData::Map(indef_or_def) => {
-                let kvs = match indef_or_def {
-                    KeyValuePairs::Def(kvs) => kvs,
-                    KeyValuePairs::Indef(kvs) => kvs,
-                };
-
-                UntypedExpr::List {
-                    location: Span::empty(),
-                    elements: kvs
-                        .into_iter()
-                        .map(|(k, v)| UntypedExpr::Pair {
-                            location: Span::empty(),
-                            fst: UntypedExpr::reify_blind(k).into(),
-                            snd: UntypedExpr::reify_blind(v).into(),
-                        })
-                        .collect::<Vec<_>>(),
-                    tail: None,
-                }
-            }
+            PlutusData::Map(kvs) => UntypedExpr::List {
+                location: Span::empty(),
+                elements: kvs
+                    .iter()
+                    .map(|(k, v)| UntypedExpr::Pair {
+                        location: Span::empty(),
+                        fst: UntypedExpr::reify_blind(k.clone()).into(),
+                        snd: UntypedExpr::reify_blind(v.clone()).into(),
+                    })
+                    .collect::<Vec<_>>(),
+                tail: None,
+            },
 
             PlutusData::Constr(Constr {
                 tag,
                 any_constructor,
                 fields,
             }) => {
-                let ix = convert_tag_to_constr(tag).or(any_constructor).unwrap() as usize;
+                let ix = convert_tag_to_constr(*tag).or(*any_constructor).unwrap() as usize;
 
                 let fields = fields
-                    .to_vec()
-                    .into_iter()
+                    .iter()
+                    .cloned()
                     .map(|field| CallArg {
                         location: Span::empty(),
                         label: None,
@@ -1216,8 +1211,9 @@ impl UntypedExpr {
             data_types,
             data,
             tipo,
-            |data_types, data, tipo| match data {
-                PlutusData::BigInt(ref i) => Ok(UntypedExpr::UInt {
+            // Read through a borrow, as in `reify_blind`.
+            |data_types, data, tipo| match &data {
+                PlutusData::BigInt(i) => Ok(UntypedExpr::UInt {
                     location: Span::empty(),
                     base: Base::Decimal {
                         numeric_underscore: false,
@@ -1232,7 +1228,7 @@ impl UntypedExpr {
                             value: String::from_utf8(bytes.to_vec()).expect("invalid UTF-8 string"),
                         })
                     } else {
-                        let bytes: Vec<u8> = bytes.into();
+                        let bytes: Vec<u8> = bytes.to_vec();
                         Ok(UntypedExpr::ByteArray {
                             location: Span::empty(),
                             bytes: bytes.into_iter().map(|b| (b, Span::empty())).collect(),
@@ -1252,8 +1248,8 @@ impl UntypedExpr {
                             Ok(UntypedExpr::List {
                                 location: Span::empty(),
                                 elements: args
-                                    .to_vec()
-                                    .into_iter()
+                                    .iter()
+                                    .cloned()
                                     .map(|arg| {
                                         UntypedExpr::do_reify_data(data_types, arg, inner.clone())
                                     })
@@ -1276,8 +1272,8 @@ impl UntypedExpr {
                         Ok(UntypedExpr::List {
                             location: Span::empty(),
                             elements: args
-                                .to_vec()
-                                .into_iter()
+                                .iter()
+                                .cloned()
                                 .map(|arg| {
                                     UntypedExpr::do_reify_data(
                                         data_types,
@@ -1295,8 +1291,8 @@ impl UntypedExpr {
                     Type::Tuple { elems, .. } => Ok(UntypedExpr::Tuple {
                         location: Span::empty(),
                         elems: args
-                            .to_vec()
-                            .into_iter()
+                            .iter()
+                            .cloned()
                             .zip(elems)
                             .map(|(arg, arg_type)| {
                                 UntypedExpr::do_reify_data(data_types, arg, arg_type.clone())
@@ -1305,8 +1301,8 @@ impl UntypedExpr {
                     }),
                     Type::Pair { fst, snd, .. } => {
                         let mut elems = args
-                            .to_vec()
-                            .into_iter()
+                            .iter()
+                            .cloned()
                             .zip([fst, snd])
                             .map(|(arg, arg_type)| {
                                 UntypedExpr::do_reify_data(data_types, arg, arg_type.clone())
@@ -1329,7 +1325,7 @@ impl UntypedExpr {
                     any_constructor,
                     fields,
                 }) => {
-                    let ix = convert_tag_to_constr(tag).or(any_constructor).unwrap() as usize;
+                    let ix = convert_tag_to_constr(*tag).or(*any_constructor).unwrap() as usize;
 
                     if let Type::App { args, .. } = tipo.deref()
                         && let Some(DataType {
@@ -1365,8 +1361,8 @@ impl UntypedExpr {
                             })
                         } else {
                             let arguments = fields
-                                .to_vec()
-                                .into_iter()
+                                .iter()
+                                .cloned()
                                 .zip(constructor.arguments.iter())
                                 .map(|(field, RecordConstructorArg { label, tipo, .. })| {
                                     let mut tipo = tipo;
@@ -1416,9 +1412,8 @@ impl UntypedExpr {
                     UntypedExpr::do_reify_data(
                         data_types,
                         Data::list(
-                            kvs.to_vec()
-                                .into_iter()
-                                .map(|(k, v)| Data::list(vec![k, v]))
+                            kvs.iter()
+                                .map(|(k, v)| Data::list(vec![k.clone(), v.clone()]))
                                 .collect(),
                         ),
                         tipo,

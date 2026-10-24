@@ -342,7 +342,7 @@ fn expect_data_map(term: &Constant) -> Result<Vec<(Constant, Constant)>, Error> 
 
 fn expect_data_constr(term: &Constant, index: usize) -> Result<Vec<Constant>, Error> {
     if let Constant::Data(PlutusData::Constr(constr)) = term
-        && let PlutusData::Constr(expected) = UplcData::constr(index as u64, vec![])
+        && let PlutusData::Constr(expected) = &UplcData::constr(index as u64, vec![])
         && expected.tag == constr.tag
         && expected.any_constructor == constr.any_constructor
     {

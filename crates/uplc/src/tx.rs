@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    PlutusData,
+    MaybeIndefArray, PlutusData,
     ast::{DeBruijn, Program},
     machine::{cost_model::ExBudget, eval_result::EvalResult},
 };
@@ -346,9 +346,14 @@ pub fn apply_params_to_script(
     params_bytes: &[u8], // PlutusData array
     plutus_script_bytes: &[u8],
 ) -> Result<Vec<u8>, Error> {
-    let params = match PlutusData::decode_fragment(params_bytes) {
-        Ok(PlutusData::Array(res)) => res,
-        Ok(_) | Err(_) => return Err(Error::ApplyParamsError),
+    let mut params =
+        PlutusData::decode_fragment(params_bytes).map_err(|_| Error::ApplyParamsError)?;
+
+    // Plutus Data can carry a manual `Drop` (the iterative one of a stack-safe pallas), so the
+    // items are taken out of the array through a borrow rather than moved out by pattern.
+    let params = match &mut params {
+        PlutusData::Array(items) => std::mem::replace(items, MaybeIndefArray::Def(vec![])),
+        _ => return Err(Error::ApplyParamsError),
     };
 
     let mut buffer = Vec::new();
