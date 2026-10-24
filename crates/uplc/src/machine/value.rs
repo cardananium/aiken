@@ -5,15 +5,15 @@ use super::{
 use crate::{
     ast::{Constant, NamedDeBruijn, Term, Type},
     builtins::DefaultFunction,
+    debug::{self, Item},
 };
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive, Zero};
 use pallas_primitives::conway::{self, PlutusData};
-use std::{collections::VecDeque, mem, mem::size_of, ops::Deref, rc::Rc};
+use std::{collections::VecDeque, fmt, mem, mem::size_of, ops::Deref, rc::Rc};
 
 pub type Env = Rc<Vec<Value>>;
 
-#[derive(Debug)]
 pub enum Value {
     Con(Rc<Constant>),
     Delay {
@@ -97,6 +97,76 @@ fn detach_env(slot: &mut Env, pending: &mut Vec<Value>, filler: &mut Option<Env>
 
     if let Ok(mut env) = Rc::try_unwrap(mem::replace(slot, Rc::clone(filler))) {
         pending.append(&mut env);
+    }
+}
+
+/// The derived format, `{:?}` and `{:#?}` alike, written without recursion (see `debug.rs`):
+/// values nest through `Constr` fields, builtin arguments and closure environments.
+impl fmt::Debug for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn values(values: &[Value]) -> Item<'_, Value> {
+            Item::List(values.iter().map(Item::Node).collect())
+        }
+
+        debug::write(self, f, |value| match value {
+            Value::Con(constant) => Item::Tuple("Con", vec![Item::Leaf(constant)]),
+            Value::Delay { body, env, term_id } => Item::Struct(
+                "Delay",
+                vec![
+                    ("body", Item::Leaf(body)),
+                    ("env", values(env)),
+                    ("term_id", Item::Leaf(term_id)),
+                ],
+            ),
+            Value::Lambda {
+                parameter_name,
+                body,
+                env,
+                term_id,
+            } => Item::Struct(
+                "Lambda",
+                vec![
+                    ("parameter_name", Item::Leaf(parameter_name)),
+                    ("body", Item::Leaf(body)),
+                    ("env", values(env)),
+                    ("term_id", Item::Leaf(term_id)),
+                ],
+            ),
+            Value::Builtin {
+                fun,
+                runtime,
+                term_id,
+            } => Item::Struct(
+                "Builtin",
+                vec![
+                    ("fun", Item::Leaf(fun)),
+                    (
+                        "runtime",
+                        Item::Struct(
+                            "BuiltinRuntime",
+                            vec![
+                                ("args", values(&runtime.args)),
+                                ("fun", Item::Leaf(&runtime.fun)),
+                                ("forces", Item::Leaf(&runtime.forces)),
+                            ],
+                        ),
+                    ),
+                    ("term_id", Item::Leaf(term_id)),
+                ],
+            ),
+            Value::Constr {
+                tag,
+                fields,
+                term_id,
+            } => Item::Struct(
+                "Constr",
+                vec![
+                    ("tag", Item::Leaf(tag)),
+                    ("fields", values(fields)),
+                    ("term_id", Item::Leaf(term_id)),
+                ],
+            ),
+        })
     }
 }
 

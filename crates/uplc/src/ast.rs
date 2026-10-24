@@ -1,6 +1,7 @@
 use crate::{
     builtins::DefaultFunction,
     debruijn::{self, Converter},
+    debug::{self, Item},
     flat::Binder,
     machine::{
         Machine,
@@ -306,7 +307,6 @@ impl Program<DeBruijn> {
 /// Specifically, `Var` and `parameter_name` in `Lambda` can be a `Name`,
 /// `NamedDebruijn`, or `DeBruijn`. When encoded to flat for on chain usage
 /// we must encode using the `DeBruijn` form.
-#[derive(Debug)]
 pub enum Term<T> {
     // tag: 0
     Var {
@@ -597,6 +597,94 @@ impl<T> Clone for Term<T> {
         }
 
         copies.pop().expect("the copy of the root")
+    }
+}
+
+/// The derived format, `{:?}` and `{:#?}` alike, written without recursion (see `debug.rs`).
+impl<T: fmt::Debug> fmt::Debug for Term<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        debug::write(self, f, |term| match term {
+            Term::Var { name, uniq_id } => Item::Struct(
+                "Var",
+                vec![("name", Item::Leaf(name)), ("uniq_id", Item::Leaf(uniq_id))],
+            ),
+            Term::Delay { body, uniq_id } => Item::Struct(
+                "Delay",
+                vec![("body", Item::Node(body)), ("uniq_id", Item::Leaf(uniq_id))],
+            ),
+            Term::Lambda {
+                parameter_name,
+                body,
+                uniq_id,
+            } => Item::Struct(
+                "Lambda",
+                vec![
+                    ("parameter_name", Item::Leaf(parameter_name)),
+                    ("body", Item::Node(body)),
+                    ("uniq_id", Item::Leaf(uniq_id)),
+                ],
+            ),
+            Term::Apply {
+                function,
+                argument,
+                uniq_id,
+            } => Item::Struct(
+                "Apply",
+                vec![
+                    ("function", Item::Node(function)),
+                    ("argument", Item::Node(argument)),
+                    ("uniq_id", Item::Leaf(uniq_id)),
+                ],
+            ),
+            Term::Constant { value, uniq_id } => Item::Struct(
+                "Constant",
+                vec![
+                    ("value", Item::Leaf(value)),
+                    ("uniq_id", Item::Leaf(uniq_id)),
+                ],
+            ),
+            Term::Force { body, uniq_id } => Item::Struct(
+                "Force",
+                vec![("body", Item::Node(body)), ("uniq_id", Item::Leaf(uniq_id))],
+            ),
+            Term::Error { uniq_id } => {
+                Item::Struct("Error", vec![("uniq_id", Item::Leaf(uniq_id))])
+            }
+            Term::Builtin { fun, uniq_id } => Item::Struct(
+                "Builtin",
+                vec![("fun", Item::Leaf(fun)), ("uniq_id", Item::Leaf(uniq_id))],
+            ),
+            Term::Constr {
+                tag,
+                fields,
+                uniq_id,
+            } => Item::Struct(
+                "Constr",
+                vec![
+                    ("tag", Item::Leaf(tag)),
+                    (
+                        "fields",
+                        Item::List(fields.iter().map(Item::Node).collect()),
+                    ),
+                    ("uniq_id", Item::Leaf(uniq_id)),
+                ],
+            ),
+            Term::Case {
+                constr,
+                branches,
+                uniq_id,
+            } => Item::Struct(
+                "Case",
+                vec![
+                    ("constr", Item::Node(constr)),
+                    (
+                        "branches",
+                        Item::List(branches.iter().map(Item::Node).collect()),
+                    ),
+                    ("uniq_id", Item::Leaf(uniq_id)),
+                ],
+            ),
+        })
     }
 }
 
@@ -958,7 +1046,7 @@ fn detach_term_child<T>(
 
 /// A container for the various constants that are available
 /// in Untyped Plutus Core. Used in the `Constant` variant of `Term`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Constant {
     // tag: 0
     Integer(BigInt),
@@ -1698,7 +1786,6 @@ impl Data {
     }
 }
 
-#[derive(Debug)]
 pub enum Type {
     Bool,
     Integer,
@@ -2020,6 +2107,70 @@ impl Display for Type {
         }
 
         Ok(())
+    }
+}
+
+/// The derived format, `{:?}` and `{:#?}` alike, written without recursion (see `debug.rs`).
+impl fmt::Debug for Type {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        debug::write(self, f, |typ| match typ {
+            Type::Bool => Item::Tuple("Bool", vec![]),
+            Type::Integer => Item::Tuple("Integer", vec![]),
+            Type::String => Item::Tuple("String", vec![]),
+            Type::ByteString => Item::Tuple("ByteString", vec![]),
+            Type::Unit => Item::Tuple("Unit", vec![]),
+            Type::List(inner) => Item::Tuple("List", vec![Item::Node(inner)]),
+            Type::Pair(fst, snd) => Item::Tuple("Pair", vec![Item::Node(fst), Item::Node(snd)]),
+            Type::Data => Item::Tuple("Data", vec![]),
+            Type::Bls12_381G1Element => Item::Tuple("Bls12_381G1Element", vec![]),
+            Type::Bls12_381G2Element => Item::Tuple("Bls12_381G2Element", vec![]),
+            Type::Bls12_381MlResult => Item::Tuple("Bls12_381MlResult", vec![]),
+            Type::Value => Item::Tuple("Value", vec![]),
+            Type::Array(inner) => Item::Tuple("Array", vec![Item::Node(inner)]),
+        })
+    }
+}
+
+/// The derived format, `{:?}` and `{:#?}` alike, written without recursion (see `debug.rs`).
+impl fmt::Debug for Constant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn elements(items: &[Rc<Constant>]) -> Item<'_, Constant> {
+            Item::List(items.iter().map(|item| Item::Node(item.as_ref())).collect())
+        }
+
+        debug::write(self, f, |constant| match constant {
+            Constant::Integer(i) => Item::Tuple("Integer", vec![Item::Leaf(i)]),
+            Constant::ByteString(bytes) => Item::Tuple("ByteString", vec![Item::Leaf(bytes)]),
+            Constant::String(s) => Item::Tuple("String", vec![Item::Leaf(s)]),
+            Constant::Unit => Item::Tuple("Unit", vec![]),
+            Constant::Bool(b) => Item::Tuple("Bool", vec![Item::Leaf(b)]),
+            Constant::ProtoList(r#type, items) => {
+                Item::Tuple("ProtoList", vec![Item::Leaf(r#type), elements(items)])
+            }
+            Constant::ProtoPair(fst_type, snd_type, fst, snd) => Item::Tuple(
+                "ProtoPair",
+                vec![
+                    Item::Leaf(fst_type),
+                    Item::Leaf(snd_type),
+                    Item::Node(fst),
+                    Item::Node(snd),
+                ],
+            ),
+            Constant::Data(data) => Item::Tuple("Data", vec![Item::Leaf(data)]),
+            Constant::Bls12_381G1Element(element) => {
+                Item::Tuple("Bls12_381G1Element", vec![Item::Leaf(element)])
+            }
+            Constant::Bls12_381G2Element(element) => {
+                Item::Tuple("Bls12_381G2Element", vec![Item::Leaf(element)])
+            }
+            Constant::Bls12_381MlResult(element) => {
+                Item::Tuple("Bls12_381MlResult", vec![Item::Leaf(element)])
+            }
+            Constant::ProtoArray(r#type, items) => {
+                Item::Tuple("ProtoArray", vec![Item::Leaf(r#type), elements(items)])
+            }
+            Constant::Value(value) => Item::Tuple("Value", vec![Item::Leaf(value)]),
+        })
     }
 }
 

@@ -3,6 +3,7 @@ use std::{fmt::Display, mem, rc::Rc};
 use crate::{
     ast::{Constant, NamedDeBruijn, Term, Type},
     builtins::DefaultFunction,
+    debug::{self, Item},
 };
 use num_traits::ToPrimitive;
 use strum::IntoEnumIterator;
@@ -31,7 +32,6 @@ pub enum MachineState {
     Done(Term<NamedDeBruijn>),
 }
 
-#[derive(Debug)]
 pub enum Context {
     FrameAwaitArg(Value, Box<Context>),
     FrameAwaitFunTerm(Env, Term<NamedDeBruijn>, Box<Context>),
@@ -111,6 +111,47 @@ impl Clone for Context {
         }
 
         copy
+    }
+}
+
+/// The derived format, `{:?}` and `{:#?}` alike, written without recursion (see `debug.rs`): the
+/// frames below are as many as the term is deep.
+impl std::fmt::Debug for Context {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn leaves<T: std::fmt::Debug>(items: &[T]) -> Item<'_, Context> {
+            Item::List(items.iter().map(|item| Item::Leaf(item)).collect())
+        }
+
+        debug::write(self, f, |context| match context {
+            Context::FrameAwaitArg(value, tail) => {
+                Item::Tuple("FrameAwaitArg", vec![Item::Leaf(value), Item::Node(tail)])
+            }
+            Context::FrameAwaitFunTerm(env, term, tail) => Item::Tuple(
+                "FrameAwaitFunTerm",
+                vec![leaves(env), Item::Leaf(term), Item::Node(tail)],
+            ),
+            Context::FrameAwaitFunValue(value, tail) => Item::Tuple(
+                "FrameAwaitFunValue",
+                vec![Item::Leaf(value), Item::Node(tail)],
+            ),
+            Context::FrameForce(tail) => Item::Tuple("FrameForce", vec![Item::Node(tail)]),
+            Context::FrameConstr(env, tag, fields, resolved_fields, tail, term_id) => Item::Tuple(
+                "FrameConstr",
+                vec![
+                    leaves(env),
+                    Item::Leaf(tag),
+                    leaves(fields),
+                    leaves(resolved_fields),
+                    Item::Node(tail),
+                    Item::Leaf(term_id),
+                ],
+            ),
+            Context::FrameCases(env, branches, tail) => Item::Tuple(
+                "FrameCases",
+                vec![leaves(env), leaves(branches), Item::Node(tail)],
+            ),
+            Context::NoFrame => Item::Tuple("NoFrame", vec![]),
+        })
     }
 }
 

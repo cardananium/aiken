@@ -2,6 +2,7 @@ pub mod ast;
 pub mod builder;
 pub mod builtins;
 mod debruijn;
+mod debug;
 pub mod flat;
 pub mod machine;
 pub mod manual_machine;
