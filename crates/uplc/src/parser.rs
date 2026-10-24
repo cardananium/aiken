@@ -164,7 +164,7 @@ peg::parser! {
           = "(" _* "error" _* ")" { Term::Error { uniq_id: next_uniq_id() } }
 
         rule constr(interner: &mut Interner) -> Term<Name>
-          = "(" _* "constr" _+ tag:decimal() _* fields:(t:term(interner) _* { t })* _* ")" {
+          = "(" _* "constr" _+ tag:constr_tag() _* fields:(t:term(interner) _* { t })* _* ")" {
             Term::Constr { tag, fields, uniq_id: next_uniq_id() }
           }
 
@@ -243,6 +243,15 @@ peg::parser! {
 
         rule decimal() -> usize
           = n:$(['0'..='9']+) {? n.parse().or(Err("usize")) }
+
+        // A tag is a `Word64`. Past `usize::MAX` (on a 32-bit target) it saturates, as the flat
+        // decoder's does: no `case` can have a branch for it either way.
+        rule constr_tag() -> usize
+          = n:$(['0'..='9']+) {?
+            n.parse::<u64>()
+                .map(|tag| usize::try_from(tag).unwrap_or(usize::MAX))
+                .or(Err("a constr tag below 2^64"))
+          }
 
         rule number() -> isize
           = n:$(("-"/"+")* ['0'..='9']+) {? n.parse().or(Err("isize")) }

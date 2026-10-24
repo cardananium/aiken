@@ -166,7 +166,11 @@ where
     T: Binder<'b>,
 {
     fn decode(d: &mut Decoder) -> Result<Self, de::Error> {
-        let version = (usize::decode(d)?, usize::decode(d)?, usize::decode(d)?);
+        let version = (
+            decode_saturated_natural(d)?,
+            decode_saturated_natural(d)?,
+            decode_saturated_natural(d)?,
+        );
         // Flat is bit-addressed, so a position is a byte offset AND a bit
         // offset within that byte. Rewinding needs both: restoring `pos`
         // alone resumes on the right byte at whatever bit the failed decode
@@ -222,6 +226,70 @@ fn decode_list_bit(d: &mut Decoder) -> Result<bool, de::Error> {
     }
 
     Ok(d.bits8(1)? != 0)
+}
+
+/// Read a flat word -- seven bits a byte, least significant first, the top bit set on every byte
+/// but the last -- that Plutus reads as a `Word64`: a constr tag or a de Bruijn index. A word that
+/// does not fit 64 bits fails to decode there (at most ten groups, the tenth a single bit), so it
+/// fails here too.
+///
+/// `Decoder::word` shifts each group into a `usize` unchecked, so on a 32-bit target, and past 64
+/// bits on any target, it silently drops the high bits: read on wasm32, a constr tag of
+/// 2^32 + 1 became 1.
+fn decode_word64(d: &mut Decoder) -> Result<u64, de::Error> {
+    let mut word: u64 = 0;
+    let mut shift: u32 = 0;
+
+    loop {
+        let byte = d.bits8(8)?;
+        let group = u64::from(byte & 0x7f);
+
+        if shift >= u64::BITS || (group << shift) >> shift != group {
+            return Err(de::Error::Message(
+                "flat word does not fit in 64 bits".to_string(),
+            ));
+        }
+
+        word |= group << shift;
+
+        if byte & 0x80 == 0 {
+            return Ok(word);
+        }
+
+        shift += 7;
+    }
+}
+
+/// A `Word64` read by [`decode_word64`], as a `usize`. On a 32-bit target a word past
+/// `usize::MAX` becomes `usize::MAX`, which behaves the same: no `case` has that many branches and
+/// no environment binds that many variables, so evaluation fails where the ledger's fails.
+fn decode_saturated_word64(d: &mut Decoder) -> Result<usize, de::Error> {
+    decode_word64(d).map(|word| usize::try_from(word).unwrap_or(usize::MAX))
+}
+
+/// Read a flat word that Plutus reads as a `Natural` (each part of a program's version), as a
+/// `usize`, with `usize::MAX` standing for any larger number: the ledger accepts no such version.
+fn decode_saturated_natural(d: &mut Decoder) -> Result<usize, de::Error> {
+    let mut word: usize = 0;
+    let mut shift: u32 = 0;
+    let mut saturated = false;
+
+    loop {
+        let byte = d.bits8(8)?;
+        let group = usize::from(byte & 0x7f);
+
+        if shift >= usize::BITS || (group << shift) >> shift != group {
+            saturated |= group != 0;
+        } else {
+            word |= group << shift;
+        }
+
+        if byte & 0x80 == 0 {
+            return Ok(if saturated { usize::MAX } else { word });
+        }
+
+        shift = shift.saturating_add(7);
+    }
 }
 
 impl<'b, T> Encode for Term<T>
@@ -550,7 +618,7 @@ where
                     8 => {
                         note!(state_log, "(constr ");
 
-                        let tag = usize::decode(d)?;
+                        let tag = decode_saturated_word64(d)?;
 
                         // The fields are walked a frame at a time rather than with
                         // `decode_list_with`, whose element decoder would be this function again.
@@ -1412,7 +1480,7 @@ impl Encode for DeBruijn {
 
 impl Decode<'_> for DeBruijn {
     fn decode(d: &mut Decoder) -> Result<Self, de::Error> {
-        Ok(usize::decode(d)?.into())
+        Ok(decode_saturated_word64(d)?.into())
     }
 }
 
@@ -1518,7 +1586,7 @@ pub fn decode_constant_tag(d: &mut Decoder) -> Result<u8, de::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Constant, Program, Term, decode_value};
+    use super::{Constant, Program, Term, decode_value, decode_word64};
     use crate::{
         ast::{BigIntValueEntries, DeBruijn, Name, Type, Value},
         global_uniq::next_uniq_id,
@@ -1973,5 +2041,80 @@ mod tests {
         let mut truncated = encode_raw_value(vec![(vec![0], vec![(vec![0], BigInt::from(1))])]);
         truncated.truncate(truncated.len() - 2);
         assert!(decode_value(&mut Decoder::new(&truncated)).is_err());
+    }
+
+    #[test]
+    fn words_decode_as_plutus_word64s() {
+        let decode = |bytes: &[u8]| decode_word64(&mut Decoder::new(bytes));
+
+        assert_eq!(decode(&[0x01]).unwrap(), 1);
+        assert_eq!(
+            decode(&[0x81, 0x80, 0x80, 0x80, 0x10]).unwrap(),
+            (1 << 32) + 1
+        );
+        assert_eq!(
+            decode(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]).unwrap(),
+            u64::MAX
+        );
+        // 2^64: the tenth group may hold one bit only.
+        assert!(decode(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02]).is_err());
+        // An eleventh group, even an empty one.
+        assert!(
+            decode(&[
+                0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn large_tags_indices_and_versions_are_not_wrapped() {
+        let saturated = usize::try_from((1u64 << 32) + 1).unwrap_or(usize::MAX);
+
+        // (program 1.1.0 (case (constr 4294967297) (error) (con unit ()))): no branch for the tag,
+        // on any target.
+        let bytes = hex::decode("0101009881808080105a9301").unwrap();
+        let program = Program::<DeBruijn>::from_flat(&bytes).unwrap();
+
+        let Term::Case { constr, .. } = &program.term else {
+            panic!("{:?}", program.term)
+        };
+        assert!(matches!(constr.as_ref(), Term::Constr { tag, .. } if *tag == saturated));
+
+        let result = program
+            .eval_version_with_protocol(
+                crate::machine::cost_model::ExBudget::max(),
+                &pallas_primitives::conway::Language::PlutusV3,
+                11,
+            )
+            .result();
+        assert!(
+            matches!(result, Err(crate::machine::Error::MissingCaseBranch(..))),
+            "{result:?}"
+        );
+
+        // (program 1.1.0 (lam i_0 i_4294967297)): out of scope, on any target.
+        let bytes = hex::decode("01010020818080801001").unwrap();
+        let program = Program::<DeBruijn>::from_flat(&bytes).unwrap();
+        let Term::Lambda { body, .. } = &program.term else {
+            panic!("{:?}", program.term)
+        };
+        assert!(
+            matches!(body.as_ref(), Term::Var { name, .. } if usize::from(**name) == saturated)
+        );
+
+        // (program 4294967297.0.0 (con unit ())).
+        let bytes = hex::decode("818080801000004981").unwrap();
+        let program = Program::<DeBruijn>::from_flat(&bytes).unwrap();
+        assert_eq!(program.version, (saturated, 0, 0));
+    }
+
+    #[test]
+    fn parsed_constr_tags_are_word64s() {
+        let program = parser::program("(program 1.1.0 (constr 18446744073709551615))").unwrap();
+        let expected = usize::try_from(u64::MAX).unwrap_or(usize::MAX);
+        assert!(matches!(program.term, Term::Constr { tag, .. } if tag == expected));
+
+        assert!(parser::program("(program 1.1.0 (constr 18446744073709551616))").is_err());
     }
 }
