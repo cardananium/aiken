@@ -670,16 +670,16 @@ impl DefaultFunction {
                 let arg2 = args[1].unwrap_integer()?;
                 let arg3 = args[2].unwrap_byte_string()?;
 
-                let skip: usize = if arg1.lt(&0.into()) {
-                    0
-                } else {
-                    arg1.try_into().unwrap()
+                // Plutus takes the start and the length as 64-bit integers, and fails for ones out
+                // of that range. A negative one counts as zero, and one too large for a `usize`
+                // (on 32-bit targets) reaches past the end of any byte string anyway.
+                let count = |arg: &BigInt| match arg.to_i64() {
+                    Some(arg) => Ok(usize::try_from(arg.max(0)).unwrap_or(usize::MAX)),
+                    None => Err(Error::OutsideInt64Bounds(arg.clone())),
                 };
-                let take: usize = if arg2.lt(&0.into()) {
-                    0
-                } else {
-                    arg2.try_into().unwrap()
-                };
+
+                let skip = count(arg1)?;
+                let take = count(arg2)?;
 
                 let ret: Vec<u8> = arg3.iter().skip(skip).take(take).cloned().collect();
 
@@ -698,16 +698,11 @@ impl DefaultFunction {
                 let arg1 = args[0].unwrap_byte_string()?;
                 let arg2 = args[1].unwrap_integer()?;
 
-                let index: i128 = arg2.try_into().unwrap();
-
-                if 0 <= index && index < arg1.len() as i128 {
-                    let ret = arg1[index as usize];
-
-                    let value = Value::integer(ret.into());
-
-                    Ok(value)
-                } else {
-                    Err(Error::ByteStringOutOfBounds(arg2.clone(), arg1.to_vec()))
+                // A negative index, or one too large for a `usize`, is out of bounds like any
+                // other index past the end.
+                match usize::try_from(arg2).ok().and_then(|index| arg1.get(index)) {
+                    Some(byte) => Ok(Value::integer((*byte).into())),
+                    None => Err(Error::ByteStringOutOfBounds(arg2.clone(), arg1.to_vec())),
                 }
             }
             DefaultFunction::EqualsByteString => {
@@ -2691,6 +2686,75 @@ mod tests {
                 .call(BuiltinSemantics::E, &args, &mut vec![])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn byte_string_indices_of_any_size_fail_instead_of_panicking() {
+        let bytes = Value::byte_string(vec![1, 2, 3]);
+
+        let index = |index: BigInt| {
+            DefaultFunction::IndexByteString.call(
+                BuiltinSemantics::E,
+                &[bytes.clone(), Value::integer(index)],
+                &mut vec![],
+            )
+        };
+
+        assert_eq!(index(2.into()), Ok(Value::integer(3.into())));
+
+        let huge = BigInt::from(1) << 200u32;
+
+        for out_of_bounds in [3.into(), (-1).into(), u64::MAX.into(), huge.clone(), -huge] {
+            assert!(matches!(
+                index(out_of_bounds),
+                Err(Error::ByteStringOutOfBounds(..))
+            ));
+        }
+
+        let empty = DefaultFunction::IndexByteString
+            .call(
+                BuiltinSemantics::E,
+                &[Value::byte_string(vec![]), Value::integer(0.into())],
+                &mut vec![],
+            )
+            .unwrap_err();
+
+        assert!(empty.to_string().ends_with("Allowed none"), "{empty}");
+
+        // The start and the length are 64-bit integers: clamped within that range, failing out of
+        // it.
+        let slice = |start: BigInt, length: BigInt| {
+            DefaultFunction::SliceByteString.call(
+                BuiltinSemantics::E,
+                &[Value::integer(start), Value::integer(length), bytes.clone()],
+                &mut vec![],
+            )
+        };
+
+        assert_eq!(
+            slice(1.into(), i64::MAX.into()),
+            Ok(Value::byte_string(vec![2, 3]))
+        );
+        assert_eq!(
+            slice((-5).into(), 2.into()),
+            Ok(Value::byte_string(vec![1, 2]))
+        );
+        assert_eq!(
+            slice(i64::MAX.into(), 1.into()),
+            Ok(Value::byte_string(vec![]))
+        );
+        assert_eq!(
+            slice(i64::MIN.into(), i64::MIN.into()),
+            Ok(Value::byte_string(vec![]))
+        );
+        assert!(matches!(
+            slice(BigInt::from(i64::MAX) + 1, 1.into()),
+            Err(Error::OutsideInt64Bounds(_))
+        ));
+        assert!(matches!(
+            slice(0.into(), BigInt::from(i64::MIN) - 1),
+            Err(Error::OutsideInt64Bounds(_))
+        ));
     }
 
     fn verify(

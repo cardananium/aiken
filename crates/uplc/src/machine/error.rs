@@ -105,13 +105,13 @@ pub enum Error {
     #[error("Decoding utf8")]
     Utf8(#[from] FromUtf8Error),
     #[error(
-        "Out of Bounds\n{:>13} {}\nb{:>13} {}\n{:>13} 0 - {}",
+        "Out of Bounds\n{:>13} {}\nb{:>13} {}\n{:>13} {}",
         "Index",
         .0,
         "ByteArray",
         hex::encode(.1),
         "Allowed",
-        .1.len() - 1
+        allowed_indices(.1)
     )]
     ByteStringOutOfBounds(BigInt, Vec<u8>),
     #[error("array index out of bounds\n{:>13} {0}\n{:>13} {1}", "Index", "Length")]
@@ -151,6 +151,8 @@ pub enum Error {
     OutsideNaturalBounds(BigInt),
     #[error("{0} is not within the bounds of a Byte")]
     OutsideByteBounds(BigInt),
+    #[error("{0} is not within the bounds of a 64-bit integer")]
+    OutsideInt64Bounds(BigInt),
     #[error("readBit: index out of bounds")]
     ReadBitOutOfBounds,
     #[error("writeBits: index out of bounds")]
@@ -189,6 +191,14 @@ fn redacted(s: String, max_rows: usize) -> String {
         s
     } else {
         s
+    }
+}
+
+/// The indices of a byte string, as a range; an empty one has none.
+fn allowed_indices(bytes: &[u8]) -> String {
+    match bytes.len() {
+        0 => "none".to_string(),
+        len => format!("0 - {}", len - 1),
     }
 }
 
