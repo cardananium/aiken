@@ -2419,7 +2419,7 @@ checksum = "13c45bb4a6ae1280ec0803b1ef9d3455eb50f01efbbe1447ab020f1d54fba9d8"
 [[package]]
 name = "pallas-addresses"
 version = "0.35.1"
-source = "git+file:///home/evgenii/svc/pallas?rev=437295c63d1846a50692129655205ed2182c54f3#437295c63d1846a50692129655205ed2182c54f3"
+source = "git+https://github.com/cardananium/pallas.git?rev=437295c63d1846a50692129655205ed2182c54f3#437295c63d1846a50692129655205ed2182c54f3"
 dependencies = [
  "base58",
  "bech32",
@@ -2434,7 +2434,7 @@ dependencies = [
 [[package]]
 name = "pallas-codec"
 version = "0.35.1"
-source = "git+file:///home/evgenii/svc/pallas?rev=437295c63d1846a50692129655205ed2182c54f3#437295c63d1846a50692129655205ed2182c54f3"
+source = "git+https://github.com/cardananium/pallas.git?rev=437295c63d1846a50692129655205ed2182c54f3#437295c63d1846a50692129655205ed2182c54f3"
 dependencies = [
  "hex",
  "minicbor",
@@ -2446,7 +2446,7 @@ dependencies = [
 [[package]]
 name = "pallas-crypto"
 version = "0.35.1"
-source = "git+file:///home/evgenii/svc/pallas?rev=437295c63d1846a50692129655205ed2182c54f3#437295c63d1846a50692129655205ed2182c54f3"
+source = "git+https://github.com/cardananium/pallas.git?rev=437295c63d1846a50692129655205ed2182c54f3#437295c63d1846a50692129655205ed2182c54f3"
 dependencies = [
  "cryptoxide 0.4.4",
  "hex",
@@ -2460,7 +2460,7 @@ dependencies = [
 [[package]]
 name = "pallas-primitives"
 version = "0.35.1"
-source = "git+file:///home/evgenii/svc/pallas?rev=437295c63d1846a50692129655205ed2182c54f3#437295c63d1846a50692129655205ed2182c54f3"
+source = "git+https://github.com/cardananium/pallas.git?rev=437295c63d1846a50692129655205ed2182c54f3#437295c63d1846a50692129655205ed2182c54f3"
 dependencies = [
  "base58",
  "bech32",
@@ -2475,7 +2475,7 @@ dependencies = [
 [[package]]
 name = "pallas-traverse"
 version = "0.35.1"
-source = "git+file:///home/evgenii/svc/pallas?rev=437295c63d1846a50692129655205ed2182c54f3#437295c63d1846a50692129655205ed2182c54f3"
+source = "git+https://github.com/cardananium/pallas.git?rev=437295c63d1846a50692129655205ed2182c54f3#437295c63d1846a50692129655205ed2182c54f3"
 dependencies = [
  "hex",
  "itertools 0.13.0",
