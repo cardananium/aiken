@@ -8,6 +8,7 @@ use pallas_codec::flat::{
     Flat,
     de::{self, Decode, Decoder},
     en::{self, Encode, Encoder},
+    filler::Filler,
 };
 use pallas_primitives::{Fragment, conway::PlutusData};
 use std::{collections::VecDeque, fmt::Debug, rc::Rc};
@@ -37,11 +38,29 @@ where
 
         buffer.extend(flat_bytes);
 
-        Self::unflat(buffer)
+        Self::from_flat(buffer)
     }
 
+    /// Decode a program from its flat bytes the way the ledger does (flat's
+    /// `unflat`): the program and its filler must take the whole buffer.
+    /// A filler that ends inside a byte, or bytes left after it, are refused
+    /// (flat's `TooMuchSpace`), where [`Flat::unflat`] ignores them.
     pub fn from_flat(bytes: &'b [u8]) -> Result<Self, de::Error> {
-        Self::unflat(bytes)
+        let mut decoder = Decoder::new(bytes);
+
+        let program = Self::decode(&mut decoder)?;
+
+        decoder.decode::<Filler>()?;
+
+        let unread_bits = (bytes.len() - decoder.pos) * 8 - decoder.used_bits as usize;
+
+        if unread_bits > 0 {
+            return Err(de::Error::Message(format!(
+                "Too much space: {unread_bits} bits of the buffer are left after the program's filler"
+            )));
+        }
+
+        Ok(program)
     }
 
     pub fn from_hex(
@@ -1948,6 +1967,43 @@ mod tests {
             message.contains("(lam") && message.contains("(delay"),
             "decode error lost the path into the term: {message}"
         );
+    }
+
+    /// `(program 1.0.0 (con unit ()))` is `01 00 00 49 81`: the last byte is
+    /// the term's final bits `10`, then the filler `000001`.
+    #[test]
+    fn from_flat_refuses_what_follows_the_filler() {
+        let exact = [0x01, 0x00, 0x00, 0x49, 0x81];
+        let program = Program::<DeBruijn>::from_flat(&exact).unwrap();
+        assert!(matches!(program.term, Term::Constant { .. }));
+
+        // A byte after the filler.
+        let trailing = [0x01, 0x00, 0x00, 0x49, 0x81, 0x00];
+        let error = Program::<DeBruijn>::from_flat(&trailing).expect_err("a trailing byte");
+        assert!(format!("{error}").contains("Too much space: 8 bits"), "{error}");
+
+        // A filler that ends at the third bit of its byte: `10` `1` `00000`.
+        let misaligned = [0x01, 0x00, 0x00, 0x49, 0xa0];
+        let error = Program::<DeBruijn>::from_flat(&misaligned).expect_err("a short filler");
+        assert!(format!("{error}").contains("Too much space: 5 bits"), "{error}");
+
+        // `unflat` still reads only as far as the filler.
+        assert!(Program::<DeBruijn>::unflat(&trailing).is_ok());
+        assert!(Program::<DeBruijn>::unflat(&misaligned).is_ok());
+
+        // CBOR-wrapped flat goes through the same check.
+        let wrapped = [0x46, 0x01, 0x00, 0x00, 0x49, 0x81, 0x00];
+        assert!(Program::<DeBruijn>::from_cbor(&wrapped, &mut Vec::new()).is_err());
+        let wrapped = [0x45, 0x01, 0x00, 0x00, 0x49, 0x81];
+        assert!(Program::<DeBruijn>::from_cbor(&wrapped, &mut Vec::new()).is_ok());
+    }
+
+    /// Flat's filler is zeros up to a one, so it may run past a byte; it
+    /// only has to end where the buffer does.
+    #[test]
+    fn from_flat_accepts_a_filler_longer_than_a_byte() {
+        let long_filler = [0x01, 0x00, 0x00, 0x49, 0x80, 0x01];
+        assert!(Program::<DeBruijn>::from_flat(&long_filler).is_ok());
     }
 
     #[test]
